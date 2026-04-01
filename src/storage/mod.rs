@@ -1,22 +1,23 @@
-pub mod graph;
-pub mod in_memory;
+#[cfg(test)]
+mod graph;
+#[cfg(test)]
+mod in_memory;
 pub mod object_store;
-pub mod sqlite;
 pub mod traits;
-pub mod vector;
+#[cfg(test)]
+mod vector;
 
-pub use graph::InMemoryGraphRepository;
-pub use in_memory::{InMemoryLoopStateRepository, InMemoryNodeRepository};
+#[cfg(test)]
+pub(crate) use graph::InMemoryGraphRepository;
+#[cfg(test)]
+pub(crate) use in_memory::{InMemoryLoopStateRepository, InMemoryNodeRepository};
 pub use object_store::{
     FileObjectStore, ObjectGraphRepository, ObjectLoopStateRepository, ObjectNodeRepository,
     ObjectVectorIndex,
-};
-pub use sqlite::{
-    SqliteDatabase, SqliteGraphRepository, SqliteLoopStateRepository, SqliteNodeRepository,
-    SqliteVectorIndex,
 };
 pub use traits::{
     GraphRepository, GraphTraversalHit, LoopStateRepository, NodeRepository, RawLifecyclePatch,
     ScoredAbstractRef, ScoredRawRef, VectorIndex,
 };
-pub use vector::InMemoryVectorIndex;
+#[cfg(test)]
+pub(crate) use vector::InMemoryVectorIndex;

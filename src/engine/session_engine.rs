@@ -25,8 +25,6 @@ use crate::storage::{
 };
 use crate::tools::executor::{ToolCallResult, ToolExecutor};
 
-const SYSTEM_PROMPT: &str = "You are the Rust-based Takos agent engine.";
-
 const INGEST_USER_INPUT_NODE: &str = "ingest_user_input";
 const LOAD_SESSION_VIEW_NODE: &str = "load_session_view";
 const BUILD_ACTIVATION_QUERY_NODE: &str = "build_activation_query";
@@ -221,7 +219,7 @@ pub async fn run_maintenance_pass(
     Ok(report)
 }
 
-pub fn build_default_execution_graph() -> ExecutionGraph {
+pub(crate) fn build_default_execution_graph() -> ExecutionGraph {
     let mut graph = ExecutionGraph::new(INGEST_USER_INPUT_NODE);
     graph.add_node(Arc::new(IngestUserInputNode));
     graph.add_node(Arc::new(LoadSessionViewNode));
@@ -463,7 +461,7 @@ impl GraphNode for AssembleContextNode {
         }
         let context = deps.context_assembler().assemble(
             &config.context_budget,
-            SYSTEM_PROMPT,
+            &config.system_prompt,
             &state.recent_session,
             &state.activated_memory,
             &state.tool_results,
@@ -874,7 +872,6 @@ mod tests {
 
     use crate::config::EngineConfig;
     use crate::domain::{DistillationState, LoopStatus, RawNode, RawNodeKind};
-    use crate::engine::context_assembler::WhitespaceTokenEstimator;
     use crate::engine::execution_graph::{
         ExecutionGraph, ExecutionState, GraphNode, GraphRunner, NodeOutcome, ResolvedRunOptions,
         RunOptions, DEFAULT_EDGE,
@@ -885,21 +882,20 @@ mod tests {
     };
     use crate::error::Result;
     use crate::ids::{LoopId, SessionId};
-    use crate::memory::distillation::SimpleDistiller;
     use crate::memory::scoring::DefaultScoringPolicy;
-    use crate::model::embedding::HashEmbedder;
-    use crate::model::runner::{ModelInput, ModelOutput, ModelRunner, RuleBasedModelRunner};
-    use crate::storage::graph::InMemoryGraphRepository;
-    use crate::storage::in_memory::{InMemoryLoopStateRepository, InMemoryNodeRepository};
+    use crate::model::{ModelInput, ModelOutput, ModelRunner};
     use crate::storage::object_store::{
         FileObjectStore, ObjectGraphRepository, ObjectLoopStateRepository, ObjectNodeRepository,
         ObjectVectorIndex,
     };
-    use crate::storage::sqlite::{
-        SqliteDatabase, SqliteGraphRepository, SqliteLoopStateRepository, SqliteNodeRepository,
-        SqliteVectorIndex,
+    use crate::storage::{
+        InMemoryGraphRepository, InMemoryLoopStateRepository, InMemoryNodeRepository,
+        InMemoryVectorIndex,
     };
-    use crate::storage::vector::InMemoryVectorIndex;
+    use crate::test_support::{
+        TestHashEmbedder, TestRuleBasedModelRunner, TestSimpleDistiller,
+        TestWhitespaceTokenEstimator,
+    };
     use crate::tools::executor::DefaultToolExecutor;
     use crate::tools::memory_tools::MemoryTools;
 
@@ -908,11 +904,11 @@ mod tests {
         let vector_index = Arc::new(InMemoryVectorIndex::default());
         let graph_repository = Arc::new(InMemoryGraphRepository::default());
         let loop_state_repository = Arc::new(InMemoryLoopStateRepository::default());
-        let embedder = Arc::new(HashEmbedder::default());
+        let embedder = Arc::new(TestHashEmbedder::default());
         let scoring_policy = Arc::new(DefaultScoringPolicy::default());
-        let token_estimator = Arc::new(WhitespaceTokenEstimator);
-        let model_runner = Arc::new(RuleBasedModelRunner);
-        let distiller = Arc::new(SimpleDistiller);
+        let token_estimator = Arc::new(TestWhitespaceTokenEstimator);
+        let model_runner = Arc::new(TestRuleBasedModelRunner);
+        let distiller = Arc::new(TestSimpleDistiller);
         let memory_tools = MemoryTools::new(
             repository.clone(),
             vector_index.clone(),
@@ -1203,13 +1199,6 @@ mod tests {
         Ok(())
     }
 
-    fn temp_sqlite_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "takos-agent-engine-{name}-{}.sqlite",
-            uuid::Uuid::new_v4()
-        ))
-    }
-
     fn temp_object_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "takos-agent-engine-{name}-{}",
@@ -1223,11 +1212,11 @@ mod tests {
         let vector_index = Arc::new(ObjectVectorIndex::new(store.clone()));
         let graph_repository = Arc::new(ObjectGraphRepository::new(store.clone()));
         let loop_state_repository = Arc::new(ObjectLoopStateRepository::new(store));
-        let embedder = Arc::new(HashEmbedder::default());
+        let embedder = Arc::new(TestHashEmbedder::default());
         let scoring_policy = Arc::new(DefaultScoringPolicy::default());
-        let token_estimator = Arc::new(WhitespaceTokenEstimator);
-        let model_runner = Arc::new(RuleBasedModelRunner);
-        let distiller = Arc::new(SimpleDistiller);
+        let token_estimator = Arc::new(TestWhitespaceTokenEstimator);
+        let model_runner = Arc::new(TestRuleBasedModelRunner);
+        let distiller = Arc::new(TestSimpleDistiller);
         let memory_tools = MemoryTools::new(
             repository.clone(),
             vector_index.clone(),
@@ -1248,78 +1237,6 @@ mod tests {
             scoring_policy,
             token_estimator,
         })
-    }
-
-    fn build_sqlite_deps(path: &PathBuf) -> Result<EngineDeps> {
-        let database = SqliteDatabase::open(path)?;
-        let repository = Arc::new(SqliteNodeRepository::new(database.clone()));
-        let vector_index = Arc::new(SqliteVectorIndex::new(database.clone()));
-        let graph_repository = Arc::new(SqliteGraphRepository::new(database.clone()));
-        let loop_state_repository = Arc::new(SqliteLoopStateRepository::new(database.clone()));
-        let embedder = Arc::new(HashEmbedder::default());
-        let scoring_policy = Arc::new(DefaultScoringPolicy::default());
-        let token_estimator = Arc::new(WhitespaceTokenEstimator);
-        let model_runner = Arc::new(RuleBasedModelRunner);
-        let distiller = Arc::new(SimpleDistiller);
-        let memory_tools = MemoryTools::new(
-            repository.clone(),
-            vector_index.clone(),
-            graph_repository.clone(),
-            embedder.clone(),
-        );
-        let tool_executor = Arc::new(DefaultToolExecutor::new(memory_tools));
-
-        Ok(EngineDeps {
-            repository,
-            vector_index,
-            graph_repository,
-            loop_state_repository,
-            embedder,
-            model_runner,
-            tool_executor,
-            distiller,
-            scoring_policy,
-            token_estimator,
-        })
-    }
-
-    #[tokio::test]
-    async fn sqlite_persists_session_across_rebuilds() -> Result<()> {
-        let path = temp_sqlite_path("continuity");
-        let deps = build_sqlite_deps(&path)?;
-        let first = run_turn(
-            &EngineConfig::default(),
-            &deps,
-            SessionRequest {
-                session_id: None,
-                user_message: "Explain persistence".to_string(),
-                plan: None,
-            },
-        )
-        .await?;
-
-        let deps_after_restart = build_sqlite_deps(&path)?;
-        let second = run_turn(
-            &EngineConfig::default(),
-            &deps_after_restart,
-            SessionRequest {
-                session_id: Some(first.session_id),
-                user_message: "timeline: recent".to_string(),
-                plan: None,
-            },
-        )
-        .await?;
-
-        assert_eq!(second.session_id, first.session_id);
-        assert_eq!(second.status, LoopStatus::Finished);
-        let session_raw = deps_after_restart
-            .repository
-            .session_raw(&first.session_id)
-            .await?;
-        assert!(session_raw.len() >= 4);
-
-        let _ = std::fs::remove_file(path);
-        Ok(())
     }
 
     #[tokio::test]

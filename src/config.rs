@@ -8,6 +8,7 @@ use crate::error::{EngineError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
+    pub system_prompt: String,
     pub memory: MemoryConfig,
     pub context_budget: ContextBudgetConfig,
     pub tools: ToolsConfig,
@@ -17,6 +18,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            system_prompt: "You are the Rust-based Takos agent engine.".to_string(),
             memory: MemoryConfig::default(),
             context_budget: ContextBudgetConfig::default(),
             tools: ToolsConfig::default(),
@@ -27,6 +29,11 @@ impl Default for EngineConfig {
 
 impl EngineConfig {
     pub fn validate(&self) -> Result<()> {
+        if self.system_prompt.trim().is_empty() {
+            return Err(EngineError::Configuration(
+                "system_prompt must not be empty".to_string(),
+            ));
+        }
         let split = self.context_budget.session_ratio + self.context_budget.memory_ratio;
         if !(0.0..=1.0).contains(&self.context_budget.session_ratio) {
             return Err(EngineError::Configuration(
@@ -86,19 +93,10 @@ impl EngineConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoryConfig {
     pub activation: ActivationConfig,
     pub retrieval: RetrievalConfig,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            activation: ActivationConfig::default(),
-            retrieval: RetrievalConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +267,8 @@ mod tests {
     fn config_can_be_parsed_from_toml() {
         let config = EngineConfig::from_toml_str(
             r#"
+            system_prompt = "You are a configurable Takos engine."
+
             [memory.activation.target_ratio]
             raw = 1
             abstract = 1

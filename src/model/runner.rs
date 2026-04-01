@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::error::Result;
 use crate::ids::{LoopId, SessionId};
@@ -33,69 +32,4 @@ pub struct ModelOutput {
 #[async_trait]
 pub trait ModelRunner: Send + Sync {
     async fn run(&self, input: ModelInput) -> Result<ModelOutput>;
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RuleBasedModelRunner;
-
-#[async_trait]
-impl ModelRunner for RuleBasedModelRunner {
-    async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
-        if input.tool_context.is_empty() {
-            if let Some(query) = input.user_message.strip_prefix("memory:") {
-                return Ok(ModelOutput {
-                    assistant_message: None,
-                    tool_calls: vec![ToolCallRequest {
-                        name: "semantic_search_memory".to_string(),
-                        arguments: json!({
-                            "query": query.trim(),
-                            "target": "both",
-                            "top_k": 4
-                        }),
-                    }],
-                });
-            }
-
-            if input.user_message.starts_with("timeline:") {
-                return Ok(ModelOutput {
-                    assistant_message: None,
-                    tool_calls: vec![ToolCallRequest {
-                        name: "timeline_search".to_string(),
-                        arguments: json!({
-                            "limit": 8
-                        }),
-                    }],
-                });
-            }
-        }
-
-        let mut lines = Vec::new();
-        lines.push(format!(
-            "session={} loop={}",
-            input.session_id, input.loop_id
-        ));
-        lines.push(format!(
-            "system_prompt_tokens={}",
-            input.system_prompt.split_whitespace().count()
-        ));
-        lines.push(format!(
-            "recent_session_items={}",
-            input.session_context.len()
-        ));
-        if let Some(plan) = &input.plan {
-            lines.push(format!("plan={plan}"));
-        }
-        if !input.memory_context.is_empty() {
-            lines.push(format!("memory_hits={}", input.memory_context.len()));
-        }
-        if !input.tool_context.is_empty() {
-            lines.push(format!("tool_findings={}", input.tool_context.join(" | ")));
-        }
-        lines.push(format!("user={}", input.user_message));
-
-        Ok(ModelOutput {
-            assistant_message: Some(lines.join("\n")),
-            tool_calls: Vec::new(),
-        })
-    }
 }

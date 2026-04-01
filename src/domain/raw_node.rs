@@ -37,19 +37,10 @@ pub enum DistillationState {
     PartiallyDistilled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct OverflowPolicy {
     pub was_pushed_out_of_session: bool,
     pub relax_retrieval_until: Option<DateTime<Utc>>,
-}
-
-impl Default for OverflowPolicy {
-    fn default() -> Self {
-        Self {
-            was_pushed_out_of_session: false,
-            relax_retrieval_until: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

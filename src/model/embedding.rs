@@ -40,38 +40,3 @@ pub fn cosine_similarity(left: &Embedding, right: &Embedding) -> f32 {
 pub trait Embedder: Send + Sync {
     async fn embed_text(&self, text: &str) -> Result<Embedding>;
 }
-
-#[derive(Debug, Clone)]
-pub struct HashEmbedder {
-    dimensions: usize,
-}
-
-impl Default for HashEmbedder {
-    fn default() -> Self {
-        Self { dimensions: 32 }
-    }
-}
-
-#[async_trait]
-impl Embedder for HashEmbedder {
-    async fn embed_text(&self, text: &str) -> Result<Embedding> {
-        let mut values = vec![0.0_f32; self.dimensions];
-        if text.is_empty() {
-            return Ok(Embedding(values));
-        }
-
-        for (index, byte) in text.bytes().enumerate() {
-            let slot = index % self.dimensions;
-            values[slot] += f32::from(byte) / 255.0;
-        }
-
-        let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
-        if norm != 0.0 {
-            for value in &mut values {
-                *value /= norm;
-            }
-        }
-
-        Ok(Embedding(values))
-    }
-}

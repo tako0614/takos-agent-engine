@@ -12,15 +12,6 @@ pub trait TokenEstimator: Send + Sync {
     fn estimate_text(&self, text: &str) -> usize;
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct WhitespaceTokenEstimator;
-
-impl TokenEstimator for WhitespaceTokenEstimator {
-    fn estimate_text(&self, text: &str) -> usize {
-        text.split_whitespace().count().max(1)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SessionWindowDecision {
     pub included_raw_ids: Vec<RawNodeId>,
@@ -176,12 +167,21 @@ mod tests {
     use crate::domain::{RawNode, RawNodeKind};
     use crate::memory::activation::ActivatedMemory;
 
-    use super::{ContextAssembler, TokenEstimator, WhitespaceTokenEstimator};
+    use super::{ContextAssembler, TokenEstimator};
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestTokenEstimator;
+
+    impl TokenEstimator for TestTokenEstimator {
+        fn estimate_text(&self, text: &str) -> usize {
+            text.split_whitespace().count().max(1)
+        }
+    }
 
     #[test]
     fn assembler_keeps_context_within_budget() {
         let assembler =
-            ContextAssembler::new(Arc::new(WhitespaceTokenEstimator) as Arc<dyn TokenEstimator>);
+            ContextAssembler::new(Arc::new(TestTokenEstimator) as Arc<dyn TokenEstimator>);
         let session = vec![
             RawNode::text(
                 RawNodeKind::UserUtterance,
