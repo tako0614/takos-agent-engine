@@ -654,7 +654,7 @@ mod tests {
                 None,
                 None,
                 "user",
-                &format!("message {i}"),
+                format!("message {i}"),
                 0.5,
                 Vec::new(),
             );
@@ -685,7 +685,7 @@ mod tests {
                 None,
                 None,
                 "user",
-                &format!("message {i}"),
+                format!("message {i}"),
                 0.5,
                 Vec::new(),
             );
