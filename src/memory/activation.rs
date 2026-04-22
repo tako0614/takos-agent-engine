@@ -126,3 +126,232 @@ impl ActivationService {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::EngineConfig;
+    use crate::domain::{
+        AbstractNode, AbstractNodeMetadata, GraphFragment, RawNode, RawNodeKind, References,
+    };
+    use crate::memory::scoring::DefaultScoringPolicy;
+    use crate::model::Embedder;
+    use crate::storage::{InMemoryNodeRepository, InMemoryVectorIndex};
+    use crate::test_support::TestHashEmbedder;
+
+    struct TestHarness {
+        service: ActivationService,
+        repo: Arc<InMemoryNodeRepository>,
+        vector: Arc<InMemoryVectorIndex>,
+        embedder: TestHashEmbedder,
+    }
+
+    fn setup() -> TestHarness {
+        let repo = Arc::new(InMemoryNodeRepository::default());
+        let vector = Arc::new(InMemoryVectorIndex::default());
+        let scoring = Arc::new(DefaultScoringPolicy::default());
+        let embedder = TestHashEmbedder::default();
+        let service = ActivationService::new(
+            repo.clone() as Arc<dyn NodeRepository>,
+            vector.clone() as Arc<dyn VectorIndex>,
+            scoring as Arc<dyn ScoringPolicy>,
+        );
+        TestHarness {
+            service,
+            repo,
+            vector,
+            embedder,
+        }
+    }
+
+    #[tokio::test]
+    async fn activate_with_no_nodes_returns_empty() {
+        let h = setup();
+        let config = EngineConfig::default();
+        let query_emb = h.embedder.embed_text("hello").await.unwrap();
+        let result = h
+            .service
+            .activate(&config, &query_emb, Utc::now())
+            .await
+            .unwrap();
+        assert!(result.raw_nodes.is_empty());
+        assert!(result.abstract_nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn activate_returns_matching_raw_nodes() {
+        let h = setup();
+        let mut config = EngineConfig::default();
+        config.memory.retrieval.similarity_threshold.raw = 0.0;
+        config.memory.retrieval.similarity_threshold.abstract_nodes = 0.0;
+
+        let node = RawNode::text(
+            RawNodeKind::UserUtterance,
+            None,
+            None,
+            "user",
+            "hello world",
+            0.8,
+            Vec::new(),
+        );
+        let node_id = node.id;
+        let emb = h.embedder.embed_text("hello world").await.unwrap();
+        h.repo.insert_raw(node).await.unwrap();
+        h.vector.index_raw(node_id, emb).await.unwrap();
+
+        let query_emb = h.embedder.embed_text("hello world").await.unwrap();
+        let result = h
+            .service
+            .activate(&config, &query_emb, Utc::now())
+            .await
+            .unwrap();
+        assert!(!result.raw_nodes.is_empty());
+        assert_eq!(result.raw_nodes[0].node.id, node_id);
+        assert!(result.raw_nodes[0].score > 0.5);
+    }
+
+    #[tokio::test]
+    async fn activate_returns_matching_abstract_nodes() {
+        let h = setup();
+        let mut config = EngineConfig::default();
+        config.memory.retrieval.similarity_threshold.raw = 0.0;
+        config.memory.retrieval.similarity_threshold.abstract_nodes = 0.0;
+
+        let node = AbstractNode::new(
+            "test topic",
+            "a summary about testing",
+            References::default(),
+            GraphFragment::default(),
+            AbstractNodeMetadata::default(),
+        );
+        let node_id = node.id;
+        let emb = h
+            .embedder
+            .embed_text("test topic: a summary about testing")
+            .await
+            .unwrap();
+        h.repo.insert_abstract(node).await.unwrap();
+        h.vector.index_abstract(node_id, emb).await.unwrap();
+
+        let query_emb = h
+            .embedder
+            .embed_text("test topic: a summary about testing")
+            .await
+            .unwrap();
+        let result = h
+            .service
+            .activate(&config, &query_emb, Utc::now())
+            .await
+            .unwrap();
+        assert!(!result.abstract_nodes.is_empty());
+        assert_eq!(result.abstract_nodes[0].node.id, node_id);
+    }
+
+    #[tokio::test]
+    async fn activate_respects_similarity_threshold() {
+        let h = setup();
+        let mut config = EngineConfig::default();
+        config.memory.retrieval.similarity_threshold.raw = 0.99;
+        config.memory.retrieval.similarity_threshold.abstract_nodes = 0.99;
+
+        let node = RawNode::text(
+            RawNodeKind::UserUtterance,
+            None,
+            None,
+            "user",
+            "apples and oranges",
+            0.5,
+            Vec::new(),
+        );
+        let node_id = node.id;
+        let emb = h.embedder.embed_text("apples and oranges").await.unwrap();
+        h.repo.insert_raw(node).await.unwrap();
+        h.vector.index_raw(node_id, emb).await.unwrap();
+
+        let query_emb = h
+            .embedder
+            .embed_text("completely unrelated query about rockets")
+            .await
+            .unwrap();
+        let result = h
+            .service
+            .activate(&config, &query_emb, Utc::now())
+            .await
+            .unwrap();
+        assert!(result.raw_nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn activate_respects_budget() {
+        let h = setup();
+        let mut config = EngineConfig::default();
+        config.memory.retrieval.similarity_threshold.raw = 0.0;
+        config.memory.activation.top_k_total = 2;
+        config.memory.activation.target_ratio.raw = 1;
+        config.memory.activation.target_ratio.abstract_nodes = 1;
+
+        for i in 0..10 {
+            let text = format!("node number {i} with some content");
+            let node = RawNode::text(
+                RawNodeKind::UserUtterance,
+                None,
+                None,
+                "user",
+                &text,
+                0.5,
+                Vec::new(),
+            );
+            let node_id = node.id;
+            let emb = h.embedder.embed_text(&text).await.unwrap();
+            h.repo.insert_raw(node).await.unwrap();
+            h.vector.index_raw(node_id, emb).await.unwrap();
+        }
+
+        let query_emb = h
+            .embedder
+            .embed_text("node number 5 with some content")
+            .await
+            .unwrap();
+        let result = h
+            .service
+            .activate(&config, &query_emb, Utc::now())
+            .await
+            .unwrap();
+        assert!(result.raw_nodes.len() <= 2);
+    }
+
+    #[tokio::test]
+    async fn activate_results_sorted_by_score_descending() {
+        let h = setup();
+        let mut config = EngineConfig::default();
+        config.memory.retrieval.similarity_threshold.raw = 0.0;
+        config.memory.activation.top_k_total = 20;
+
+        let texts = ["hello world", "goodbye world", "hello there friend"];
+        for text in &texts {
+            let node = RawNode::text(
+                RawNodeKind::UserUtterance,
+                None,
+                None,
+                "user",
+                *text,
+                0.5,
+                Vec::new(),
+            );
+            let node_id = node.id;
+            let emb = h.embedder.embed_text(text).await.unwrap();
+            h.repo.insert_raw(node).await.unwrap();
+            h.vector.index_raw(node_id, emb).await.unwrap();
+        }
+
+        let query_emb = h.embedder.embed_text("hello world").await.unwrap();
+        let result = h
+            .service
+            .activate(&config, &query_emb, Utc::now())
+            .await
+            .unwrap();
+        for window in result.raw_nodes.windows(2) {
+            assert!(window[0].score >= window[1].score);
+        }
+    }
+}

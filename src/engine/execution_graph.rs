@@ -326,11 +326,38 @@ impl GraphRunner {
         deps: &EngineDeps,
         options: &ResolvedRunOptions,
     ) -> Result<(ExecutionState, GraphRunResult)> {
+        if checkpoint.status != LoopStatus::Paused {
+            return Err(EngineError::LoopTerminated(checkpoint.status));
+        }
         let (mut state, current_node, _status) = ExecutionState::from_checkpoint(checkpoint)?;
         let result = self
             .run_from_node(current_node, &mut state, config, deps, options)
             .await?;
         Ok((state, result))
+    }
+
+    async fn save_cancelled_checkpoint(
+        &self,
+        current_node: &str,
+        state: &ExecutionState,
+        deps: &EngineDeps,
+    ) -> Result<GraphRunResult> {
+        warn!(
+            session_id = %state.session_id,
+            loop_id = %state.loop_id,
+            node = current_node,
+            "graph execution cancelled"
+        );
+        let cancelled = state.checkpoint(current_node.to_string(), LoopStatus::Cancelled)?;
+        deps.loop_state_repository
+            .save_checkpoint(cancelled)
+            .await?;
+        Ok(GraphRunResult {
+            status: LoopStatus::Cancelled,
+            completed_steps: state.iteration,
+            tool_rounds_completed: state.tool_rounds_completed,
+            last_node: Some(current_node.to_string()),
+        })
     }
 
     async fn run_from_node(
@@ -343,17 +370,9 @@ impl GraphRunner {
     ) -> Result<GraphRunResult> {
         loop {
             if options.is_cancelled() {
-                warn!(session_id = %state.session_id, loop_id = %state.loop_id, node = %current_node, "graph execution cancelled");
-                let cancelled = state.checkpoint(current_node.clone(), LoopStatus::Cancelled)?;
-                deps.loop_state_repository
-                    .save_checkpoint(cancelled)
-                    .await?;
-                return Ok(GraphRunResult {
-                    status: LoopStatus::Cancelled,
-                    completed_steps: state.iteration,
-                    tool_rounds_completed: state.tool_rounds_completed,
-                    last_node: Some(current_node),
-                });
+                return self
+                    .save_cancelled_checkpoint(&current_node, state, deps)
+                    .await;
             }
 
             if state.iteration >= options.max_graph_steps {
@@ -373,6 +392,11 @@ impl GraphRunner {
             state.iteration = state.iteration.saturating_add(1);
             let running = state.checkpoint(current_node.clone(), LoopStatus::Running)?;
             deps.loop_state_repository.save_checkpoint(running).await?;
+            if options.is_cancelled() {
+                return self
+                    .save_cancelled_checkpoint(&current_node, state, deps)
+                    .await;
+            }
 
             let node = self.graph.node(&current_node)?.clone();
             debug!(
@@ -382,19 +406,42 @@ impl GraphRunner {
                 step = state.iteration,
                 "running execution node"
             );
-            let outcome = match timeout(
+            enum NodeExecutionResult {
+                Completed(std::result::Result<Result<NodeOutcome>, tokio::time::error::Elapsed>),
+                Cancelled,
+            }
+
+            let run_node = timeout(
                 options.timeout_for_class(node.runtime_class()),
                 node.run(state, config, deps, options),
-            )
-            .await
-            {
-                Ok(Ok(outcome)) => outcome,
-                Ok(Err(error)) => {
+            );
+            let execution = if let Some(token) = &options.cancellation_token {
+                tokio::select! {
+                    _ = token.cancelled() => NodeExecutionResult::Cancelled,
+                    result = run_node => NodeExecutionResult::Completed(result),
+                }
+            } else {
+                NodeExecutionResult::Completed(run_node.await)
+            };
+
+            let outcome = match execution {
+                NodeExecutionResult::Cancelled => {
+                    return self
+                        .save_cancelled_checkpoint(&current_node, state, deps)
+                        .await;
+                }
+                NodeExecutionResult::Completed(Ok(Ok(outcome))) => outcome,
+                NodeExecutionResult::Completed(Ok(Err(EngineError::Cancelled))) => {
+                    return self
+                        .save_cancelled_checkpoint(&current_node, state, deps)
+                        .await;
+                }
+                NodeExecutionResult::Completed(Ok(Err(error))) => {
                     let failed = state.checkpoint(current_node.clone(), LoopStatus::Failed)?;
                     deps.loop_state_repository.save_checkpoint(failed).await?;
                     return Err(error);
                 }
-                Err(_) => {
+                NodeExecutionResult::Completed(Err(_)) => {
                     warn!(
                         session_id = %state.session_id,
                         loop_id = %state.loop_id,
@@ -413,6 +460,12 @@ impl GraphRunner {
                     });
                 }
             };
+
+            if options.is_cancelled() {
+                return self
+                    .save_cancelled_checkpoint(&current_node, state, deps)
+                    .await;
+            }
 
             state.last_completed_node = Some(current_node.clone());
             match outcome {

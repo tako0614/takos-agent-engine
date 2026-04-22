@@ -255,7 +255,7 @@ pub trait GraphNode: Send + Sync {
 - explicit pause
 - process restart
 
-`resume_loop(session_id, loop_id, options)` は checkpoint から `ExecutionState` を復元し、直前 node から graph を継続する。
+`resume_loop(config, deps, session_id, loop_id, options)` は checkpoint から `ExecutionState` を復元し、直前 node から graph を継続する。
 
 ### 8.3 bounded runtime
 
@@ -413,11 +413,11 @@ session_ratio = 0.5
 memory_ratio = 0.5
 
 [runtime]
-max_graph_steps = 32
-max_tool_rounds = 4
-node_timeout_ms = 5000
-tool_timeout_ms = 8000
-distillation_timeout_ms = 8000
+max_graph_steps = 64
+max_tool_rounds = 8
+node_timeout_ms = 10000
+tool_timeout_ms = 30000
+distillation_timeout_ms = 15000
 maintenance_batch_size = 32
 ```
 

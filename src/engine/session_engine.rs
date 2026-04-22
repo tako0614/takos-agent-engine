@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use tracing::{info_span, instrument};
 
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, ToolsConfig};
 use crate::domain::{
     AbstractNode, DistillationState, LoopStatus, OverflowPolicy, RawContent, RawNode, RawNodeKind,
 };
@@ -19,11 +19,14 @@ use crate::ids::{LoopId, SessionId};
 use crate::memory::{
     ActivationQuery, ActivationService, DistillationInput, Distiller, ScoringPolicy,
 };
-use crate::model::{Embedder, ModelInput, ModelRunner};
+use crate::model::{Embedder, ModelInput, ModelRunner, ToolCallRequest};
 use crate::storage::{
     GraphRepository, LoopStateRepository, NodeRepository, RawLifecyclePatch, VectorIndex,
 };
 use crate::tools::executor::{ToolCallResult, ToolExecutor};
+use crate::tools::memory_tools::{
+    GraphSearchParams, MemorySearchParams, MemoryToolBounds, TimelineSearchParams,
+};
 
 const INGEST_USER_INPUT_NODE: &str = "ingest_user_input";
 const LOAD_SESSION_VIEW_NODE: &str = "load_session_view";
@@ -541,7 +544,7 @@ impl GraphNode for ExecuteToolsNode {
     async fn run(
         &self,
         state: &mut ExecutionState,
-        _config: &EngineConfig,
+        config: &EngineConfig,
         deps: &EngineDeps,
         options: &ResolvedRunOptions,
     ) -> Result<NodeOutcome> {
@@ -549,9 +552,10 @@ impl GraphNode for ExecuteToolsNode {
         let round = state.tool_rounds_completed.saturating_add(1);
         for (index, call) in calls.into_iter().enumerate() {
             if options.is_cancelled() {
-                return Ok(NodeOutcome::Pause);
+                return Err(EngineError::Cancelled);
             }
 
+            let call = prepare_tool_call_for_config(call, &config.tools)?;
             let operation_key = tool_result_operation_key(state.loop_id, round, index, &call.name);
             let raw_node = if let Some(existing) = deps
                 .repository
@@ -561,6 +565,9 @@ impl GraphNode for ExecuteToolsNode {
                 existing
             } else {
                 let result = deps.tool_executor.execute(call.clone()).await?;
+                if options.is_cancelled() {
+                    return Err(EngineError::Cancelled);
+                }
                 let raw = RawNode::json(
                     RawNodeKind::ToolResult,
                     Some(state.session_id),
@@ -848,6 +855,65 @@ fn decode_tool_result_from_raw(node: &RawNode) -> Result<ToolCallResult> {
     }
 }
 
+fn prepare_tool_call_for_config(
+    mut call: ToolCallRequest,
+    tools: &ToolsConfig,
+) -> Result<ToolCallRequest> {
+    let bounds = MemoryToolBounds::from(tools);
+    match call.name.as_str() {
+        "semantic_search_memory" => {
+            ensure_tool_enabled(tools.memory_search, &call.name)?;
+            let mut params: MemorySearchParams =
+                serde_json::from_value(std::mem::take(&mut call.arguments)).map_err(|err| {
+                    EngineError::Tool(format!("invalid semantic search args: {err}"))
+                })?;
+            params.top_k = bounds.clamp_memory_search_top_k(params.top_k);
+            call.arguments = serde_json::to_value(params).map_err(|err| {
+                EngineError::Tool(format!("failed to encode semantic search args: {err}"))
+            })?;
+            Ok(call)
+        }
+        "graph_search_memory" => {
+            ensure_tool_enabled(tools.graph_search, &call.name)?;
+            let mut params: GraphSearchParams =
+                serde_json::from_value(std::mem::take(&mut call.arguments)).map_err(|err| {
+                    EngineError::Tool(format!("invalid graph search args: {err}"))
+                })?;
+            params.max_depth = bounds.clamp_graph_search_depth(params.max_depth);
+            call.arguments = serde_json::to_value(params).map_err(|err| {
+                EngineError::Tool(format!("failed to encode graph search args: {err}"))
+            })?;
+            Ok(call)
+        }
+        "provenance_lookup" => {
+            ensure_tool_enabled(tools.provenance_lookup, &call.name)?;
+            Ok(call)
+        }
+        "timeline_search" => {
+            ensure_tool_enabled(tools.timeline_search, &call.name)?;
+            let mut params: TimelineSearchParams =
+                serde_json::from_value(std::mem::take(&mut call.arguments))
+                    .map_err(|err| EngineError::Tool(format!("invalid timeline args: {err}")))?;
+            params.limit = bounds.clamp_timeline_search_limit(params.limit);
+            call.arguments = serde_json::to_value(params).map_err(|err| {
+                EngineError::Tool(format!("failed to encode timeline args: {err}"))
+            })?;
+            Ok(call)
+        }
+        _ => Ok(call),
+    }
+}
+
+fn ensure_tool_enabled(enabled: bool, tool_name: &str) -> Result<()> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(EngineError::Tool(format!(
+            "tool {tool_name} is disabled by config"
+        )))
+    }
+}
+
 fn user_input_operation_key(loop_id: LoopId) -> String {
     format!("loop:{loop_id}:user_input")
 }
@@ -867,10 +933,11 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use tokio::sync::Notify;
     use tokio::time::sleep;
     use tokio_util::sync::CancellationToken;
 
-    use crate::config::EngineConfig;
+    use crate::config::{EngineConfig, ToolsConfig};
     use crate::domain::{DistillationState, LoopStatus, RawNode, RawNodeKind};
     use crate::engine::execution_graph::{
         ExecutionGraph, ExecutionState, GraphNode, GraphRunner, NodeOutcome, ResolvedRunOptions,
@@ -880,10 +947,10 @@ mod tests {
         build_default_execution_graph, run_maintenance_pass, run_turn, run_turn_with_options,
         EngineDeps, SessionRequest,
     };
-    use crate::error::Result;
-    use crate::ids::{LoopId, SessionId};
+    use crate::error::{EngineError, Result};
+    use crate::ids::{AbstractNodeId, LoopId, SessionId};
     use crate::memory::scoring::DefaultScoringPolicy;
-    use crate::model::{ModelInput, ModelOutput, ModelRunner};
+    use crate::model::{ModelInput, ModelOutput, ModelRunner, ToolCallRequest};
     use crate::storage::object_store::{
         FileObjectStore, ObjectGraphRepository, ObjectLoopStateRepository, ObjectNodeRepository,
         ObjectVectorIndex,
@@ -896,8 +963,10 @@ mod tests {
         TestHashEmbedder, TestRuleBasedModelRunner, TestSimpleDistiller,
         TestWhitespaceTokenEstimator,
     };
-    use crate::tools::executor::DefaultToolExecutor;
-    use crate::tools::memory_tools::MemoryTools;
+    use crate::tools::executor::{DefaultToolExecutor, ToolCallResult, ToolExecutor};
+    use crate::tools::memory_tools::{
+        GraphSearchParams, MemorySearchParams, MemoryTools, TimelineSearchParams,
+    };
 
     fn build_demo_deps() -> EngineDeps {
         let repository = Arc::new(InMemoryNodeRepository::default());
@@ -955,6 +1024,15 @@ mod tests {
     struct FinishNode;
     struct LoopNode;
     struct SlowNode;
+    #[derive(Debug)]
+    struct PendingModelRunner {
+        started: Arc<Notify>,
+    }
+
+    #[derive(Debug)]
+    struct PendingToolExecutor {
+        started: Arc<Notify>,
+    }
 
     #[async_trait]
     impl GraphNode for PauseNode {
@@ -1031,6 +1109,24 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelRunner for PendingModelRunner {
+        async fn run(&self, _input: ModelInput) -> Result<ModelOutput> {
+            self.started.notify_waiters();
+            std::future::pending::<()>().await;
+            unreachable!("pending model runner should be cancelled before returning")
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for PendingToolExecutor {
+        async fn execute(&self, _call: ToolCallRequest) -> Result<ToolCallResult> {
+            self.started.notify_waiters();
+            std::future::pending::<()>().await;
+            unreachable!("pending tool executor should be cancelled before returning")
+        }
+    }
+
     #[tokio::test]
     async fn graph_runner_can_pause_and_resume() -> Result<()> {
         let deps = build_demo_deps();
@@ -1079,6 +1175,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_runner_rejects_resume_when_checkpoint_is_not_paused() -> Result<()> {
+        let deps = build_demo_deps();
+        let graph = ExecutionGraph::new("finish");
+        let runner = GraphRunner::new(Arc::new(graph));
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let request = SessionRequest {
+            session_id: Some(session_id),
+            user_message: "running".to_string(),
+            plan: None,
+        };
+        let state = ExecutionState::from_request(request, session_id, loop_id);
+        let checkpoint = state.checkpoint("finish".to_string(), LoopStatus::Running)?;
+
+        let err = runner
+            .resume(
+                checkpoint,
+                &EngineConfig::default(),
+                &deps,
+                &ResolvedRunOptions::from_config(&EngineConfig::default(), RunOptions::default()),
+            )
+            .await
+            .expect_err("running checkpoints must not resume");
+
+        assert!(matches!(
+            err,
+            EngineError::LoopTerminated(LoopStatus::Running)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn graph_runner_respects_cancellation() -> Result<()> {
         let deps = build_demo_deps();
         let token = CancellationToken::new();
@@ -1098,6 +1226,162 @@ mod tests {
         )
         .await?;
         assert_eq!(response.status, LoopStatus::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_model_execution() -> Result<()> {
+        let mut deps = build_demo_deps();
+        let started = Arc::new(Notify::new());
+        deps.model_runner = Arc::new(PendingModelRunner {
+            started: started.clone(),
+        });
+        let token = CancellationToken::new();
+        let run_token = token.clone();
+
+        let handle = tokio::spawn(async move {
+            run_turn_with_options(
+                &EngineConfig::default(),
+                &deps,
+                SessionRequest {
+                    session_id: None,
+                    user_message: "wait in model".to_string(),
+                    plan: None,
+                },
+                RunOptions {
+                    node_timeout: Some(Duration::from_secs(5)),
+                    cancellation_token: Some(run_token),
+                    ..RunOptions::default()
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("model runner did not start");
+        token.cancel();
+        let response = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cancelled model run timed out")
+            .expect("model task panicked")?;
+
+        assert_eq!(response.status, LoopStatus::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_tool_execution() -> Result<()> {
+        let mut deps = build_demo_deps();
+        let started = Arc::new(Notify::new());
+        deps.tool_executor = Arc::new(PendingToolExecutor {
+            started: started.clone(),
+        });
+        let token = CancellationToken::new();
+        let run_token = token.clone();
+
+        let handle = tokio::spawn(async move {
+            run_turn_with_options(
+                &EngineConfig::default(),
+                &deps,
+                SessionRequest {
+                    session_id: None,
+                    user_message: "timeline: recent".to_string(),
+                    plan: None,
+                },
+                RunOptions {
+                    tool_timeout: Some(Duration::from_secs(5)),
+                    cancellation_token: Some(run_token),
+                    ..RunOptions::default()
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("tool executor did not start");
+        token.cancel();
+        let response = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cancelled tool run timed out")
+            .expect("tool task panicked")?;
+
+        assert_eq!(response.status, LoopStatus::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_memory_search_tool_is_rejected() -> Result<()> {
+        let deps = build_demo_deps();
+        let mut config = EngineConfig::default();
+        config.tools.memory_search = false;
+
+        let err = run_turn(
+            &config,
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "memory: blocked".to_string(),
+                plan: None,
+            },
+        )
+        .await
+        .expect_err("disabled memory search should fail");
+
+        assert!(matches!(err, EngineError::Tool(message) if message.contains("disabled")));
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_tool_call_for_config_clamps_memory_tool_args() -> Result<()> {
+        let mut tools = ToolsConfig::default();
+        tools.max_memory_search_top_k = 2;
+        tools.max_graph_search_depth = 1;
+        tools.max_timeline_search_limit = 3;
+
+        let semantic = super::prepare_tool_call_for_config(
+            ToolCallRequest {
+                name: "semantic_search_memory".to_string(),
+                arguments: serde_json::json!({
+                    "query": "topic",
+                    "target": "both",
+                    "top_k": 100
+                }),
+            },
+            &tools,
+        )?;
+        let semantic_params: MemorySearchParams =
+            serde_json::from_value(semantic.arguments).expect("semantic args should deserialize");
+        assert_eq!(semantic_params.top_k, 2);
+
+        let graph = super::prepare_tool_call_for_config(
+            ToolCallRequest {
+                name: "graph_search_memory".to_string(),
+                arguments: serde_json::json!({
+                    "start_node_id": AbstractNodeId::new().to_string(),
+                    "max_depth": 100
+                }),
+            },
+            &tools,
+        )?;
+        let graph_params: GraphSearchParams =
+            serde_json::from_value(graph.arguments).expect("graph args should deserialize");
+        assert_eq!(graph_params.max_depth, 1);
+
+        let timeline = super::prepare_tool_call_for_config(
+            ToolCallRequest {
+                name: "timeline_search".to_string(),
+                arguments: serde_json::json!({
+                    "limit": 100
+                }),
+            },
+            &tools,
+        )?;
+        let timeline_params: TimelineSearchParams =
+            serde_json::from_value(timeline.arguments).expect("timeline args should deserialize");
+        assert_eq!(timeline_params.limit, 3);
+
         Ok(())
     }
 
