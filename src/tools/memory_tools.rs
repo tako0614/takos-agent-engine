@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::config::ToolsConfig;
 use crate::domain::{AbstractNode, RawNode};
 use crate::error::{EngineError, Result};
 use crate::ids::{AbstractNodeId, SessionId};
@@ -107,11 +108,49 @@ pub struct TimelineSearchResult {
     pub raw_nodes: Vec<RawNode>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryToolBounds {
+    pub max_memory_search_top_k: usize,
+    pub max_graph_search_depth: usize,
+    pub max_timeline_search_limit: usize,
+}
+
+impl Default for MemoryToolBounds {
+    fn default() -> Self {
+        Self::from(&ToolsConfig::default())
+    }
+}
+
+impl From<&ToolsConfig> for MemoryToolBounds {
+    fn from(config: &ToolsConfig) -> Self {
+        Self {
+            max_memory_search_top_k: config.max_memory_search_top_k,
+            max_graph_search_depth: config.max_graph_search_depth,
+            max_timeline_search_limit: config.max_timeline_search_limit,
+        }
+    }
+}
+
+impl MemoryToolBounds {
+    pub fn clamp_memory_search_top_k(&self, requested: usize) -> usize {
+        requested.max(1).min(self.max_memory_search_top_k.max(1))
+    }
+
+    pub fn clamp_graph_search_depth(&self, requested: usize) -> usize {
+        requested.min(self.max_graph_search_depth)
+    }
+
+    pub fn clamp_timeline_search_limit(&self, requested: usize) -> usize {
+        requested.max(1).min(self.max_timeline_search_limit.max(1))
+    }
+}
+
 pub struct MemoryTools {
     repository: Arc<dyn NodeRepository>,
     vector_index: Arc<dyn VectorIndex>,
     graph_repository: Arc<dyn GraphRepository>,
     embedder: Arc<dyn Embedder>,
+    bounds: MemoryToolBounds,
 }
 
 impl MemoryTools {
@@ -121,16 +160,33 @@ impl MemoryTools {
         graph_repository: Arc<dyn GraphRepository>,
         embedder: Arc<dyn Embedder>,
     ) -> Self {
+        Self::new_with_bounds(
+            repository,
+            vector_index,
+            graph_repository,
+            embedder,
+            MemoryToolBounds::default(),
+        )
+    }
+
+    pub fn new_with_bounds(
+        repository: Arc<dyn NodeRepository>,
+        vector_index: Arc<dyn VectorIndex>,
+        graph_repository: Arc<dyn GraphRepository>,
+        embedder: Arc<dyn Embedder>,
+        bounds: MemoryToolBounds,
+    ) -> Self {
         Self {
             repository,
             vector_index,
             graph_repository,
             embedder,
+            bounds,
         }
     }
 
     pub async fn semantic_search(&self, params: MemorySearchParams) -> Result<MemorySearchResult> {
-        let top_k = params.top_k.max(1);
+        let top_k = self.bounds.clamp_memory_search_top_k(params.top_k);
         let query_embedding = self.embedder.embed_text(&params.query).await?;
         let threshold = params.threshold.unwrap_or(0.0);
 
@@ -162,9 +218,10 @@ impl MemoryTools {
     pub async fn graph_search(&self, params: GraphSearchParams) -> Result<GraphSearchResult> {
         let start = AbstractNodeId::from_str(&params.start_node_id)
             .map_err(|err| EngineError::Tool(format!("invalid abstract node id: {err}")))?;
+        let max_depth = self.bounds.clamp_graph_search_depth(params.max_depth);
         let hits = self
             .graph_repository
-            .traverse(&start, params.max_depth, params.relation_types.as_deref())
+            .traverse(&start, max_depth, params.relation_types.as_deref())
             .await?;
 
         let ids: Vec<_> = hits.iter().map(|hit| hit.node_id).collect();
@@ -227,7 +284,7 @@ impl MemoryTools {
                 session_id.as_ref(),
                 params.from,
                 params.to,
-                params.limit.max(1),
+                self.bounds.clamp_timeline_search_limit(params.limit),
             )
             .await?;
         Ok(TimelineSearchResult { raw_nodes })
@@ -278,5 +335,425 @@ impl MemoryTools {
             }
         }
         Ok(hits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{
+        AbstractNode, AbstractNodeMetadata, GraphFragment, RawNode, RawNodeKind, References,
+        Relation,
+    };
+    use crate::model::Embedder;
+    use crate::storage::{InMemoryGraphRepository, InMemoryNodeRepository, InMemoryVectorIndex};
+    use crate::test_support::TestHashEmbedder;
+
+    struct TestHarness {
+        tools: MemoryTools,
+        repo: Arc<InMemoryNodeRepository>,
+        vector: Arc<InMemoryVectorIndex>,
+        graph: Arc<InMemoryGraphRepository>,
+        embedder: TestHashEmbedder,
+    }
+
+    fn setup() -> TestHarness {
+        setup_with_bounds(MemoryToolBounds::default())
+    }
+
+    fn setup_with_bounds(bounds: MemoryToolBounds) -> TestHarness {
+        let repo = Arc::new(InMemoryNodeRepository::default());
+        let vector = Arc::new(InMemoryVectorIndex::default());
+        let graph = Arc::new(InMemoryGraphRepository::default());
+        let embedder = TestHashEmbedder::default();
+
+        let tools = MemoryTools::new_with_bounds(
+            repo.clone() as Arc<dyn NodeRepository>,
+            vector.clone() as Arc<dyn VectorIndex>,
+            graph.clone() as Arc<dyn GraphRepository>,
+            Arc::new(embedder.clone()) as Arc<dyn Embedder>,
+            bounds,
+        );
+        TestHarness {
+            tools,
+            repo,
+            vector,
+            graph,
+            embedder,
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_search_empty_returns_no_hits() {
+        let h = setup();
+        let params = MemorySearchParams {
+            query: "hello".to_string(),
+            target: MemorySearchTarget::Both,
+            top_k: 5,
+            threshold: None,
+        };
+        let result = h.tools.semantic_search(params).await.unwrap();
+        assert!(result.raw_hits.is_empty());
+        assert!(result.abstract_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn semantic_search_returns_raw_hits() {
+        let h = setup();
+
+        let node = RawNode::text(
+            RawNodeKind::UserUtterance,
+            None,
+            None,
+            "user",
+            "hello world",
+            0.5,
+            Vec::new(),
+        );
+        let node_id = node.id;
+        let emb = h.embedder.embed_text("hello world").await.unwrap();
+        h.repo.insert_raw(node).await.unwrap();
+        h.vector.index_raw(node_id, emb).await.unwrap();
+
+        let params = MemorySearchParams {
+            query: "hello world".to_string(),
+            target: MemorySearchTarget::Raw,
+            top_k: 5,
+            threshold: None,
+        };
+        let result = h.tools.semantic_search(params).await.unwrap();
+        assert!(!result.raw_hits.is_empty());
+        assert_eq!(result.raw_hits[0].node.id, node_id);
+        assert!(result.abstract_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn semantic_search_returns_abstract_hits() {
+        let h = setup();
+
+        let node = AbstractNode::new(
+            "hello concept",
+            "a summary about hello",
+            References::default(),
+            GraphFragment::default(),
+            AbstractNodeMetadata::default(),
+        );
+        let node_id = node.id;
+        let emb = h
+            .embedder
+            .embed_text("hello concept: a summary about hello")
+            .await
+            .unwrap();
+        h.repo.insert_abstract(node).await.unwrap();
+        h.vector.index_abstract(node_id, emb).await.unwrap();
+
+        let params = MemorySearchParams {
+            query: "hello concept: a summary about hello".to_string(),
+            target: MemorySearchTarget::Abstract,
+            top_k: 5,
+            threshold: None,
+        };
+        let result = h.tools.semantic_search(params).await.unwrap();
+        assert!(result.raw_hits.is_empty());
+        assert!(!result.abstract_hits.is_empty());
+        assert_eq!(result.abstract_hits[0].node.id, node_id);
+    }
+
+    #[tokio::test]
+    async fn semantic_search_both_targets() {
+        let h = setup();
+
+        let raw = RawNode::text(
+            RawNodeKind::UserUtterance,
+            None,
+            None,
+            "user",
+            "shared topic here",
+            0.5,
+            Vec::new(),
+        );
+        let raw_id = raw.id;
+        let raw_emb = h.embedder.embed_text("shared topic here").await.unwrap();
+        h.repo.insert_raw(raw).await.unwrap();
+        h.vector.index_raw(raw_id, raw_emb).await.unwrap();
+
+        let abs = AbstractNode::new(
+            "shared topic",
+            "summary about shared topic",
+            References::default(),
+            GraphFragment::default(),
+            AbstractNodeMetadata::default(),
+        );
+        let abs_id = abs.id;
+        let abs_emb = h
+            .embedder
+            .embed_text("shared topic: summary about shared topic")
+            .await
+            .unwrap();
+        h.repo.insert_abstract(abs).await.unwrap();
+        h.vector.index_abstract(abs_id, abs_emb).await.unwrap();
+
+        let params = MemorySearchParams {
+            query: "shared topic".to_string(),
+            target: MemorySearchTarget::Both,
+            top_k: 5,
+            threshold: None,
+        };
+        let result = h.tools.semantic_search(params).await.unwrap();
+        assert!(!result.raw_hits.is_empty());
+        assert!(!result.abstract_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn semantic_search_respects_threshold() {
+        let h = setup();
+
+        let node = RawNode::text(
+            RawNodeKind::UserUtterance,
+            None,
+            None,
+            "user",
+            "apples and oranges",
+            0.5,
+            Vec::new(),
+        );
+        let node_id = node.id;
+        let emb = h.embedder.embed_text("apples and oranges").await.unwrap();
+        h.repo.insert_raw(node).await.unwrap();
+        h.vector.index_raw(node_id, emb).await.unwrap();
+
+        let params = MemorySearchParams {
+            query: "completely unrelated rockets in space".to_string(),
+            target: MemorySearchTarget::Raw,
+            top_k: 5,
+            threshold: Some(0.99),
+        };
+        let result = h.tools.semantic_search(params).await.unwrap();
+        assert!(result.raw_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn semantic_search_clamps_top_k_to_bounds() {
+        let h = setup_with_bounds(MemoryToolBounds {
+            max_memory_search_top_k: 2,
+            max_graph_search_depth: 4,
+            max_timeline_search_limit: 100,
+        });
+
+        for i in 0..5 {
+            let node = RawNode::text(
+                RawNodeKind::UserUtterance,
+                None,
+                None,
+                "user",
+                format!("shared topic {i}"),
+                0.5,
+                Vec::new(),
+            );
+            let node_id = node.id;
+            let emb = h.embedder.embed_text(&node.content_text()).await.unwrap();
+            h.repo.insert_raw(node).await.unwrap();
+            h.vector.index_raw(node_id, emb).await.unwrap();
+        }
+
+        let result = h
+            .tools
+            .semantic_search(MemorySearchParams {
+                query: "shared topic".to_string(),
+                target: MemorySearchTarget::Raw,
+                top_k: 100,
+                threshold: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.raw_hits.len() <= 2);
+    }
+
+    #[tokio::test]
+    async fn graph_search_clamps_depth_to_bounds() {
+        let h = setup_with_bounds(MemoryToolBounds {
+            max_memory_search_top_k: 32,
+            max_graph_search_depth: 1,
+            max_timeline_search_limit: 100,
+        });
+
+        let leaf = AbstractNode::new(
+            "leaf",
+            "leaf summary",
+            References::default(),
+            GraphFragment::default(),
+            AbstractNodeMetadata::default(),
+        );
+        let middle = AbstractNode::new(
+            "middle",
+            "middle summary",
+            References {
+                abstract_node_ids: vec![leaf.id],
+                raw_node_ids: Vec::new(),
+            },
+            GraphFragment::default(),
+            AbstractNodeMetadata::default(),
+        );
+        let root = AbstractNode::new(
+            "root",
+            "root summary",
+            References::default(),
+            GraphFragment {
+                entities: Vec::new(),
+                relations: vec![Relation {
+                    subject: "root".to_string(),
+                    predicate: "links".to_string(),
+                    object: middle.id.to_string(),
+                    weight: 1.0,
+                    provenance_raw_node_ids: Vec::new(),
+                }],
+            },
+            AbstractNodeMetadata::default(),
+        );
+
+        for node in [&root, &middle, &leaf] {
+            h.repo.insert_abstract(node.clone()).await.unwrap();
+            h.graph.index_abstract(node).await.unwrap();
+        }
+
+        let result = h
+            .tools
+            .graph_search(GraphSearchParams {
+                start_node_id: root.id.to_string(),
+                max_depth: 10,
+                relation_types: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.hits.len(), 2);
+        assert!(result.hits.iter().all(|hit| hit.depth <= 1));
+    }
+
+    #[tokio::test]
+    async fn timeline_search_empty() {
+        let h = setup();
+        let params = TimelineSearchParams {
+            session_id: None,
+            from: None,
+            to: None,
+            limit: 10,
+        };
+        let result = h.tools.timeline_search(params).await.unwrap();
+        assert!(result.raw_nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeline_search_returns_recent_nodes() {
+        let h = setup();
+
+        for i in 0..5 {
+            let node = RawNode::text(
+                RawNodeKind::UserUtterance,
+                None,
+                None,
+                "user",
+                &format!("message {i}"),
+                0.5,
+                Vec::new(),
+            );
+            h.repo.insert_raw(node).await.unwrap();
+        }
+
+        let params = TimelineSearchParams {
+            session_id: None,
+            from: None,
+            to: None,
+            limit: 3,
+        };
+        let result = h.tools.timeline_search(params).await.unwrap();
+        assert_eq!(result.raw_nodes.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn timeline_search_clamps_limit_to_bounds() {
+        let h = setup_with_bounds(MemoryToolBounds {
+            max_memory_search_top_k: 32,
+            max_graph_search_depth: 4,
+            max_timeline_search_limit: 2,
+        });
+
+        for i in 0..5 {
+            let node = RawNode::text(
+                RawNodeKind::UserUtterance,
+                None,
+                None,
+                "user",
+                &format!("message {i}"),
+                0.5,
+                Vec::new(),
+            );
+            h.repo.insert_raw(node).await.unwrap();
+        }
+
+        let result = h
+            .tools
+            .timeline_search(TimelineSearchParams {
+                session_id: None,
+                from: None,
+                to: None,
+                limit: 100,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.raw_nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn timeline_search_with_session_filter() {
+        let h = setup();
+        let sid = SessionId::new();
+
+        let in_session = RawNode::text(
+            RawNodeKind::UserUtterance,
+            Some(sid),
+            None,
+            "user",
+            "in session",
+            0.5,
+            Vec::new(),
+        );
+        h.repo.insert_raw(in_session).await.unwrap();
+
+        let outside = RawNode::text(
+            RawNodeKind::UserUtterance,
+            None,
+            None,
+            "user",
+            "outside session",
+            0.5,
+            Vec::new(),
+        );
+        h.repo.insert_raw(outside).await.unwrap();
+
+        let params = TimelineSearchParams {
+            session_id: Some(sid.to_string()),
+            from: None,
+            to: None,
+            limit: 10,
+        };
+        let result = h.tools.timeline_search(params).await.unwrap();
+        assert_eq!(result.raw_nodes.len(), 1);
+        assert_eq!(result.raw_nodes[0].content_text(), "in session");
+    }
+
+    #[tokio::test]
+    async fn timeline_search_invalid_session_id_returns_error() {
+        let h = setup();
+        let params = TimelineSearchParams {
+            session_id: Some("not-a-uuid".to_string()),
+            from: None,
+            to: None,
+            limit: 10,
+        };
+        let result = h.tools.timeline_search(params).await;
+        assert!(result.is_err());
     }
 }

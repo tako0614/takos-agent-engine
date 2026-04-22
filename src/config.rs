@@ -70,6 +70,21 @@ impl EngineConfig {
                 "runtime.maintenance_batch_size must be greater than 0".to_string(),
             ));
         }
+        if self.tools.max_memory_search_top_k == 0 {
+            return Err(EngineError::Configuration(
+                "tools.max_memory_search_top_k must be greater than 0".to_string(),
+            ));
+        }
+        if self.tools.max_graph_search_depth == 0 {
+            return Err(EngineError::Configuration(
+                "tools.max_graph_search_depth must be greater than 0".to_string(),
+            ));
+        }
+        if self.tools.max_timeline_search_limit == 0 {
+            return Err(EngineError::Configuration(
+                "tools.max_timeline_search_limit must be greater than 0".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -203,6 +218,12 @@ pub struct ToolsConfig {
     pub graph_search: bool,
     pub provenance_lookup: bool,
     pub timeline_search: bool,
+    #[serde(default = "default_max_memory_search_top_k")]
+    pub max_memory_search_top_k: usize,
+    #[serde(default = "default_max_graph_search_depth")]
+    pub max_graph_search_depth: usize,
+    #[serde(default = "default_max_timeline_search_limit")]
+    pub max_timeline_search_limit: usize,
 }
 
 impl Default for ToolsConfig {
@@ -212,8 +233,23 @@ impl Default for ToolsConfig {
             graph_search: true,
             provenance_lookup: true,
             timeline_search: true,
+            max_memory_search_top_k: default_max_memory_search_top_k(),
+            max_graph_search_depth: default_max_graph_search_depth(),
+            max_timeline_search_limit: default_max_timeline_search_limit(),
         }
     }
+}
+
+pub(crate) fn default_max_memory_search_top_k() -> usize {
+    32
+}
+
+pub(crate) fn default_max_graph_search_depth() -> usize {
+    4
+}
+
+pub(crate) fn default_max_timeline_search_limit() -> usize {
+    100
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,11 +265,11 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            max_graph_steps: 32,
-            max_tool_rounds: 4,
-            node_timeout_ms: 5_000,
-            tool_timeout_ms: 8_000,
-            distillation_timeout_ms: 8_000,
+            max_graph_steps: 64,
+            max_tool_rounds: 8,
+            node_timeout_ms: 10_000,
+            tool_timeout_ms: 30_000,
+            distillation_timeout_ms: 15_000,
             maintenance_batch_size: 32,
         }
     }
@@ -298,16 +334,34 @@ mod tests {
             graph_search = true
             provenance_lookup = true
             timeline_search = true
+            max_memory_search_top_k = 32
+            max_graph_search_depth = 4
+            max_timeline_search_limit = 100
 
             [runtime]
-            max_graph_steps = 32
-            max_tool_rounds = 4
-            node_timeout_ms = 5000
-            tool_timeout_ms = 8000
-            distillation_timeout_ms = 8000
+            max_graph_steps = 64
+            max_tool_rounds = 8
+            node_timeout_ms = 10000
+            tool_timeout_ms = 30000
+            distillation_timeout_ms = 15000
             maintenance_batch_size = 32
             "#,
         );
         assert!(config.is_ok());
+    }
+
+    #[test]
+    fn config_rejects_zero_tool_bounds() {
+        let mut config = EngineConfig::default();
+        config.tools.max_memory_search_top_k = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = EngineConfig::default();
+        config.tools.max_graph_search_depth = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = EngineConfig::default();
+        config.tools.max_timeline_search_limit = 0;
+        assert!(config.validate().is_err());
     }
 }
