@@ -1335,10 +1335,12 @@ mod tests {
 
     #[test]
     fn prepare_tool_call_for_config_clamps_memory_tool_args() -> Result<()> {
-        let mut tools = ToolsConfig::default();
-        tools.max_memory_search_top_k = 2;
-        tools.max_graph_search_depth = 1;
-        tools.max_timeline_search_limit = 3;
+        let tools = ToolsConfig {
+            max_memory_search_top_k: 2,
+            max_graph_search_depth: 1,
+            max_timeline_search_limit: 3,
+            ..ToolsConfig::default()
+        };
 
         let semantic = super::prepare_tool_call_for_config(
             ToolCallRequest {
