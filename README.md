@@ -2,7 +2,7 @@
 
 Rust で書かれた Takos の agent engine。session 履歴と長期 memory を同一基盤で扱い、RawNode / AbstractNode の二層記憶を
 activation しながら checkpoint 可能な graph runtime で長期継続実行する。 この repository が engine library
-の正本であり、 service wrapper は sibling repository の `takos-agent/` が持つ。agent runtime の境界は
+の正本であり、 service wrapper は sibling repository の `agent/` が持つ。agent runtime の境界は
 [Agent Runtime](docs/agent-runtime.md) を参照。
 
 ## 設計理念
