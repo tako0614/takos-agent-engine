@@ -42,6 +42,20 @@ const RUN_MODEL_AFTER_TOOLS_NODE: &str = "run_model_after_tools";
 const PERSIST_ASSISTANT_OUTPUT_NODE: &str = "persist_assistant_output";
 const MARK_SESSION_OVERFLOW_NODE: &str = "mark_session_overflow";
 const DISTILL_CURRENT_LOOP_NODE: &str = "distill_current_loop";
+const BUILD_PLANNER_ACTIVATION_QUERY_NODE: &str = "build_planner_activation_query";
+const ACTIVATE_PLANNER_MEMORY_NODE: &str = "activate_planner_memory";
+const ASSEMBLE_PLANNER_CONTEXT_NODE: &str = "assemble_planner_context";
+const RUN_PLANNER_MODEL_NODE: &str = "run_planner_model";
+const CAPTURE_PLANNER_OUTPUT_NODE: &str = "capture_planner_output";
+const BUILD_SUBGOAL_ACTIVATION_QUERY_NODE: &str = "build_subgoal_activation_query";
+const ACTIVATE_SUBGOAL_MEMORY_NODE: &str = "activate_subgoal_memory";
+const ASSEMBLE_SUBGOAL_CONTEXT_NODE: &str = "assemble_subgoal_context";
+const RUN_SUBGOAL_MODEL_NODE: &str = "run_subgoal_model";
+const BUILD_SUBGOAL_FOLLOWUP_ACTIVATION_QUERY_NODE: &str =
+    "build_subgoal_followup_activation_query";
+const REACTIVATE_SUBGOAL_MEMORY_NODE: &str = "reactivate_subgoal_memory";
+const REASSEMBLE_SUBGOAL_CONTEXT_NODE: &str = "reassemble_subgoal_context";
+const RUN_SUBGOAL_MODEL_AFTER_TOOLS_NODE: &str = "run_subgoal_model_after_tools";
 
 #[derive(Clone)]
 pub struct EngineDeps {
@@ -91,6 +105,13 @@ pub struct SessionResponse {
     pub tool_rounds_completed: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionGraphPreset {
+    Default,
+    Planner,
+    Subgoal,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintenanceReport {
     pub processed_loops: usize,
@@ -123,7 +144,7 @@ pub async fn run_turn_with_options(
     tracing::Span::current().record("loop_id", tracing::field::display(loop_id));
 
     let resolved_options = ResolvedRunOptions::from_config(config, options);
-    let graph = Arc::new(build_default_execution_graph());
+    let graph = Arc::new(build_execution_graph_preset(ExecutionGraphPreset::Default));
     let runner = GraphRunner::new(graph);
     let mut state = ExecutionState::from_request(request, session_id, loop_id);
     let result = runner
@@ -155,7 +176,7 @@ pub async fn resume_loop(
         })?;
 
     let resolved_options = ResolvedRunOptions::from_config(config, options);
-    let graph = Arc::new(build_default_execution_graph());
+    let graph = Arc::new(build_execution_graph_preset(ExecutionGraphPreset::Default));
     let runner = GraphRunner::new(graph);
     let (state, result) = runner
         .resume(checkpoint, config, deps, &resolved_options)
@@ -222,7 +243,15 @@ pub async fn run_maintenance_pass(
     Ok(report)
 }
 
-pub(crate) fn build_default_execution_graph() -> ExecutionGraph {
+pub fn build_execution_graph_preset(preset: ExecutionGraphPreset) -> ExecutionGraph {
+    match preset {
+        ExecutionGraphPreset::Default => build_default_execution_graph(),
+        ExecutionGraphPreset::Planner => build_planner_execution_graph(),
+        ExecutionGraphPreset::Subgoal => build_subgoal_execution_graph(),
+    }
+}
+
+pub fn build_default_execution_graph() -> ExecutionGraph {
     let mut graph = ExecutionGraph::new(INGEST_USER_INPUT_NODE);
     graph.add_node(Arc::new(IngestUserInputNode));
     graph.add_node(Arc::new(LoadSessionViewNode));
@@ -236,7 +265,10 @@ pub(crate) fn build_default_execution_graph() -> ExecutionGraph {
         id: ASSEMBLE_CONTEXT_NODE,
         reload_session: false,
     }));
-    graph.add_node(Arc::new(ModelNode { id: RUN_MODEL_NODE }));
+    graph.add_node(Arc::new(ModelNode {
+        id: RUN_MODEL_NODE,
+        allow_tools: true,
+    }));
     graph.add_node(Arc::new(ExecuteToolsNode));
     graph.add_node(Arc::new(BuildActivationQueryNode {
         id: BUILD_FOLLOWUP_ACTIVATION_QUERY_NODE,
@@ -250,8 +282,11 @@ pub(crate) fn build_default_execution_graph() -> ExecutionGraph {
     }));
     graph.add_node(Arc::new(ModelNode {
         id: RUN_MODEL_AFTER_TOOLS_NODE,
+        allow_tools: true,
     }));
-    graph.add_node(Arc::new(PersistAssistantOutputNode));
+    graph.add_node(Arc::new(PersistAssistantOutputNode {
+        finish_after_persist: false,
+    }));
     graph.add_node(Arc::new(MarkSessionOverflowNode));
     graph.add_node(Arc::new(DistillCurrentLoopNode));
 
@@ -309,6 +344,162 @@ pub(crate) fn build_default_execution_graph() -> ExecutionGraph {
         MARK_SESSION_OVERFLOW_NODE,
         DEFAULT_EDGE,
         DISTILL_CURRENT_LOOP_NODE,
+    );
+
+    graph
+}
+
+pub fn build_planner_execution_graph() -> ExecutionGraph {
+    let mut graph = ExecutionGraph::new(INGEST_USER_INPUT_NODE);
+    graph.add_node(Arc::new(IngestUserInputNode));
+    graph.add_node(Arc::new(LoadSessionViewNode));
+    graph.add_node(Arc::new(BuildActivationQueryNode {
+        id: BUILD_PLANNER_ACTIVATION_QUERY_NODE,
+    }));
+    graph.add_node(Arc::new(ActivateMemoryNode {
+        id: ACTIVATE_PLANNER_MEMORY_NODE,
+    }));
+    graph.add_node(Arc::new(AssembleContextNode {
+        id: ASSEMBLE_PLANNER_CONTEXT_NODE,
+        reload_session: false,
+    }));
+    graph.add_node(Arc::new(ModelNode {
+        id: RUN_PLANNER_MODEL_NODE,
+        allow_tools: false,
+    }));
+    graph.add_node(Arc::new(CapturePlannerOutputNode));
+    graph.add_node(Arc::new(PersistAssistantOutputNode {
+        finish_after_persist: true,
+    }));
+
+    graph.add_edge(INGEST_USER_INPUT_NODE, DEFAULT_EDGE, LOAD_SESSION_VIEW_NODE);
+    graph.add_edge(
+        LOAD_SESSION_VIEW_NODE,
+        DEFAULT_EDGE,
+        BUILD_PLANNER_ACTIVATION_QUERY_NODE,
+    );
+    graph.add_edge(
+        BUILD_PLANNER_ACTIVATION_QUERY_NODE,
+        DEFAULT_EDGE,
+        ACTIVATE_PLANNER_MEMORY_NODE,
+    );
+    graph.add_edge(
+        ACTIVATE_PLANNER_MEMORY_NODE,
+        DEFAULT_EDGE,
+        ASSEMBLE_PLANNER_CONTEXT_NODE,
+    );
+    graph.add_edge(
+        ASSEMBLE_PLANNER_CONTEXT_NODE,
+        DEFAULT_EDGE,
+        RUN_PLANNER_MODEL_NODE,
+    );
+    graph.add_edge(
+        RUN_PLANNER_MODEL_NODE,
+        DEFAULT_EDGE,
+        CAPTURE_PLANNER_OUTPUT_NODE,
+    );
+    graph.add_edge(
+        CAPTURE_PLANNER_OUTPUT_NODE,
+        DEFAULT_EDGE,
+        PERSIST_ASSISTANT_OUTPUT_NODE,
+    );
+
+    graph
+}
+
+pub fn build_subgoal_execution_graph() -> ExecutionGraph {
+    let mut graph = ExecutionGraph::new(INGEST_USER_INPUT_NODE);
+    graph.add_node(Arc::new(IngestUserInputNode));
+    graph.add_node(Arc::new(LoadSessionViewNode));
+    graph.add_node(Arc::new(BuildActivationQueryNode {
+        id: BUILD_SUBGOAL_ACTIVATION_QUERY_NODE,
+    }));
+    graph.add_node(Arc::new(ActivateMemoryNode {
+        id: ACTIVATE_SUBGOAL_MEMORY_NODE,
+    }));
+    graph.add_node(Arc::new(AssembleContextNode {
+        id: ASSEMBLE_SUBGOAL_CONTEXT_NODE,
+        reload_session: false,
+    }));
+    graph.add_node(Arc::new(ModelNode {
+        id: RUN_SUBGOAL_MODEL_NODE,
+        allow_tools: true,
+    }));
+    graph.add_node(Arc::new(ExecuteToolsNode));
+    graph.add_node(Arc::new(BuildActivationQueryNode {
+        id: BUILD_SUBGOAL_FOLLOWUP_ACTIVATION_QUERY_NODE,
+    }));
+    graph.add_node(Arc::new(ActivateMemoryNode {
+        id: REACTIVATE_SUBGOAL_MEMORY_NODE,
+    }));
+    graph.add_node(Arc::new(AssembleContextNode {
+        id: REASSEMBLE_SUBGOAL_CONTEXT_NODE,
+        reload_session: true,
+    }));
+    graph.add_node(Arc::new(ModelNode {
+        id: RUN_SUBGOAL_MODEL_AFTER_TOOLS_NODE,
+        allow_tools: true,
+    }));
+    graph.add_node(Arc::new(PersistAssistantOutputNode {
+        finish_after_persist: true,
+    }));
+
+    graph.add_edge(INGEST_USER_INPUT_NODE, DEFAULT_EDGE, LOAD_SESSION_VIEW_NODE);
+    graph.add_edge(
+        LOAD_SESSION_VIEW_NODE,
+        DEFAULT_EDGE,
+        BUILD_SUBGOAL_ACTIVATION_QUERY_NODE,
+    );
+    graph.add_edge(
+        BUILD_SUBGOAL_ACTIVATION_QUERY_NODE,
+        DEFAULT_EDGE,
+        ACTIVATE_SUBGOAL_MEMORY_NODE,
+    );
+    graph.add_edge(
+        ACTIVATE_SUBGOAL_MEMORY_NODE,
+        DEFAULT_EDGE,
+        ASSEMBLE_SUBGOAL_CONTEXT_NODE,
+    );
+    graph.add_edge(
+        ASSEMBLE_SUBGOAL_CONTEXT_NODE,
+        DEFAULT_EDGE,
+        RUN_SUBGOAL_MODEL_NODE,
+    );
+    graph.add_edge(
+        RUN_SUBGOAL_MODEL_NODE,
+        DEFAULT_EDGE,
+        PERSIST_ASSISTANT_OUTPUT_NODE,
+    );
+    graph.add_edge(RUN_SUBGOAL_MODEL_NODE, "needs_tools", EXECUTE_TOOLS_NODE);
+    graph.add_edge(
+        EXECUTE_TOOLS_NODE,
+        DEFAULT_EDGE,
+        BUILD_SUBGOAL_FOLLOWUP_ACTIVATION_QUERY_NODE,
+    );
+    graph.add_edge(
+        BUILD_SUBGOAL_FOLLOWUP_ACTIVATION_QUERY_NODE,
+        DEFAULT_EDGE,
+        REACTIVATE_SUBGOAL_MEMORY_NODE,
+    );
+    graph.add_edge(
+        REACTIVATE_SUBGOAL_MEMORY_NODE,
+        DEFAULT_EDGE,
+        REASSEMBLE_SUBGOAL_CONTEXT_NODE,
+    );
+    graph.add_edge(
+        REASSEMBLE_SUBGOAL_CONTEXT_NODE,
+        DEFAULT_EDGE,
+        RUN_SUBGOAL_MODEL_AFTER_TOOLS_NODE,
+    );
+    graph.add_edge(
+        RUN_SUBGOAL_MODEL_AFTER_TOOLS_NODE,
+        DEFAULT_EDGE,
+        PERSIST_ASSISTANT_OUTPUT_NODE,
+    );
+    graph.add_edge(
+        RUN_SUBGOAL_MODEL_AFTER_TOOLS_NODE,
+        "needs_tools",
+        EXECUTE_TOOLS_NODE,
     );
 
     graph
@@ -478,6 +669,7 @@ impl GraphNode for AssembleContextNode {
 
 struct ModelNode {
     id: &'static str,
+    allow_tools: bool,
 }
 
 #[async_trait]
@@ -513,18 +705,58 @@ impl GraphNode for ModelNode {
         }
         state.latest_model_output = Some(output.clone());
 
-        if !state.pending_tool_calls.is_empty()
+        if self.allow_tools
+            && !state.pending_tool_calls.is_empty()
             && state.tool_rounds_completed < options.max_tool_rounds
         {
             return Ok(NodeOutcome::Branch("needs_tools".to_string()));
         }
 
         if !state.pending_tool_calls.is_empty() && state.assistant_message.is_none() {
-            state.assistant_message = Some(format!(
-                "Tool round limit reached after {} rounds without a final assistant message.",
-                options.max_tool_rounds
-            ));
+            let message = if self.allow_tools {
+                format!(
+                    "Tool round limit reached after {} rounds without a final assistant message.",
+                    options.max_tool_rounds
+                )
+            } else {
+                "Tool execution is disabled for this graph preset.".to_string()
+            };
+            state.assistant_message = Some(message);
         }
+        if !self.allow_tools {
+            state.pending_tool_calls.clear();
+        }
+        Ok(NodeOutcome::Continue)
+    }
+}
+
+struct CapturePlannerOutputNode;
+
+#[async_trait]
+impl GraphNode for CapturePlannerOutputNode {
+    fn id(&self) -> &'static str {
+        CAPTURE_PLANNER_OUTPUT_NODE
+    }
+
+    async fn run(
+        &self,
+        state: &mut ExecutionState,
+        _config: &EngineConfig,
+        _deps: &EngineDeps,
+        _options: &ResolvedRunOptions,
+    ) -> Result<NodeOutcome> {
+        let planner_output = state
+            .assistant_message
+            .clone()
+            .or_else(|| {
+                state
+                    .latest_model_output
+                    .as_ref()
+                    .and_then(|output| output.assistant_message.clone())
+            })
+            .unwrap_or_else(|| "No assistant message generated.".to_string());
+        state.assistant_message = Some(planner_output.clone());
+        state.plan = Some(planner_output);
         Ok(NodeOutcome::Continue)
     }
 }
@@ -595,7 +827,9 @@ impl GraphNode for ExecuteToolsNode {
     }
 }
 
-struct PersistAssistantOutputNode;
+struct PersistAssistantOutputNode {
+    finish_after_persist: bool,
+}
 
 #[async_trait]
 impl GraphNode for PersistAssistantOutputNode {
@@ -633,7 +867,11 @@ impl GraphNode for PersistAssistantOutputNode {
         let node = persist_raw_node(deps, node).await?;
         state.assistant_message = Some(assistant_message);
         push_raw_node_into_state(state, node);
-        Ok(NodeOutcome::Continue)
+        if self.finish_after_persist {
+            Ok(NodeOutcome::Finish)
+        } else {
+            Ok(NodeOutcome::Continue)
+        }
     }
 }
 
@@ -944,8 +1182,9 @@ mod tests {
         RunOptions, DEFAULT_EDGE,
     };
     use crate::engine::session_engine::{
-        build_default_execution_graph, run_maintenance_pass, run_turn, run_turn_with_options,
-        EngineDeps, SessionRequest,
+        build_default_execution_graph, build_execution_graph_preset, build_planner_execution_graph,
+        build_subgoal_execution_graph, run_maintenance_pass, run_turn, run_turn_with_options,
+        EngineDeps, ExecutionGraphPreset, SessionRequest,
     };
     use crate::error::{EngineError, Result};
     use crate::ids::{AbstractNodeId, LoopId, SessionId};
@@ -1581,6 +1820,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planner_graph_captures_model_output_as_plan_without_tools() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(RepeatingToolModelRunner);
+        let graph = build_execution_graph_preset(ExecutionGraphPreset::Planner);
+        let runner = GraphRunner::new(Arc::new(graph));
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let request = SessionRequest {
+            session_id: Some(session_id),
+            user_message: "create a plan".to_string(),
+            plan: None,
+        };
+        let mut state = ExecutionState::from_request(request, session_id, loop_id);
+
+        let result = runner
+            .run(
+                &mut state,
+                &EngineConfig::default(),
+                &deps,
+                &ResolvedRunOptions::from_config(&EngineConfig::default(), RunOptions::default()),
+            )
+            .await?;
+
+        assert_eq!(result.status, LoopStatus::Finished);
+        assert_eq!(result.tool_rounds_completed, 0);
+        assert!(state.pending_tool_calls.is_empty());
+        assert_eq!(
+            state.assistant_message.as_deref(),
+            Some("Tool execution is disabled for this graph preset.")
+        );
+        assert_eq!(state.plan, state.assistant_message);
+        assert!(state.new_abstract_ids.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subgoal_graph_runs_tool_loop_without_distillation() -> Result<()> {
+        let deps = build_demo_deps();
+        let graph = build_subgoal_execution_graph();
+        let runner = GraphRunner::new(Arc::new(graph));
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let request = SessionRequest {
+            session_id: Some(session_id),
+            user_message: "timeline: recent".to_string(),
+            plan: Some("Use the timeline to answer the subgoal.".to_string()),
+        };
+        let mut state = ExecutionState::from_request(request, session_id, loop_id);
+
+        let result = runner
+            .run(
+                &mut state,
+                &EngineConfig::default(),
+                &deps,
+                &ResolvedRunOptions::from_config(&EngineConfig::default(), RunOptions::default()),
+            )
+            .await?;
+
+        assert_eq!(result.status, LoopStatus::Finished);
+        assert_eq!(result.tool_rounds_completed, 1);
+        assert_eq!(state.tool_results.len(), 1);
+        assert!(state.assistant_message.is_some());
+        assert!(state.new_abstract_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn named_graph_builders_return_runnable_presets() {
+        assert_eq!(
+            build_planner_execution_graph().start_node(),
+            super::INGEST_USER_INPUT_NODE
+        );
+        assert_eq!(
+            build_execution_graph_preset(ExecutionGraphPreset::Subgoal).start_node(),
+            super::INGEST_USER_INPUT_NODE
+        );
+    }
+
+    #[tokio::test]
     async fn default_graph_bounds_multi_step_tool_rounds() -> Result<()> {
         let mut deps = build_demo_deps();
         deps.model_runner = Arc::new(RepeatingToolModelRunner);
@@ -1607,5 +1925,23 @@ mod tests {
     #[test]
     fn default_graph_contains_expected_nodes() {
         let _graph = build_default_execution_graph();
+    }
+
+    #[test]
+    fn operation_key_formats_are_stable() {
+        let loop_id = LoopId::new();
+
+        assert_eq!(
+            super::user_input_operation_key(loop_id),
+            format!("loop:{loop_id}:user_input")
+        );
+        assert_eq!(
+            super::tool_result_operation_key(loop_id, 2, 3, "timeline_search"),
+            format!("loop:{loop_id}:tool:2:3:timeline_search")
+        );
+        assert_eq!(
+            super::assistant_output_operation_key(loop_id),
+            format!("loop:{loop_id}:assistant_output")
+        );
     }
 }
