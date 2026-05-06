@@ -1,0 +1,7 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: takos-agent-engine
+Source: https://github.com/tako0614/takos-agent-engine
+
+Files: *
+Copyright: 2026 Takos Contributors
+License: MIT
