@@ -306,7 +306,7 @@ impl FederatedMemoryTools {
 }
 
 fn sort_federated_hits(hits: &mut [FederatedMemoryHit]) {
-    hits.sort_by(|left, right| compare_federated_hits(left, right));
+    hits.sort_by(compare_federated_hits);
 }
 
 fn compare_federated_hits(left: &FederatedMemoryHit, right: &FederatedMemoryHit) -> Ordering {
@@ -330,7 +330,7 @@ fn sort_federated_graph_hits(hits: &mut [FederatedGraphSearchHit]) {
 }
 
 fn sort_federated_timeline_nodes(nodes: &mut [FederatedTimelineRawNode]) {
-    nodes.sort_by(|left, right| compare_timeline_position(left, right));
+    nodes.sort_by(compare_timeline_position);
 }
 
 fn compare_timeline_position(
