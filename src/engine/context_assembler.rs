@@ -32,6 +32,20 @@ pub struct ContextAssembler {
     estimator: Arc<dyn TokenEstimator>,
 }
 
+/// Split `remaining` proportionally by `ratio` (expected to be in `0..=1`).
+///
+/// Uses fixed-point integer arithmetic so the result stays bounded by
+/// `remaining` and the conversion from the f32 ratio is the only float cast,
+/// constrained to a known small range.
+fn split_budget(remaining: usize, ratio: f32) -> usize {
+    const SCALE: u128 = 1_000_000;
+    let clamped = ratio.clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let numerator = (f64::from(clamped) * 1_000_000.0).round() as u128;
+    let scaled = (remaining as u128).saturating_mul(numerator) / SCALE;
+    usize::try_from(scaled).unwrap_or(remaining)
+}
+
 impl ContextAssembler {
     pub fn new(estimator: Arc<dyn TokenEstimator>) -> Self {
         Self { estimator }
@@ -48,9 +62,7 @@ impl ContextAssembler {
     ) -> AssembledContext {
         let mut total_tokens = self.estimator.estimate_text(system_prompt);
         let remaining = budget.remaining_tokens();
-        let session_budget = (remaining as f64 * f64::from(budget.session_ratio))
-            .round()
-            .clamp(0.0, remaining as f64) as usize;
+        let session_budget = split_budget(remaining, budget.session_ratio);
         let memory_budget = remaining.saturating_sub(session_budget);
 
         let (session_context, session_window) =

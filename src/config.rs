@@ -226,6 +226,9 @@ impl ContextBudgetConfig {
     }
 }
 
+// Each bool toggles an independent tool; serde-mapped from TOML scalars, so
+// a bitflags struct would obscure the operator-facing configuration shape.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolsConfig {
     pub memory_search: bool,

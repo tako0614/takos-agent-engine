@@ -382,6 +382,10 @@ impl GraphRunner {
         })
     }
 
+    // Each iteration handles one node — splitting the match arms into helpers
+    // would just spread the lifecycle (cancellation / timeout / error / outcome
+    // / branching / completion) across functions that all need the same locals.
+    #[allow(clippy::too_many_lines)]
     async fn run_from_node(
         &self,
         mut current_node: String,
@@ -390,6 +394,11 @@ impl GraphRunner {
         deps: &EngineDeps,
         options: &ResolvedRunOptions,
     ) -> Result<GraphRunResult> {
+        enum NodeExecutionResult {
+            Completed(std::result::Result<Result<NodeOutcome>, tokio::time::error::Elapsed>),
+            Cancelled,
+        }
+
         loop {
             if options.is_cancelled() {
                 return self
@@ -428,10 +437,6 @@ impl GraphRunner {
                 step = state.iteration,
                 "running execution node"
             );
-            enum NodeExecutionResult {
-                Completed(std::result::Result<Result<NodeOutcome>, tokio::time::error::Elapsed>),
-                Cancelled,
-            }
 
             let run_node = timeout(
                 options.timeout_for_class(node.runtime_class()),
@@ -447,17 +452,13 @@ impl GraphRunner {
             };
 
             let outcome = match execution {
-                NodeExecutionResult::Cancelled => {
+                NodeExecutionResult::Cancelled
+                | NodeExecutionResult::Completed(Ok(Err(EngineError::Cancelled))) => {
                     return self
                         .save_cancelled_checkpoint(&current_node, state, deps)
                         .await;
                 }
                 NodeExecutionResult::Completed(Ok(Ok(outcome))) => outcome,
-                NodeExecutionResult::Completed(Ok(Err(EngineError::Cancelled))) => {
-                    return self
-                        .save_cancelled_checkpoint(&current_node, state, deps)
-                        .await;
-                }
                 NodeExecutionResult::Completed(Ok(Err(error))) => {
                     let failed = state.checkpoint(current_node.clone(), LoopStatus::Failed)?;
                     deps.loop_state_repository.save_checkpoint(failed).await?;
