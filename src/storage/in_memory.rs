@@ -146,8 +146,8 @@ impl NodeRepository for InMemoryNodeRepository {
             self.raw_nodes.read().await.values().cloned().collect()
         };
         nodes.retain(|node| {
-            let lower_ok = from.map(|value| node.timestamp >= value).unwrap_or(true);
-            let upper_ok = to.map(|value| node.timestamp <= value).unwrap_or(true);
+            let lower_ok = from.is_none_or(|value| node.timestamp >= value);
+            let upper_ok = to.is_none_or(|value| node.timestamp <= value);
             lower_ok && upper_ok
         });
         nodes.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
