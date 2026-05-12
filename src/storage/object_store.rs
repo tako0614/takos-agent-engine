@@ -348,6 +348,7 @@ impl FileObjectStore {
         self.vector_index_dir().join("abstract_embeddings.json")
     }
 
+    #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
     fn write_json<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
@@ -379,6 +380,7 @@ impl FileObjectStore {
         Ok(())
     }
 
+    #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
     fn read_json<T: DeserializeOwned>(&self, path: &Path) -> Result<T> {
         let payload = fs::read(path).map_err(|err| {
             EngineError::Storage(format!("failed to read object {}: {err}", path.display()))
@@ -398,6 +400,7 @@ impl FileObjectStore {
         self.read_json(path).map(Some)
     }
 
+    #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
     fn remove_file_if_exists(&self, path: &Path) -> Result<()> {
         if !path.exists() {
             return Ok(());
@@ -408,6 +411,7 @@ impl FileObjectStore {
         Ok(())
     }
 
+    #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
     fn list_paths(&self, directory: &Path) -> Result<Vec<PathBuf>> {
         if !directory.exists() {
             return Ok(Vec::new());
