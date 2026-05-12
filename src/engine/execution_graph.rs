@@ -123,12 +123,11 @@ impl ExecutionState {
     /// Returns an [`EngineError::Storage`] when the checkpoint's `state_json`
     /// cannot be deserialized back into an `ExecutionState`.
     pub fn from_checkpoint(checkpoint: LoopState) -> Result<(Self, String, LoopStatus)> {
-        let state: ExecutionState =
-            serde_json::from_value(checkpoint.state_json).map_err(|err| {
-                EngineError::Storage(format!(
-                    "failed to deserialize loop checkpoint state: {err}"
-                ))
-            })?;
+        let state: Self = serde_json::from_value(checkpoint.state_json).map_err(|err| {
+            EngineError::Storage(format!(
+                "failed to deserialize loop checkpoint state: {err}"
+            ))
+        })?;
         Ok((state, checkpoint.current_node, checkpoint.status))
     }
 }
@@ -205,7 +204,7 @@ impl ResolvedRunOptions {
     }
 
     #[must_use]
-    pub fn timeout_for_class(&self, class: NodeRuntimeClass) -> Duration {
+    pub const fn timeout_for_class(&self, class: NodeRuntimeClass) -> Duration {
         match class {
             NodeRuntimeClass::Standard => self.node_timeout,
             NodeRuntimeClass::ToolExecution => self.tool_timeout,
@@ -310,7 +309,7 @@ pub struct GraphRunner {
 
 impl GraphRunner {
     #[must_use]
-    pub fn new(graph: Arc<ExecutionGraph>) -> Self {
+    pub const fn new(graph: Arc<ExecutionGraph>) -> Self {
         Self { graph }
     }
 

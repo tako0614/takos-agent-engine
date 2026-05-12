@@ -169,7 +169,7 @@ mod tests {
         let mut set = HashSet::new();
         let eref = EmbeddingRef::for_node("raw", "id1");
         set.insert(eref.clone());
-        set.insert(eref.clone());
+        set.insert(eref);
         assert_eq!(set.len(), 1);
     }
 

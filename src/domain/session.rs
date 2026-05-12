@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::SessionId;
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Session {
     pub id: SessionId,
     pub goal: String,
@@ -23,7 +23,7 @@ impl Session {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionPlan {
     pub summary: String,
 }

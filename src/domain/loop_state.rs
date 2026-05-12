@@ -13,7 +13,7 @@ pub enum LoopStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoopState {
     pub session_id: SessionId,
     pub loop_id: LoopId,

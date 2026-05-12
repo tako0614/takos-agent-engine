@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::ids::{LoopId, SessionId};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCallRequest {
     pub name: String,
     #[serde(default)]

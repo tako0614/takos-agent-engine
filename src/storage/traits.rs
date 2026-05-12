@@ -19,14 +19,14 @@ pub struct ScoredAbstractRef {
     pub score: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphTraversalHit {
     pub node_id: AbstractNodeId,
     pub depth: usize,
     pub via_predicate: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawLifecyclePatch {
     pub distillation_state: Option<DistillationState>,
     pub overflow: Option<OverflowPolicy>,

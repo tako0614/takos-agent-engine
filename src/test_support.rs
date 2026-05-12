@@ -15,7 +15,7 @@ use crate::model::runner::{ModelInput, ModelOutput, ModelRunner, ToolCallRequest
 use crate::storage::RawLifecyclePatch;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TestWhitespaceTokenEstimator;
+pub struct TestWhitespaceTokenEstimator;
 
 impl TokenEstimator for TestWhitespaceTokenEstimator {
     fn estimate_text(&self, text: &str) -> usize {
@@ -24,7 +24,7 @@ impl TokenEstimator for TestWhitespaceTokenEstimator {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TestHashEmbedder {
+pub struct TestHashEmbedder {
     dimensions: usize,
 }
 
@@ -59,7 +59,7 @@ impl Embedder for TestHashEmbedder {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct TestRuleBasedModelRunner;
+pub struct TestRuleBasedModelRunner;
 
 #[async_trait]
 impl ModelRunner for TestRuleBasedModelRunner {
@@ -124,7 +124,7 @@ impl ModelRunner for TestRuleBasedModelRunner {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct TestSimpleDistiller;
+pub struct TestSimpleDistiller;
 
 #[async_trait]
 impl Distiller for TestSimpleDistiller {

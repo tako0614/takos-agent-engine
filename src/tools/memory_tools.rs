@@ -29,11 +29,11 @@ pub struct MemorySearchParams {
     pub threshold: Option<f32>,
 }
 
-fn default_memory_search_target() -> MemorySearchTarget {
+const fn default_memory_search_target() -> MemorySearchTarget {
     MemorySearchTarget::Both
 }
 
-fn default_memory_search_top_k() -> usize {
+const fn default_memory_search_top_k() -> usize {
     8
 }
 
@@ -45,7 +45,7 @@ pub struct GraphSearchParams {
     pub relation_types: Option<Vec<String>>,
 }
 
-fn default_graph_depth() -> usize {
+const fn default_graph_depth() -> usize {
     2
 }
 
@@ -63,7 +63,7 @@ pub struct TimelineSearchParams {
     pub limit: usize,
 }
 
-fn default_timeline_limit() -> usize {
+const fn default_timeline_limit() -> usize {
     10
 }
 

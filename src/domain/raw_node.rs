@@ -14,7 +14,7 @@ pub enum RawNodeKind {
     Event,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum RawContent {
     Text(String),
@@ -37,7 +37,7 @@ pub enum DistillationState {
     PartiallyDistilled,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OverflowPolicy {
     pub was_pushed_out_of_session: bool,
     pub relax_retrieval_until: Option<DateTime<Utc>>,

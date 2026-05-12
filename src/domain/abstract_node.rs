@@ -5,7 +5,7 @@ use crate::domain::Relation;
 use crate::ids::{AbstractNodeId, RawNodeId};
 use crate::model::embedding::EmbeddingRef;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EntityRef {
     pub id: String,
     pub label: String,
@@ -17,7 +17,7 @@ pub struct GraphFragment {
     pub relations: Vec<Relation>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct References {
     pub abstract_node_ids: Vec<AbstractNodeId>,
     pub raw_node_ids: Vec<RawNodeId>,
@@ -177,8 +177,8 @@ mod tests {
             label: "Entity B".to_string(),
         };
         let graph = GraphFragment {
-            entities: vec![entity_a.clone(), entity_b.clone()],
-            relations: vec![relation.clone()],
+            entities: vec![entity_a, entity_b],
+            relations: vec![relation],
         };
         let node = AbstractNode::new(
             "With graph",

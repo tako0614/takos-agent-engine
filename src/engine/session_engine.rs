@@ -730,7 +730,7 @@ impl GraphNode for ModelNode {
         if let Some(message) = &output.assistant_message {
             state.assistant_message = Some(message.clone());
         }
-        state.latest_model_output = Some(output.clone());
+        state.latest_model_output = Some(output);
 
         if self.allow_tools
             && !state.pending_tool_calls.is_empty()
