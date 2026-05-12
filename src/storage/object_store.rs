@@ -38,6 +38,7 @@ impl FileObjectStore {
         Ok(store)
     }
 
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -623,6 +624,7 @@ pub struct ObjectNodeRepository {
 }
 
 impl ObjectNodeRepository {
+    #[must_use]
     pub fn new(store: FileObjectStore) -> Self {
         Self { store }
     }
@@ -754,12 +756,13 @@ impl NodeRepository for ObjectNodeRepository {
         limit: usize,
     ) -> Result<Vec<RawNode>> {
         let _guard = self.store.lock()?;
-        let index_path = session_id
-            .map(|value| self.store.session_index_path(value))
-            .unwrap_or_else(|| self.store.raw_timeline_path());
+        let index_path = session_id.map_or_else(
+            || self.store.raw_timeline_path(),
+            |value| self.store.session_index_path(value),
+        );
         let mut entries = self.store.read_raw_index_entries_unlocked(&index_path)?;
-        entries.retain(|entry| from.map(|value| entry.timestamp >= value).unwrap_or(true));
-        entries.retain(|entry| to.map(|value| entry.timestamp <= value).unwrap_or(true));
+        entries.retain(|entry| from.is_none_or(|value| entry.timestamp >= value));
+        entries.retain(|entry| to.is_none_or(|value| entry.timestamp <= value));
         entries.sort_by(|left, right| {
             right
                 .timestamp
@@ -820,6 +823,7 @@ pub struct ObjectVectorIndex {
 }
 
 impl ObjectVectorIndex {
+    #[must_use]
     pub fn new(store: FileObjectStore) -> Self {
         Self { store }
     }
@@ -917,6 +921,7 @@ pub struct ObjectGraphRepository {
 }
 
 impl ObjectGraphRepository {
+    #[must_use]
     pub fn new(store: FileObjectStore) -> Self {
         Self { store }
     }
@@ -1007,6 +1012,7 @@ pub struct ObjectLoopStateRepository {
 }
 
 impl ObjectLoopStateRepository {
+    #[must_use]
     pub fn new(store: FileObjectStore) -> Self {
         Self { store }
     }

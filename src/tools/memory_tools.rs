@@ -132,14 +132,17 @@ impl From<&ToolsConfig> for MemoryToolBounds {
 }
 
 impl MemoryToolBounds {
+    #[must_use]
     pub fn clamp_memory_search_top_k(&self, requested: usize) -> usize {
         requested.max(1).min(self.max_memory_search_top_k.max(1))
     }
 
+    #[must_use]
     pub fn clamp_graph_search_depth(&self, requested: usize) -> usize {
         requested.min(self.max_graph_search_depth)
     }
 
+    #[must_use]
     pub fn clamp_timeline_search_limit(&self, requested: usize) -> usize {
         requested.max(1).min(self.max_timeline_search_limit.max(1))
     }

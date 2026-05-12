@@ -26,6 +26,7 @@ pub struct DefaultToolExecutor {
 }
 
 impl DefaultToolExecutor {
+    #[must_use]
     pub fn new(memory_tools: MemoryTools) -> Self {
         Self { memory_tools }
     }

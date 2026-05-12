@@ -63,6 +63,7 @@ impl Default for AnnVectorIndex {
 }
 
 impl AnnVectorIndex {
+    #[must_use]
     pub fn new(config: AnnVectorIndexConfig) -> Self {
         let config = config.normalized();
         Self {

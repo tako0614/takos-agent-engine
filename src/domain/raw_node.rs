@@ -138,6 +138,7 @@ impl RawNode {
         }
     }
 
+    #[must_use]
     pub fn content_text(&self) -> String {
         match &self.content {
             RawContent::Text(text) => text.clone(),
@@ -150,6 +151,7 @@ impl RawNode {
         self
     }
 
+    #[must_use]
     pub fn context_text(&self) -> String {
         format!("{:?}: {}", self.kind, self.content_text())
     }

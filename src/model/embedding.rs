@@ -10,11 +10,13 @@ pub struct Embedding(pub Vec<f32>);
 pub struct EmbeddingRef(pub String);
 
 impl EmbeddingRef {
+    #[must_use]
     pub fn for_node(prefix: &str, node_id: String) -> Self {
         Self(format!("{prefix}:{node_id}"))
     }
 }
 
+#[must_use]
 pub fn cosine_similarity(left: &Embedding, right: &Embedding) -> f32 {
     if left.0.len() != right.0.len() || left.0.is_empty() {
         return 0.0;
