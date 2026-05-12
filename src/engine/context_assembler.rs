@@ -18,7 +18,7 @@ pub struct SessionWindowDecision {
     pub pushed_out_raw_ids: Vec<RawNodeId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AssembledContext {
     pub system_prompt: String,
     pub session_context: Vec<String>,

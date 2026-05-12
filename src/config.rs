@@ -218,7 +218,7 @@ impl Default for ContextBudgetConfig {
 
 impl ContextBudgetConfig {
     #[must_use]
-    pub fn remaining_tokens(&self) -> usize {
+    pub const fn remaining_tokens(&self) -> usize {
         self.total_tokens
             .saturating_sub(self.reserve_system)
             .saturating_sub(self.reserve_tools)
@@ -257,15 +257,15 @@ impl Default for ToolsConfig {
     }
 }
 
-pub(crate) fn default_max_memory_search_top_k() -> usize {
+pub(crate) const fn default_max_memory_search_top_k() -> usize {
     32
 }
 
-pub(crate) fn default_max_graph_search_depth() -> usize {
+pub(crate) const fn default_max_graph_search_depth() -> usize {
     4
 }
 
-pub(crate) fn default_max_timeline_search_limit() -> usize {
+pub(crate) const fn default_max_timeline_search_limit() -> usize {
     100
 }
 
@@ -294,17 +294,17 @@ impl Default for RuntimeConfig {
 
 impl RuntimeConfig {
     #[must_use]
-    pub fn node_timeout(&self) -> Duration {
+    pub const fn node_timeout(&self) -> Duration {
         Duration::from_millis(self.node_timeout_ms)
     }
 
     #[must_use]
-    pub fn tool_timeout(&self) -> Duration {
+    pub const fn tool_timeout(&self) -> Duration {
         Duration::from_millis(self.tool_timeout_ms)
     }
 
     #[must_use]
-    pub fn distillation_timeout(&self) -> Duration {
+    pub const fn distillation_timeout(&self) -> Duration {
         Duration::from_millis(self.distillation_timeout_ms)
     }
 }

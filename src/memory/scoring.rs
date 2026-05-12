@@ -47,17 +47,19 @@ impl ScoringPolicy for DefaultScoringPolicy {
             0.0
         };
 
-        (base_similarity * self.semantic_weight)
-            + (node.metadata.importance * self.importance_weight)
-            - age_penalty
+        base_similarity.mul_add(
+            self.semantic_weight,
+            node.metadata.importance * self.importance_weight,
+        ) - age_penalty
             + overflow_bonus
     }
 
     fn score_abstract(&self, base_similarity: f32, node: &AbstractNode, now: DateTime<Utc>) -> f32 {
         let age_penalty = Self::age_in_days(node.timestamp, now) * self.decay_per_day;
-        (base_similarity * self.semantic_weight)
-            + (node.metadata.importance * self.importance_weight)
-            - age_penalty
+        base_similarity.mul_add(
+            self.semantic_weight,
+            node.metadata.importance * self.importance_weight,
+        ) - age_penalty
     }
 }
 

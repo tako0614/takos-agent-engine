@@ -54,11 +54,11 @@ pub struct FederatedMemorySearchParams {
     pub threshold: Option<f32>,
 }
 
-fn default_federated_memory_search_target() -> MemorySearchTarget {
+const fn default_federated_memory_search_target() -> MemorySearchTarget {
     MemorySearchTarget::Both
 }
 
-fn default_federated_memory_search_top_k() -> usize {
+const fn default_federated_memory_search_top_k() -> usize {
     8
 }
 
@@ -89,7 +89,7 @@ impl FederatedMemoryNode {
         }
     }
 
-    fn kind_rank(&self) -> u8 {
+    const fn kind_rank(&self) -> u8 {
         match self {
             Self::Raw(_) => 0,
             Self::Abstract(_) => 1,

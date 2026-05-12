@@ -633,7 +633,7 @@ pub struct ObjectNodeRepository {
 
 impl ObjectNodeRepository {
     #[must_use]
-    pub fn new(store: FileObjectStore) -> Self {
+    pub const fn new(store: FileObjectStore) -> Self {
         Self { store }
     }
 }
@@ -832,7 +832,7 @@ pub struct ObjectVectorIndex {
 
 impl ObjectVectorIndex {
     #[must_use]
-    pub fn new(store: FileObjectStore) -> Self {
+    pub const fn new(store: FileObjectStore) -> Self {
         Self { store }
     }
 }
@@ -930,7 +930,7 @@ pub struct ObjectGraphRepository {
 
 impl ObjectGraphRepository {
     #[must_use]
-    pub fn new(store: FileObjectStore) -> Self {
+    pub const fn new(store: FileObjectStore) -> Self {
         Self { store }
     }
 
@@ -1021,7 +1021,7 @@ pub struct ObjectLoopStateRepository {
 
 impl ObjectLoopStateRepository {
     #[must_use]
-    pub fn new(store: FileObjectStore) -> Self {
+    pub const fn new(store: FileObjectStore) -> Self {
         Self { store }
     }
 }
