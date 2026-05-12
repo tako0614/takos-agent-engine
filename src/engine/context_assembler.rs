@@ -47,7 +47,9 @@ impl ContextAssembler {
     ) -> AssembledContext {
         let mut total_tokens = self.estimator.estimate_text(system_prompt);
         let remaining = budget.remaining_tokens();
-        let session_budget = ((remaining as f32) * budget.session_ratio) as usize;
+        let session_budget = (remaining as f64 * f64::from(budget.session_ratio))
+            .round()
+            .clamp(0.0, remaining as f64) as usize;
         let memory_budget = remaining.saturating_sub(session_budget);
 
         let (session_context, session_window) =
