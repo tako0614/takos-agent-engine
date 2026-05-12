@@ -1,5 +1,7 @@
 # Agent Runtime
 
+> このページでわかること: Takos agent runtime の実装境界と Rust container の役割。
+
 ::: tip Status このページは current implementation の agent runtime 境界を説明します。Takos は control plane 全体を Rust
 に寄せる方針ではなく、container 内の agent 本体を Rust の正本にする方針です。 :::
 

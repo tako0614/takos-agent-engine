@@ -1,5 +1,7 @@
 # takos-agent-engine architecture v0.3
 
+> このページでわかること: Takos agent engine (Rust) のアーキテクチャと設計方針。
+
 ## 1. 目的
 
 `takos-agent-engine` は、Takos の agent loop を Rust で実装する library-first な runtime である。
