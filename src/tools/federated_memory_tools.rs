@@ -37,6 +37,7 @@ impl MemorySource {
         }
     }
 
+    #[must_use]
     pub fn with_graph_repository(mut self, graph_repository: Arc<dyn GraphRepository>) -> Self {
         self.graph_repository = Some(graph_repository);
         self

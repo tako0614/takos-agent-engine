@@ -84,6 +84,7 @@ impl AbstractNode {
         format!("{}: {}", self.title, self.summary)
     }
 
+    #[must_use]
     pub fn with_operation_key(mut self, operation_key: impl Into<String>) -> Self {
         self.operation_key = Some(operation_key.into());
         self
