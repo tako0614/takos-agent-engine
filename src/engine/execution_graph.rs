@@ -49,6 +49,7 @@ pub struct ExecutionState {
 }
 
 impl ExecutionState {
+    #[must_use]
     pub fn from_request(request: SessionRequest, session_id: SessionId, loop_id: LoopId) -> Self {
         Self {
             session_id,
@@ -170,6 +171,7 @@ pub struct ResolvedRunOptions {
 }
 
 impl ResolvedRunOptions {
+    #[must_use]
     pub fn from_config(config: &EngineConfig, options: RunOptions) -> Self {
         Self {
             max_graph_steps: options
@@ -194,6 +196,7 @@ impl ResolvedRunOptions {
         }
     }
 
+    #[must_use]
     pub fn timeout_for_class(&self, class: NodeRuntimeClass) -> Duration {
         match class {
             NodeRuntimeClass::Standard => self.node_timeout,
@@ -205,8 +208,7 @@ impl ResolvedRunOptions {
     pub fn is_cancelled(&self) -> bool {
         self.cancellation_token
             .as_ref()
-            .map(CancellationToken::is_cancelled)
-            .unwrap_or(false)
+            .is_some_and(CancellationToken::is_cancelled)
     }
 }
 
@@ -256,6 +258,7 @@ impl ExecutionGraph {
         self.edges.insert((from.into(), branch.into()), to.into());
     }
 
+    #[must_use]
     pub fn start_node(&self) -> &str {
         &self.start
     }
@@ -298,6 +301,7 @@ pub struct GraphRunner {
 }
 
 impl GraphRunner {
+    #[must_use]
     pub fn new(graph: Arc<ExecutionGraph>) -> Self {
         Self { graph }
     }
@@ -417,7 +421,7 @@ impl GraphRunner {
             );
             let execution = if let Some(token) = &options.cancellation_token {
                 tokio::select! {
-                    _ = token.cancelled() => NodeExecutionResult::Cancelled,
+                    () = token.cancelled() => NodeExecutionResult::Cancelled,
                     result = run_node => NodeExecutionResult::Completed(result),
                 }
             } else {

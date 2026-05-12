@@ -37,6 +37,7 @@ impl ContextAssembler {
         Self { estimator }
     }
 
+    #[must_use]
     pub fn assemble(
         &self,
         budget: &ContextBudgetConfig,

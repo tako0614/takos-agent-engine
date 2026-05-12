@@ -23,6 +23,7 @@ impl ActivationQuery {
         }
     }
 
+    #[must_use]
     pub fn as_embedding_input(&self) -> String {
         let mut sections = vec![format!("user: {}", self.user_message)];
         if let Some(plan) = &self.plan {

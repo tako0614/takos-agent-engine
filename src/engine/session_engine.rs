@@ -243,6 +243,7 @@ pub async fn run_maintenance_pass(
     Ok(report)
 }
 
+#[must_use]
 pub fn build_execution_graph_preset(preset: ExecutionGraphPreset) -> ExecutionGraph {
     match preset {
         ExecutionGraphPreset::Default => build_default_execution_graph(),
@@ -251,6 +252,7 @@ pub fn build_execution_graph_preset(preset: ExecutionGraphPreset) -> ExecutionGr
     }
 }
 
+#[must_use]
 pub fn build_default_execution_graph() -> ExecutionGraph {
     let mut graph = ExecutionGraph::new(INGEST_USER_INPUT_NODE);
     graph.add_node(Arc::new(IngestUserInputNode));
@@ -349,6 +351,7 @@ pub fn build_default_execution_graph() -> ExecutionGraph {
     graph
 }
 
+#[must_use]
 pub fn build_planner_execution_graph() -> ExecutionGraph {
     let mut graph = ExecutionGraph::new(INGEST_USER_INPUT_NODE);
     graph.add_node(Arc::new(IngestUserInputNode));
@@ -407,6 +410,7 @@ pub fn build_planner_execution_graph() -> ExecutionGraph {
     graph
 }
 
+#[must_use]
 pub fn build_subgoal_execution_graph() -> ExecutionGraph {
     let mut graph = ExecutionGraph::new(INGEST_USER_INPUT_NODE);
     graph.add_node(Arc::new(IngestUserInputNode));
@@ -578,7 +582,7 @@ impl GraphNode for BuildActivationQueryNode {
             .iter()
             .rev()
             .take(12)
-            .map(|node| node.context_text())
+            .map(super::super::domain::raw_node::RawNode::context_text)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()

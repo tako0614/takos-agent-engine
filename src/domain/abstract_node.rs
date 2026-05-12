@@ -79,6 +79,7 @@ impl AbstractNode {
         }
     }
 
+    #[must_use]
     pub fn context_text(&self) -> String {
         format!("{}: {}", self.title, self.summary)
     }

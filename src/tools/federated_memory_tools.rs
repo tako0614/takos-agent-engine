@@ -151,6 +151,7 @@ impl FederatedMemoryTools {
         }
     }
 
+    #[must_use]
     pub fn sources(&self) -> &[MemorySource] {
         &self.sources
     }
