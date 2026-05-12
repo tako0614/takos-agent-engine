@@ -660,8 +660,12 @@ impl GraphNode for AssembleContextNode {
             &state.activated_memory,
             &state.tool_results,
         );
-        state.session_window_ids = context.session_window.included_raw_ids.clone();
-        state.pushed_out_raw_ids = context.session_window.pushed_out_raw_ids.clone();
+        state
+            .session_window_ids
+            .clone_from(&context.session_window.included_raw_ids);
+        state
+            .pushed_out_raw_ids
+            .clone_from(&context.session_window.pushed_out_raw_ids);
         state.assembled_context = Some(context);
         Ok(NodeOutcome::Continue)
     }
@@ -699,7 +703,7 @@ impl GraphNode for ModelNode {
             ))
             .await?;
         state.model_invocations = state.model_invocations.saturating_add(1);
-        state.pending_tool_calls = output.tool_calls.clone();
+        state.pending_tool_calls.clone_from(&output.tool_calls);
         if let Some(message) = &output.assistant_message {
             state.assistant_message = Some(message.clone());
         }
