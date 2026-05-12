@@ -156,6 +156,10 @@ impl FederatedMemoryTools {
         &self.sources
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError`] when the embedder fails or any federated
+    /// source repository returns an error during the per-source search.
     pub async fn semantic_search(
         &self,
         params: FederatedMemorySearchParams,
@@ -188,6 +192,10 @@ impl FederatedMemoryTools {
         Ok(FederatedMemorySearchResult { hits })
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError`] when the start node id cannot be parsed or
+    /// any federated graph / node repository returns an error during traversal.
     pub async fn graph_search(
         &self,
         params: GraphSearchParams,
@@ -220,6 +228,10 @@ impl FederatedMemoryTools {
         Ok(FederatedGraphSearchResult { hits })
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError`] when the optional session id cannot be
+    /// parsed or any federated node repository returns an error.
     pub async fn timeline_search(
         &self,
         params: TimelineSearchParams,

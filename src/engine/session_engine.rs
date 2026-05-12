@@ -120,6 +120,10 @@ pub struct MaintenanceReport {
     pub updated_raw_nodes: usize,
 }
 
+/// # Errors
+///
+/// Surfaces the same [`EngineError`] variants as
+/// [`run_turn_with_options`], to which this is a thin wrapper.
 #[instrument(skip(config, deps), fields(session_id, loop_id))]
 pub async fn run_turn(
     config: &EngineConfig,
@@ -129,6 +133,10 @@ pub async fn run_turn(
     run_turn_with_options(config, deps, request, RunOptions::default()).await
 }
 
+/// # Errors
+///
+/// Returns [`EngineError::Configuration`] when the config does not validate,
+/// plus any [`EngineError`] raised by the underlying [`GraphRunner::run`].
 #[instrument(skip(config, deps, options), fields(session_id, loop_id))]
 pub async fn run_turn_with_options(
     config: &EngineConfig,
@@ -154,6 +162,12 @@ pub async fn run_turn_with_options(
     Ok(build_response(state, result))
 }
 
+/// # Errors
+///
+/// Returns [`EngineError::Configuration`] when the config does not validate,
+/// [`EngineError::CheckpointNotFound`] when no checkpoint exists for the
+/// `(session_id, loop_id)` pair, plus any [`EngineError`] raised by
+/// [`GraphRunner::resume`].
 #[instrument(skip(config, deps, options), fields(session_id, loop_id))]
 pub async fn resume_loop(
     config: &EngineConfig,
@@ -185,6 +199,11 @@ pub async fn resume_loop(
     Ok(build_response(state, result))
 }
 
+/// # Errors
+///
+/// Returns [`EngineError::Configuration`] when the config does not validate,
+/// plus any [`EngineError`] raised by the repository or distillation tools
+/// during the maintenance sweep.
 pub async fn run_maintenance_pass(
     config: &EngineConfig,
     deps: &EngineDeps,

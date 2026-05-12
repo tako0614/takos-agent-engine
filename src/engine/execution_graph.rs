@@ -78,6 +78,10 @@ impl ExecutionState {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError::Storage`] when the execution state cannot be
+    /// serialized into JSON for inclusion in the checkpoint.
     pub fn checkpoint(&self, current_node: String, status: LoopStatus) -> Result<LoopState> {
         Ok(LoopState {
             session_id: self.session_id,
@@ -114,6 +118,10 @@ impl ExecutionState {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError::Storage`] when the checkpoint's `state_json`
+    /// cannot be deserialized back into an `ExecutionState`.
     pub fn from_checkpoint(checkpoint: LoopState) -> Result<(Self, String, LoopStatus)> {
         let state: ExecutionState =
             serde_json::from_value(checkpoint.state_json).map_err(|err| {
@@ -306,6 +314,11 @@ impl GraphRunner {
         Self { graph }
     }
 
+    /// # Errors
+    ///
+    /// Returns the first [`EngineError`] surfaced by a graph node — node
+    /// timeouts, repository / model / tool failures, cancellation, or
+    /// checkpoint persistence errors.
     pub async fn run(
         &self,
         state: &mut ExecutionState,
@@ -323,6 +336,11 @@ impl GraphRunner {
         .await
     }
 
+    /// # Errors
+    ///
+    /// Returns [`EngineError::LoopTerminated`] when the checkpoint is not
+    /// paused, plus any [`EngineError`] raised by the resumed execution per
+    /// [`Self::run`].
     pub async fn resume(
         &self,
         checkpoint: LoopState,

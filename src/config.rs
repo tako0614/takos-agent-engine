@@ -28,6 +28,11 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    /// # Errors
+    ///
+    /// Returns an [`EngineError::Configuration`] when any field falls outside
+    /// its allowed range — empty system prompt, ratios outside `0..=1`, ratios
+    /// that do not sum to 1, or any of the integer minimums set to zero.
     pub fn validate(&self) -> Result<()> {
         if self.system_prompt.trim().is_empty() {
             return Err(EngineError::Configuration(
@@ -88,6 +93,10 @@ impl EngineConfig {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError::Configuration`] when the TOML cannot be
+    /// parsed or the resulting config fails [`Self::validate`].
     pub fn from_toml_str(source: &str) -> Result<Self> {
         let config: Self = toml::from_str(source).map_err(|err| {
             EngineError::Configuration(format!("failed to parse engine config from TOML: {err}"))
@@ -96,6 +105,10 @@ impl EngineConfig {
         Ok(config)
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError::Configuration`] when the file cannot be
+    /// read or the contents fail [`Self::from_toml_str`].
     pub fn from_toml_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let contents = fs::read_to_string(path).map_err(|err| {

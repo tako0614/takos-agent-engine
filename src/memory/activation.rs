@@ -49,6 +49,10 @@ impl ActivationService {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError`] when the vector index search or the node
+    /// repository lookup of the resulting candidate ids fails.
     pub async fn activate(
         &self,
         config: &EngineConfig,
