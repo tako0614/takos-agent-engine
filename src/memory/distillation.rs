@@ -14,7 +14,7 @@ pub struct DistillationInput {
     pub activated_abstract_ids: Vec<AbstractNodeId>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawLifecycleUpdate {
     pub raw_node_id: RawNodeId,
     pub patch: RawLifecyclePatch,
