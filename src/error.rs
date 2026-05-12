@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn error_is_debug() {
         let err = EngineError::Storage("test".to_string());
-        let debug = format!("{:?}", err);
+        let debug = format!("{err:?}");
         assert!(debug.contains("Storage"));
     }
 }

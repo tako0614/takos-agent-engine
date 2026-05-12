@@ -410,6 +410,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::similar_names)] // raw_a/raw_b vs raw_a_id/raw_b_id reads clearly in context
     async fn semantic_search_merges_sources_with_stable_order() {
         let source_b = test_source("source-b");
         let raw_b = RawNode::text(
