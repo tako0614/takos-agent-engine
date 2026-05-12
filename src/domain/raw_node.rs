@@ -96,7 +96,7 @@ impl RawNode {
             timestamp: Utc::now(),
             kind,
             content: RawContent::Text(text.into()),
-            embedding_ref: EmbeddingRef::for_node("raw", id.to_string()),
+            embedding_ref: EmbeddingRef::for_node("raw", &id.to_string()),
             metadata: RawNodeMetadata {
                 source: source.into(),
                 tags,
@@ -126,7 +126,7 @@ impl RawNode {
             timestamp: Utc::now(),
             kind,
             content: RawContent::Json(value),
-            embedding_ref: EmbeddingRef::for_node("raw", id.to_string()),
+            embedding_ref: EmbeddingRef::for_node("raw", &id.to_string()),
             metadata: RawNodeMetadata {
                 source: source.into(),
                 tags,

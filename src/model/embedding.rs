@@ -11,7 +11,7 @@ pub struct EmbeddingRef(pub String);
 
 impl EmbeddingRef {
     #[must_use]
-    pub fn for_node(prefix: &str, node_id: String) -> Self {
+    pub fn for_node(prefix: &str, node_id: &str) -> Self {
         Self(format!("{prefix}:{node_id}"))
     }
 }
@@ -139,27 +139,27 @@ mod tests {
 
     #[test]
     fn embedding_ref_for_node_format() {
-        let eref = EmbeddingRef::for_node("raw", "abc-123".to_string());
+        let eref = EmbeddingRef::for_node("raw", "abc-123");
         assert_eq!(eref.0, "raw:abc-123");
     }
 
     #[test]
     fn embedding_ref_for_node_abstract() {
-        let eref = EmbeddingRef::for_node("abstract", "xyz".to_string());
+        let eref = EmbeddingRef::for_node("abstract", "xyz");
         assert_eq!(eref.0, "abstract:xyz");
     }
 
     #[test]
     fn embedding_ref_equality() {
-        let a = EmbeddingRef::for_node("raw", "id1".to_string());
-        let b = EmbeddingRef::for_node("raw", "id1".to_string());
+        let a = EmbeddingRef::for_node("raw", "id1");
+        let b = EmbeddingRef::for_node("raw", "id1");
         assert_eq!(a, b);
     }
 
     #[test]
     fn embedding_ref_inequality() {
-        let a = EmbeddingRef::for_node("raw", "id1".to_string());
-        let b = EmbeddingRef::for_node("raw", "id2".to_string());
+        let a = EmbeddingRef::for_node("raw", "id1");
+        let b = EmbeddingRef::for_node("raw", "id2");
         assert_ne!(a, b);
     }
 
@@ -167,7 +167,7 @@ mod tests {
     fn embedding_ref_is_hashable() {
         use std::collections::HashSet;
         let mut set = HashSet::new();
-        let eref = EmbeddingRef::for_node("raw", "id1".to_string());
+        let eref = EmbeddingRef::for_node("raw", "id1");
         set.insert(eref.clone());
         set.insert(eref.clone());
         assert_eq!(set.len(), 1);
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn embedding_ref_serde_roundtrip() {
-        let eref = EmbeddingRef::for_node("raw", "node-1".to_string());
+        let eref = EmbeddingRef::for_node("raw", "node-1");
         let json = serde_json::to_string(&eref).unwrap();
         let deserialized: EmbeddingRef = serde_json::from_str(&json).unwrap();
         assert_eq!(eref, deserialized);

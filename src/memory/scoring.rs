@@ -28,6 +28,9 @@ impl Default for DefaultScoringPolicy {
 
 impl DefaultScoringPolicy {
     fn age_in_days(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> f32 {
+        // Memory age fits well within f32's representable seconds for any
+        // realistic timestamp delta; we want days as f32 for the scoring math.
+        #[allow(clippy::cast_precision_loss)]
         let seconds = (now - timestamp).num_seconds().max(0) as f32;
         seconds / 86_400.0
     }

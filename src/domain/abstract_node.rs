@@ -71,7 +71,7 @@ impl AbstractNode {
             timestamp: Utc::now(),
             title: title.into(),
             summary: summary.into(),
-            embedding_ref: EmbeddingRef::for_node("abstract", id.to_string()),
+            embedding_ref: EmbeddingRef::for_node("abstract", &id.to_string()),
             graph,
             references,
             metadata,
