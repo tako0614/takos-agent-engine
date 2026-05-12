@@ -28,6 +28,10 @@ pub struct FileObjectStore {
 }
 
 impl FileObjectStore {
+    /// # Errors
+    ///
+    /// Returns an [`EngineError::Storage`] when the on-disk layout cannot be
+    /// created or the index rebuild fails on a corrupt store.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let store = Self {
             root: root.as_ref().to_path_buf(),

@@ -188,6 +188,10 @@ impl MemoryTools {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError`] when the embedder fails to embed the query
+    /// or the underlying vector / node repositories return an error.
     pub async fn semantic_search(&self, params: MemorySearchParams) -> Result<MemorySearchResult> {
         let top_k = self.bounds.clamp_memory_search_top_k(params.top_k);
         let query_embedding = self.embedder.embed_text(&params.query).await?;
@@ -218,6 +222,10 @@ impl MemoryTools {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError`] when the start node id cannot be parsed or
+    /// the graph / node repositories return an error.
     pub async fn graph_search(&self, params: GraphSearchParams) -> Result<GraphSearchResult> {
         let start = AbstractNodeId::from_str(&params.start_node_id)
             .map_err(|err| EngineError::Tool(format!("invalid abstract node id: {err}")))?;
@@ -250,6 +258,10 @@ impl MemoryTools {
         Ok(GraphSearchResult { hits: ordered_hits })
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError`] when the abstract node id cannot be parsed,
+    /// the referenced node does not exist, or the repository returns an error.
     pub async fn provenance_lookup(
         &self,
         params: ProvenanceLookupParams,
@@ -271,6 +283,10 @@ impl MemoryTools {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an [`EngineError`] when the optional session id cannot be
+    /// parsed or the node repository returns an error.
     pub async fn timeline_search(
         &self,
         params: TimelineSearchParams,
