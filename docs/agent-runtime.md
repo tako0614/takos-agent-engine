@@ -48,16 +48,16 @@ control-web / control-worker
              -> Workers / platform tools
 ```
 
-`takos-agent` は container の inside loop を責務として持ち、platform state は control plane に委譲します。
+`takos-agent` は container の inside loop を責務として持ち、Takos product control state は control plane に委譲します。
 
 ## なぜこの分離か
 
 - agent の思考ループは Rust で型安全に固定したい
-- tool backend と platform state は Takos 本体の Workers/DB と密結合している
-- custom skill や remote tool を全部 Rust に移すと、platform の変更速度を落とす
+- tool backend と Takos product control state は Takos 本体の Workers/DB と密結合している
+- custom skill や remote tool を全部 Rust に移すと、product control plane の変更速度を落とす
 - 一方で container 内の loop を Rust にすれば、agent 自体の信頼性と再現性は高められる
 
-つまり、Takos における Rust 化の目的は「platform を全部書き換えること」ではなく、「agent container の本体を Rust
+つまり、Takos における Rust 化の目的は「product control plane を全部書き換えること」ではなく、「agent container の本体を Rust
 の正本にすること」です。
 
 ## Local と Remote の境界
