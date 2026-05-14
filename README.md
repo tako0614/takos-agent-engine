@@ -1,43 +1,37 @@
 # takos-agent-engine
 
-Rust で書かれた Takos の agent engine。session 履歴と長期 memory を同一基盤で扱い、RawNode / AbstractNode の二層記憶を
-activation しながら checkpoint 可能な graph runtime で長期継続実行する。 この repository が engine library
-の正本であり、 service wrapper は ecosystem checkout の `takos/agent/` が持つ。agent runtime の境界は
-[Agent Runtime](docs/agent-runtime.md) を参照。
+Rust で書かれた Takos の agent engine library。 RawNode / AbstractNode の二層記憶を activation しながら、 checkpoint
+可能な graph runtime で agent loop を回す。 engine 本体は stateless で、 storage / LLM / embedding / tool 実行はすべて
+trait 経由で注入する。 LLM agent を embed したい Rust service の中で、 session 履歴と長期 memory を同一基盤で扱いたい
+ときに使う。
 
-## 設計理念
+この repository が engine library の正本であり、 service wrapper は ecosystem checkout の `takos/agent/` が持つ。 agent
+runtime の境界は [Agent Runtime](docs/agent-runtime.md) を参照。
 
-### memory は session の外に溢れても死なない
+## Install / Quickstart
 
-一般的な LLM agent は context window を超えた情報を捨てる。takos-agent-engine は session
-から押し出された発話やツール結果を「消える情報」ではなく「まだ構造化されていない原石」として扱う。overflow した raw node
-は relaxed threshold で再活性化しやすくなり、maintenance pass で構造化された AbstractNode
-に昇格する。情報は捨てられるのではなく、形を変えて生き続ける。
+crate は `publish = false` で crates.io には公開していない。 consumer は git revision を pin して依存する。
 
-### 圧縮ではなく構造化
+```toml
+[dependencies]
+takos-agent-engine = { git = "https://github.com/tako0614/takos-agent-engine", rev = "<commit-sha>", features = ["openai-embeddings"] }
+```
 
-distillation は token を減らすための「要約」ではない。raw な出来事群から entity と relation を抽出し、provenance 付きの
-knowledge graph fragment として保存する操作である。AbstractNode は「何が起きたか」だけでなく「どの raw
-から導かれたか」を参照でき、agent は自分の記憶の根拠を遡れる。
+利用可能な feature flag:
 
-### stateless core, stateful world
+- `openai-chat` — OpenAI-compatible chat backend を有効化
+- `openai-embeddings` — OpenAI-compatible embeddings backend を有効化
 
-engine 本体は一切の状態を内包しない。session state、memory、embedding index、graph、checkpoint はすべて injected
-dependency に委ねる。したがって engine は「stateful agent system を動かす stateless runner」であり、backend
-を差し替えるだけで in-memory テスト、ファイルベース永続化、分散ストレージのいずれにも対応できる。
+repo を clone して example を動かす場合:
 
-### graph として実行し、graph として記憶する
+```bash
+cargo build
+cargo run --example demo
+cargo run --example object_demo
+```
 
-agent の実行フローは ExecutionGraph として宣言的に定義し、GraphRunner が 1 node ずつ進める。記憶もまた AbstractNode の
-relation graph として蓄積される。実行と記憶の両方が graph であることで、agent
-の振る舞いと知識構造が同じ概念モデルで扱える。
-
-### checkpoint で止まっても壊れない
-
-GraphRunner は side effect 境界の前後で checkpoint を取る。process restart や明示的な pause
-で `LoopStatus::Paused` の checkpoint が残っている場合は、`resume_loop` で直前の node から再開できる。timeout /
-cancellation は状態を失わないために checkpoint へ残すが、現在の public resume API はそれらを自動再開しない。tool
-実行の途中で落ちても operation_key による idempotent persistence が二重書き込みを防ぐ。
+`run_turn` / `run_turn_with_options` / `resume_loop` が high-level facade。 まずは `examples/demo.rs` と
+`examples/object_demo.rs` を読むのが早い。
 
 ## アーキテクチャ概要
 
@@ -86,6 +80,40 @@ RawNode 群から蒸留された knowledge unit。entity / relation の graph fr
 - raw / abstract への参照 (backlinks)
 - `abstraction_level` / `confidence` / `importance` メタデータ
 - vector search と graph traversal の両方の対象
+
+## 設計理念
+
+### memory は session の外に溢れても死なない
+
+一般的な LLM agent は context window を超えた情報を捨てる。takos-agent-engine は session
+から押し出された発話やツール結果を「消える情報」ではなく「まだ構造化されていない原石」として扱う。overflow した raw node
+は relaxed threshold で再活性化しやすくなり、maintenance pass で構造化された AbstractNode
+に昇格する。情報は捨てられるのではなく、形を変えて生き続ける。
+
+### 圧縮ではなく構造化
+
+distillation は token を減らすための「要約」ではない。raw な出来事群から entity と relation を抽出し、provenance 付きの
+knowledge graph fragment として保存する操作である。AbstractNode は「何が起きたか」だけでなく「どの raw
+から導かれたか」を参照でき、agent は自分の記憶の根拠を遡れる。
+
+### stateless core, stateful world
+
+engine 本体は一切の状態を内包しない。session state、memory、embedding index、graph、checkpoint はすべて injected
+dependency に委ねる。したがって engine は「stateful agent system を動かす stateless runner」であり、backend
+を差し替えるだけで in-memory テスト、ファイルベース永続化、分散ストレージのいずれにも対応できる。
+
+### graph として実行し、graph として記憶する
+
+agent の実行フローは ExecutionGraph として宣言的に定義し、GraphRunner が 1 node ずつ進める。記憶もまた AbstractNode の
+relation graph として蓄積される。実行と記憶の両方が graph であることで、agent
+の振る舞いと知識構造が同じ概念モデルで扱える。
+
+### checkpoint で止まっても壊れない
+
+GraphRunner は side effect 境界の前後で checkpoint を取る。process restart や明示的な pause
+で `LoopStatus::Paused` の checkpoint が残っている場合は、`resume_loop` で直前の node から再開できる。timeout /
+cancellation は状態を失わないために checkpoint へ残すが、現在の public resume API はそれらを自動再開しない。tool
+実行の途中で落ちても operation_key による idempotent persistence が二重書き込みを防ぐ。
 
 ## 実行フロー
 
