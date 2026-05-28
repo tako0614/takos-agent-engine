@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::error::Result;
-use crate::ids::{AbstractNodeId, RawNodeId};
+use crate::ids::{AbstractNodeId, RawNodeId, SessionId};
 use crate::model::embedding::{cosine_similarity, Embedding};
 use crate::storage::traits::{ScoredAbstractRef, ScoredRawRef, VectorIndex};
 
@@ -81,21 +81,52 @@ impl AnnVectorIndex {
 #[async_trait]
 impl VectorIndex for AnnVectorIndex {
     async fn index_raw(&self, id: RawNodeId, embedding: Embedding) -> Result<()> {
-        self.raw_index.write().await.index(id, embedding);
+        self.raw_index.write().await.index(id, embedding, None);
         Ok(())
     }
 
     async fn index_abstract(&self, id: AbstractNodeId, embedding: Embedding) -> Result<()> {
-        self.abstract_index.write().await.index(id, embedding);
+        self.abstract_index.write().await.index(id, embedding, None);
         Ok(())
     }
 
-    async fn search_raw(&self, query: &Embedding, top_k: usize) -> Result<Vec<ScoredRawRef>> {
+    async fn index_raw_with_session(
+        &self,
+        id: RawNodeId,
+        embedding: Embedding,
+        session_id: Option<SessionId>,
+    ) -> Result<()> {
+        self.raw_index
+            .write()
+            .await
+            .index(id, embedding, session_id);
+        Ok(())
+    }
+
+    async fn index_abstract_with_session(
+        &self,
+        id: AbstractNodeId,
+        embedding: Embedding,
+        session_id: Option<SessionId>,
+    ) -> Result<()> {
+        self.abstract_index
+            .write()
+            .await
+            .index(id, embedding, session_id);
+        Ok(())
+    }
+
+    async fn search_raw(
+        &self,
+        query: &Embedding,
+        top_k: usize,
+        session_id: Option<&SessionId>,
+    ) -> Result<Vec<ScoredRawRef>> {
         Ok(self
             .raw_index
             .read()
             .await
-            .search(query, top_k)
+            .search(query, top_k, session_id)
             .into_iter()
             .map(|(id, score)| ScoredRawRef { id, score })
             .collect())
@@ -105,12 +136,13 @@ impl VectorIndex for AnnVectorIndex {
         &self,
         query: &Embedding,
         top_k: usize,
+        session_id: Option<&SessionId>,
     ) -> Result<Vec<ScoredAbstractRef>> {
         Ok(self
             .abstract_index
             .read()
             .await
-            .search(query, top_k)
+            .search(query, top_k, session_id)
             .into_iter()
             .map(|(id, score)| ScoredAbstractRef { id, score })
             .collect())
@@ -136,7 +168,7 @@ where
         }
     }
 
-    fn index(&mut self, id: ID, embedding: Embedding) {
+    fn index(&mut self, id: ID, embedding: Embedding, session_id: Option<SessionId>) {
         if let Some(previous) = self.embeddings.remove(&id) {
             self.remove_from_bucket(previous.signature, id);
         }
@@ -147,6 +179,7 @@ where
             IndexedEmbedding {
                 embedding,
                 signature,
+                session_id,
             },
         );
         let bucket = self.buckets.entry(signature).or_default();
@@ -154,7 +187,12 @@ where
         bucket.sort();
     }
 
-    fn search(&self, query: &Embedding, top_k: usize) -> Vec<(ID, f32)> {
+    fn search(
+        &self,
+        query: &Embedding,
+        top_k: usize,
+        session_id: Option<&SessionId>,
+    ) -> Vec<(ID, f32)> {
         if top_k == 0 || self.embeddings.is_empty() {
             return Vec::new();
         }
@@ -164,9 +202,13 @@ where
         let mut scored: Vec<_> = candidate_ids
             .into_iter()
             .filter_map(|id| {
-                self.embeddings
-                    .get(&id)
-                    .map(|record| (id, cosine_similarity(query, &record.embedding)))
+                self.embeddings.get(&id).and_then(|record| {
+                    if entry_matches_session_filter(record.session_id.as_ref(), session_id) {
+                        Some((id, cosine_similarity(query, &record.embedding)))
+                    } else {
+                        None
+                    }
+                })
             })
             .collect();
 
@@ -218,6 +260,23 @@ where
 struct IndexedEmbedding {
     embedding: Embedding,
     signature: u64,
+    session_id: Option<SessionId>,
+}
+
+/// Returns true when an entry's stored session matches the search filter.
+///
+/// - If the caller requests a specific `query` session (`Some(_)`), only
+///   entries indexed with the same `entry` session are eligible.
+/// - If the caller passes `None`, only legacy entries that were indexed
+///   without a session id stay eligible. This keeps backfill-free data
+///   reachable without leaking it across sessions when a session-scoped
+///   search is requested.
+fn entry_matches_session_filter(entry: Option<&SessionId>, query: Option<&SessionId>) -> bool {
+    match (entry, query) {
+        (None, None) => true,
+        (Some(stored), Some(requested)) => stored == requested,
+        _ => false,
+    }
 }
 
 fn sort_scored_by_score_then_id<ID: Ord>(scored: &mut [(ID, f32)]) {
@@ -270,33 +329,92 @@ const fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+#[derive(Debug)]
+#[cfg(test)]
+struct InMemoryEmbeddingEntry {
+    embedding: Embedding,
+    session_id: Option<SessionId>,
+}
+
 #[derive(Debug, Default)]
 #[cfg(test)]
 pub struct InMemoryVectorIndex {
-    raw_embeddings: RwLock<HashMap<RawNodeId, Embedding>>,
-    abstract_embeddings: RwLock<HashMap<AbstractNodeId, Embedding>>,
+    raw_embeddings: RwLock<HashMap<RawNodeId, InMemoryEmbeddingEntry>>,
+    abstract_embeddings: RwLock<HashMap<AbstractNodeId, InMemoryEmbeddingEntry>>,
 }
 
 #[async_trait]
 #[cfg(test)]
 impl VectorIndex for InMemoryVectorIndex {
     async fn index_raw(&self, id: RawNodeId, embedding: Embedding) -> Result<()> {
-        self.raw_embeddings.write().await.insert(id, embedding);
+        self.raw_embeddings.write().await.insert(
+            id,
+            InMemoryEmbeddingEntry {
+                embedding,
+                session_id: None,
+            },
+        );
         Ok(())
     }
 
     async fn index_abstract(&self, id: AbstractNodeId, embedding: Embedding) -> Result<()> {
-        self.abstract_embeddings.write().await.insert(id, embedding);
+        self.abstract_embeddings.write().await.insert(
+            id,
+            InMemoryEmbeddingEntry {
+                embedding,
+                session_id: None,
+            },
+        );
         Ok(())
     }
 
-    async fn search_raw(&self, query: &Embedding, top_k: usize) -> Result<Vec<ScoredRawRef>> {
+    async fn index_raw_with_session(
+        &self,
+        id: RawNodeId,
+        embedding: Embedding,
+        session_id: Option<SessionId>,
+    ) -> Result<()> {
+        self.raw_embeddings.write().await.insert(
+            id,
+            InMemoryEmbeddingEntry {
+                embedding,
+                session_id,
+            },
+        );
+        Ok(())
+    }
+
+    async fn index_abstract_with_session(
+        &self,
+        id: AbstractNodeId,
+        embedding: Embedding,
+        session_id: Option<SessionId>,
+    ) -> Result<()> {
+        self.abstract_embeddings.write().await.insert(
+            id,
+            InMemoryEmbeddingEntry {
+                embedding,
+                session_id,
+            },
+        );
+        Ok(())
+    }
+
+    async fn search_raw(
+        &self,
+        query: &Embedding,
+        top_k: usize,
+        session_id: Option<&SessionId>,
+    ) -> Result<Vec<ScoredRawRef>> {
         let guard = self.raw_embeddings.read().await;
         let mut scored: Vec<_> = guard
             .iter()
-            .map(|(id, embedding)| ScoredRawRef {
+            .filter(|(_, entry)| {
+                entry_matches_session_filter(entry.session_id.as_ref(), session_id)
+            })
+            .map(|(id, entry)| ScoredRawRef {
                 id: *id,
-                score: cosine_similarity(query, embedding),
+                score: cosine_similarity(query, &entry.embedding),
             })
             .collect();
         scored.sort_by(|left, right| {
@@ -314,13 +432,17 @@ impl VectorIndex for InMemoryVectorIndex {
         &self,
         query: &Embedding,
         top_k: usize,
+        session_id: Option<&SessionId>,
     ) -> Result<Vec<ScoredAbstractRef>> {
         let guard = self.abstract_embeddings.read().await;
         let mut scored: Vec<_> = guard
             .iter()
-            .map(|(id, embedding)| ScoredAbstractRef {
+            .filter(|(_, entry)| {
+                entry_matches_session_filter(entry.session_id.as_ref(), session_id)
+            })
+            .map(|(id, entry)| ScoredAbstractRef {
                 id: *id,
-                score: cosine_similarity(query, embedding),
+                score: cosine_similarity(query, &entry.embedding),
             })
             .collect();
         scored.sort_by(|left, right| {
@@ -366,7 +488,9 @@ mod tests {
         index.index_raw(second, Embedding(vec![1.0, 0.0])).await?;
         index.index_raw(first, Embedding(vec![1.0, 0.0])).await?;
 
-        let scored = index.search_raw(&Embedding(vec![1.0, 0.0]), 3).await?;
+        let scored = index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 3, None)
+            .await?;
 
         assert_eq!(scored.len(), 3);
         assert_eq!(scored[0].id, first);
@@ -389,8 +513,12 @@ mod tests {
             .index_abstract(abstract_node, Embedding(vec![1.0, 0.0]))
             .await?;
 
-        let raw_scored = index.search_raw(&Embedding(vec![1.0, 0.0]), 8).await?;
-        let abstract_scored = index.search_abstract(&Embedding(vec![1.0, 0.0]), 8).await?;
+        let raw_scored = index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 8, None)
+            .await?;
+        let abstract_scored = index
+            .search_abstract(&Embedding(vec![1.0, 0.0]), 8, None)
+            .await?;
 
         assert_eq!(raw_scored.len(), 1);
         assert_eq!(raw_scored[0].id, raw);
@@ -446,9 +574,80 @@ mod tests {
         let index = AnnVectorIndex::default();
         index.index_raw(raw_id(1), Embedding(vec![1.0])).await?;
 
-        let scored = index.search_raw(&Embedding(vec![1.0]), 0).await?;
+        let scored = index.search_raw(&Embedding(vec![1.0]), 0, None).await?;
 
         assert!(scored.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ann_vector_index_filters_by_session_id() -> Result<()> {
+        let index = AnnVectorIndex::new(exact_config());
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        let raw_a = raw_id(1);
+        let raw_b = raw_id(2);
+        let raw_legacy = raw_id(3);
+
+        index
+            .index_raw_with_session(raw_a, Embedding(vec![1.0, 0.0]), Some(session_a))
+            .await?;
+        index
+            .index_raw_with_session(raw_b, Embedding(vec![1.0, 0.0]), Some(session_b))
+            .await?;
+        // Legacy entry indexed without a session id (= None).
+        index
+            .index_raw(raw_legacy, Embedding(vec![1.0, 0.0]))
+            .await?;
+
+        // Session A search returns only the session-A entry.
+        let scoped_a = index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 8, Some(&session_a))
+            .await?;
+        assert_eq!(scoped_a.len(), 1);
+        assert_eq!(scoped_a[0].id, raw_a);
+
+        // Session B search returns only the session-B entry.
+        let scoped_b = index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 8, Some(&session_b))
+            .await?;
+        assert_eq!(scoped_b.len(), 1);
+        assert_eq!(scoped_b[0].id, raw_b);
+
+        // None filter only returns legacy entries (backfill semantics).
+        let legacy_only = index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 8, None)
+            .await?;
+        assert_eq!(legacy_only.len(), 1);
+        assert_eq!(legacy_only[0].id, raw_legacy);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ann_vector_index_filters_abstract_by_session_id() -> Result<()> {
+        let index = AnnVectorIndex::new(exact_config());
+        let session_a = SessionId::new();
+        let abs_a = abstract_id(1);
+        let abs_legacy = abstract_id(2);
+
+        index
+            .index_abstract_with_session(abs_a, Embedding(vec![1.0, 0.0]), Some(session_a))
+            .await?;
+        index
+            .index_abstract(abs_legacy, Embedding(vec![1.0, 0.0]))
+            .await?;
+
+        let scoped = index
+            .search_abstract(&Embedding(vec![1.0, 0.0]), 8, Some(&session_a))
+            .await?;
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].id, abs_a);
+
+        let legacy_only = index
+            .search_abstract(&Embedding(vec![1.0, 0.0]), 8, None)
+            .await?;
+        assert_eq!(legacy_only.len(), 1);
+        assert_eq!(legacy_only[0].id, abs_legacy);
         Ok(())
     }
 }

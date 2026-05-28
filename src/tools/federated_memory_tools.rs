@@ -273,8 +273,12 @@ impl FederatedMemoryTools {
         hits: &mut Vec<FederatedMemoryHit>,
     ) -> Result<()> {
         for candidate in source
+            // Federated memory queries are cross-session by design — they
+            // collate everything reachable from the configured sources.
+            // Pass `None` so the search returns legacy / non-session-tagged
+            // entries; per-session retrieval is the ActivationService path.
             .vector_index
-            .search_raw(query_embedding, top_k)
+            .search_raw(query_embedding, top_k, None)
             .await?
         {
             if candidate.score < threshold {
@@ -301,7 +305,7 @@ impl FederatedMemoryTools {
     ) -> Result<()> {
         for candidate in source
             .vector_index
-            .search_abstract(query_embedding, top_k)
+            .search_abstract(query_embedding, top_k, None)
             .await?
         {
             if candidate.score < threshold {

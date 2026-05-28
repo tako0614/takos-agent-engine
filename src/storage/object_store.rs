@@ -1,13 +1,14 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::fs;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::domain::{AbstractNode, DistillationState, LoopState, RawNode};
 use crate::error::{EngineError, Result};
@@ -20,6 +21,11 @@ use super::traits::{
 };
 
 const STORE_FORMAT_VERSION: u32 = 1;
+/// Bumped whenever the on-disk index layout written by
+/// `rebuild_indexes_unlocked` changes. `open()` compares this with the value
+/// stored in `<root>/indexes/.index-version` and skips the (expensive) full
+/// rebuild whenever they match.
+const INDEX_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct FileObjectStore {
@@ -33,12 +39,25 @@ impl FileObjectStore {
     /// Returns an [`EngineError::Storage`] when the on-disk layout cannot be
     /// created or the index rebuild fails on a corrupt store.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        // Bridge async filesystem work to a sync constructor so existing
+        // callers that build the store outside of a tokio task keep working.
+        // We block in place on a dedicated future; the work itself is the same
+        // tokio::fs path used by all other helpers.
+        let root = root.as_ref().to_path_buf();
+        tokio_block_on(async move { Self::open_async(root).await })
+    }
+
+    /// # Errors
+    ///
+    /// Returns an [`EngineError::Storage`] when the on-disk layout cannot be
+    /// created or the index rebuild fails on a corrupt store.
+    pub async fn open_async(root: impl AsRef<Path>) -> Result<Self> {
         let store = Self {
             root: root.as_ref().to_path_buf(),
             gate: Arc::new(Mutex::new(())),
         };
-        store.ensure_layout()?;
-        store.ensure_indexes()?;
+        store.ensure_layout().await?;
+        store.ensure_indexes().await?;
         Ok(store)
     }
 
@@ -47,13 +66,11 @@ impl FileObjectStore {
         &self.root
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, ()>> {
-        self.gate.lock().map_err(|_| {
-            EngineError::Storage("object store lock was poisoned by a prior panic".to_string())
-        })
+    async fn lock(&self) -> MutexGuard<'_, ()> {
+        self.gate.lock().await
     }
 
-    fn ensure_layout(&self) -> Result<()> {
+    async fn ensure_layout(&self) -> Result<()> {
         for directory in [
             self.raw_dir(),
             self.abstract_dir(),
@@ -62,17 +79,17 @@ impl FileObjectStore {
             self.graph_dir(),
             self.checkpoint_dir(),
         ] {
-            fs::create_dir_all(&directory).map_err(|err| {
+            fs::create_dir_all(&directory).await.map_err(|err| {
                 EngineError::Storage(format!(
                     "failed to create object store directory {}: {err}",
                     directory.display()
                 ))
             })?;
         }
-        self.ensure_index_layout()
+        self.ensure_index_layout().await
     }
 
-    fn ensure_index_layout(&self) -> Result<()> {
+    async fn ensure_index_layout(&self) -> Result<()> {
         for directory in [
             self.raw_operation_dir(),
             self.abstract_operation_dir(),
@@ -82,7 +99,7 @@ impl FileObjectStore {
             self.backlog_index_dir(),
             self.vector_index_dir(),
         ] {
-            fs::create_dir_all(&directory).map_err(|err| {
+            fs::create_dir_all(&directory).await.map_err(|err| {
                 EngineError::Storage(format!(
                     "failed to create object store index directory {}: {err}",
                     directory.display()
@@ -92,25 +109,94 @@ impl FileObjectStore {
         Ok(())
     }
 
-    fn ensure_indexes(&self) -> Result<()> {
-        let _guard = self.lock()?;
-        let mut metadata = self.ensure_metadata_unlocked()?;
-        self.rebuild_indexes_unlocked(&mut metadata)
+    async fn ensure_indexes(&self) -> Result<()> {
+        let _guard = self.lock().await;
+        let mut metadata = self.ensure_metadata_unlocked().await?;
+        if self.read_index_version().await? == Some(INDEX_VERSION)
+            && self.indexes_pass_sanity_check().await
+        {
+            // The on-disk indexes were written by this code version and our
+            // canonical entries parse cleanly. Trust them: this is what makes
+            // repeated `open()` calls (per request) cheap. A version bump,
+            // missing marker, or corrupted critical index forces a full
+            // rebuild on the next open.
+            return Ok(());
+        }
+        self.rebuild_indexes_unlocked(&mut metadata).await
     }
 
-    fn rebuild_indexes_unlocked(&self, metadata: &mut StoreMetadata) -> Result<()> {
-        if self.index_root().exists() {
-            fs::remove_dir_all(self.index_root()).map_err(|err| {
+    async fn indexes_pass_sanity_check(&self) -> bool {
+        // Touch the canonical materialized indexes that downstream callers
+        // depend on. If any of them fail to parse, fall through to a rebuild
+        // rather than surfacing a Storage error for what's a recoverable
+        // on-disk inconsistency.
+        for path in [
+            self.raw_timeline_path(),
+            self.undistilled_index_path(),
+            self.pushed_undistilled_index_path(),
+            self.raw_embedding_manifest_path(),
+            self.abstract_embedding_manifest_path(),
+        ] {
+            if !path_index_is_parseable_or_missing(&path).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn read_index_version(&self) -> Result<Option<u32>> {
+        let path = self.index_version_path();
+        match fs::read(&path).await {
+            Ok(payload) => {
+                let text = String::from_utf8_lossy(&payload);
+                Ok(text.trim().parse::<u32>().ok())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(EngineError::Storage(format!(
+                "failed to read object store index version {}: {err}",
+                path.display()
+            ))),
+        }
+    }
+
+    async fn write_index_version(&self) -> Result<()> {
+        let path = self.index_version_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await.map_err(|err| {
+                EngineError::Storage(format!(
+                    "failed to create object store index version parent {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        fs::write(&path, INDEX_VERSION.to_string().as_bytes())
+            .await
+            .map_err(|err| {
+                EngineError::Storage(format!(
+                    "failed to write object store index version {}: {err}",
+                    path.display()
+                ))
+            })
+    }
+
+    async fn rebuild_indexes_unlocked(&self, metadata: &mut StoreMetadata) -> Result<()> {
+        if fs::try_exists(&self.index_root()).await.map_err(|err| {
+            EngineError::Storage(format!(
+                "failed to probe object store index root {}: {err}",
+                self.index_root().display()
+            ))
+        })? {
+            fs::remove_dir_all(self.index_root()).await.map_err(|err| {
                 EngineError::Storage(format!(
                     "failed to reset object store index root {}: {err}",
                     self.index_root().display()
                 ))
             })?;
         }
-        self.ensure_index_layout()?;
+        self.ensure_index_layout().await?;
 
-        let raw_nodes = self.list_raw_nodes_scan_unlocked()?;
-        let abstract_nodes = self.list_abstract_nodes_scan_unlocked()?;
+        let raw_nodes = self.list_raw_nodes_scan_unlocked().await?;
+        let abstract_nodes = self.list_abstract_nodes_scan_unlocked().await?;
 
         let mut global_timeline = Vec::new();
         let mut session_timelines: HashMap<SessionId, Vec<RawIndexEntry>> = HashMap::new();
@@ -143,24 +229,30 @@ impl FileObjectStore {
                 self.write_json(
                     &self.raw_operation_path(operation_key),
                     &StoredId { id: node.id },
-                )?;
+                )
+                .await?;
             }
         }
 
         sort_raw_index_entries(&mut global_timeline);
-        self.write_json(&self.raw_timeline_path(), &global_timeline)?;
+        self.write_json(&self.raw_timeline_path(), &global_timeline)
+            .await?;
         sort_raw_index_entries(&mut undistilled);
-        self.write_json(&self.undistilled_index_path(), &undistilled)?;
+        self.write_json(&self.undistilled_index_path(), &undistilled)
+            .await?;
         sort_raw_index_entries(&mut pushed_undistilled);
-        self.write_json(&self.pushed_undistilled_index_path(), &pushed_undistilled)?;
+        self.write_json(&self.pushed_undistilled_index_path(), &pushed_undistilled)
+            .await?;
 
         for (session_id, mut entries) in session_timelines {
             sort_raw_index_entries(&mut entries);
-            self.write_json(&self.session_index_path(&session_id), &entries)?;
+            self.write_json(&self.session_index_path(&session_id), &entries)
+                .await?;
         }
         for (loop_id, mut entries) in loop_timelines {
             sort_raw_index_entries(&mut entries);
-            self.write_json(&self.loop_index_path(&loop_id), &entries)?;
+            self.write_json(&self.loop_index_path(&loop_id), &entries)
+                .await?;
         }
 
         for node in abstract_nodes {
@@ -168,21 +260,27 @@ impl FileObjectStore {
                 self.write_json(
                     &self.abstract_operation_path(operation_key),
                     &StoredId { id: node.id },
-                )?;
+                )
+                .await?;
             }
         }
 
-        let raw_embedding_ids =
-            self.read_embedding_ids_scan_unlocked::<RawNodeId>(&self.raw_embedding_dir())?;
-        self.write_manifest_unlocked(&self.raw_embedding_manifest_path(), &raw_embedding_ids)?;
+        let raw_embedding_ids = self
+            .read_embedding_ids_scan_unlocked::<RawNodeId>(&self.raw_embedding_dir())
+            .await?;
+        self.write_manifest_unlocked(&self.raw_embedding_manifest_path(), &raw_embedding_ids)
+            .await?;
         let abstract_embedding_ids = self
-            .read_embedding_ids_scan_unlocked::<AbstractNodeId>(&self.abstract_embedding_dir())?;
+            .read_embedding_ids_scan_unlocked::<AbstractNodeId>(&self.abstract_embedding_dir())
+            .await?;
         self.write_manifest_unlocked(
             &self.abstract_embedding_manifest_path(),
             &abstract_embedding_ids,
-        )?;
+        )
+        .await?;
 
-        self.mark_indexes_rebuilt_unlocked(metadata)
+        self.mark_indexes_rebuilt_unlocked(metadata).await?;
+        self.write_index_version().await
     }
 
     fn metadata_path(&self) -> PathBuf {
@@ -191,6 +289,10 @@ impl FileObjectStore {
 
     fn index_root(&self) -> PathBuf {
         self.root.join("indexes")
+    }
+
+    fn index_version_path(&self) -> PathBuf {
+        self.index_root().join(".index-version")
     }
 
     fn raw_dir(&self) -> PathBuf {
@@ -270,8 +372,11 @@ impl FileObjectStore {
             .join(format!("{session_id}--{loop_id}.json"))
     }
 
-    fn ensure_metadata_unlocked(&self) -> Result<StoreMetadata> {
-        if let Some(metadata) = self.try_read_json::<StoreMetadata>(&self.metadata_path())? {
+    async fn ensure_metadata_unlocked(&self) -> Result<StoreMetadata> {
+        if let Some(metadata) = self
+            .try_read_json::<StoreMetadata>(&self.metadata_path())
+            .await?
+        {
             if metadata.format_version != STORE_FORMAT_VERSION {
                 return Err(EngineError::Storage(format!(
                     "unsupported object store format version {} in {}",
@@ -289,25 +394,25 @@ impl FileObjectStore {
             updated_at: now,
             last_index_rebuild_at: None,
         };
-        self.write_json(&self.metadata_path(), &metadata)?;
+        self.write_json(&self.metadata_path(), &metadata).await?;
         Ok(metadata)
     }
 
-    fn write_metadata_unlocked(&self, metadata: &StoreMetadata) -> Result<()> {
-        self.write_json(&self.metadata_path(), metadata)
+    async fn write_metadata_unlocked(&self, metadata: &StoreMetadata) -> Result<()> {
+        self.write_json(&self.metadata_path(), metadata).await
     }
 
-    fn touch_metadata_unlocked(&self) -> Result<()> {
-        let mut metadata = self.ensure_metadata_unlocked()?;
+    async fn touch_metadata_unlocked(&self) -> Result<()> {
+        let mut metadata = self.ensure_metadata_unlocked().await?;
         metadata.updated_at = Utc::now();
-        self.write_metadata_unlocked(&metadata)
+        self.write_metadata_unlocked(&metadata).await
     }
 
-    fn mark_indexes_rebuilt_unlocked(&self, metadata: &mut StoreMetadata) -> Result<()> {
+    async fn mark_indexes_rebuilt_unlocked(&self, metadata: &mut StoreMetadata) -> Result<()> {
         let now = Utc::now();
         metadata.updated_at = now;
         metadata.last_index_rebuild_at = Some(now);
-        self.write_metadata_unlocked(metadata)
+        self.write_metadata_unlocked(metadata).await
     }
 
     fn raw_operation_path(&self, operation_key: &str) -> PathBuf {
@@ -349,9 +454,9 @@ impl FileObjectStore {
     }
 
     #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
-    fn write_json<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
+    async fn write_json<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| {
+            fs::create_dir_all(parent).await.map_err(|err| {
                 EngineError::Storage(format!(
                     "failed to create parent directory {}: {err}",
                     parent.display()
@@ -365,13 +470,13 @@ impl FileObjectStore {
             ))
         })?;
         let temporary = path.with_extension("tmp");
-        fs::write(&temporary, payload).map_err(|err| {
+        fs::write(&temporary, payload).await.map_err(|err| {
             EngineError::Storage(format!(
                 "failed to write temporary object {}: {err}",
                 temporary.display()
             ))
         })?;
-        fs::rename(&temporary, path).map_err(|err| {
+        fs::rename(&temporary, path).await.map_err(|err| {
             EngineError::Storage(format!(
                 "failed to move object {} into place: {err}",
                 path.display()
@@ -381,8 +486,8 @@ impl FileObjectStore {
     }
 
     #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
-    fn read_json<T: DeserializeOwned>(&self, path: &Path) -> Result<T> {
-        let payload = fs::read(path).map_err(|err| {
+    async fn read_json<T: DeserializeOwned>(&self, path: &Path) -> Result<T> {
+        let payload = fs::read(path).await.map_err(|err| {
             EngineError::Storage(format!("failed to read object {}: {err}", path.display()))
         })?;
         serde_json::from_slice(&payload).map_err(|err| {
@@ -393,56 +498,75 @@ impl FileObjectStore {
         })
     }
 
-    fn try_read_json<T: DeserializeOwned>(&self, path: &Path) -> Result<Option<T>> {
-        if !path.exists() {
-            return Ok(None);
+    async fn try_read_json<T: DeserializeOwned>(&self, path: &Path) -> Result<Option<T>> {
+        match fs::try_exists(path).await {
+            Ok(true) => self.read_json(path).await.map(Some),
+            Ok(false) => Ok(None),
+            Err(err) => Err(EngineError::Storage(format!(
+                "failed to probe object {}: {err}",
+                path.display()
+            ))),
         }
-        self.read_json(path).map(Some)
     }
 
     #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
-    fn remove_file_if_exists(&self, path: &Path) -> Result<()> {
-        if !path.exists() {
-            return Ok(());
+    async fn remove_file_if_exists(&self, path: &Path) -> Result<()> {
+        match fs::try_exists(path).await {
+            Ok(true) => fs::remove_file(path).await.map_err(|err| {
+                EngineError::Storage(format!("failed to remove object {}: {err}", path.display()))
+            }),
+            Ok(false) => Ok(()),
+            Err(err) => Err(EngineError::Storage(format!(
+                "failed to probe object {} for removal: {err}",
+                path.display()
+            ))),
         }
-        fs::remove_file(path).map_err(|err| {
-            EngineError::Storage(format!("failed to remove object {}: {err}", path.display()))
-        })?;
-        Ok(())
     }
 
     #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
-    fn list_paths(&self, directory: &Path) -> Result<Vec<PathBuf>> {
-        if !directory.exists() {
-            return Ok(Vec::new());
+    async fn list_paths(&self, directory: &Path) -> Result<Vec<PathBuf>> {
+        match fs::try_exists(directory).await {
+            Ok(false) => return Ok(Vec::new()),
+            Ok(true) => {}
+            Err(err) => {
+                return Err(EngineError::Storage(format!(
+                    "failed to probe object store directory {}: {err}",
+                    directory.display()
+                )));
+            }
         }
         let mut paths = Vec::new();
-        let entries = fs::read_dir(directory).map_err(|err| {
+        let mut entries = fs::read_dir(directory).await.map_err(|err| {
             EngineError::Storage(format!(
                 "failed to read object store directory {}: {err}",
                 directory.display()
             ))
         })?;
-        for entry in entries {
-            let entry = entry.map_err(|err| {
-                EngineError::Storage(format!(
-                    "failed to enumerate object store directory {}: {err}",
-                    directory.display()
-                ))
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) == Some("json") {
-                paths.push(path);
+        loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    let path = entry.path();
+                    if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                        paths.push(path);
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    return Err(EngineError::Storage(format!(
+                        "failed to enumerate object store directory {}: {err}",
+                        directory.display()
+                    )));
+                }
             }
         }
         paths.sort();
         Ok(paths)
     }
 
-    fn list_raw_nodes_scan_unlocked(&self) -> Result<Vec<RawNode>> {
+    async fn list_raw_nodes_scan_unlocked(&self) -> Result<Vec<RawNode>> {
         let mut nodes = Vec::new();
-        for path in self.list_paths(&self.raw_dir())? {
-            nodes.push(self.read_json(&path)?);
+        for path in self.list_paths(&self.raw_dir()).await? {
+            nodes.push(self.read_json(&path).await?);
         }
         nodes.sort_by(|left: &RawNode, right: &RawNode| {
             left.timestamp
@@ -452,10 +576,10 @@ impl FileObjectStore {
         Ok(nodes)
     }
 
-    fn list_abstract_nodes_scan_unlocked(&self) -> Result<Vec<AbstractNode>> {
+    async fn list_abstract_nodes_scan_unlocked(&self) -> Result<Vec<AbstractNode>> {
         let mut nodes = Vec::new();
-        for path in self.list_paths(&self.abstract_dir())? {
-            nodes.push(self.read_json(&path)?);
+        for path in self.list_paths(&self.abstract_dir()).await? {
+            nodes.push(self.read_json(&path).await?);
         }
         nodes.sort_by(|left: &AbstractNode, right: &AbstractNode| {
             left.timestamp
@@ -465,50 +589,52 @@ impl FileObjectStore {
         Ok(nodes)
     }
 
-    fn read_raw_index_entries_unlocked(&self, path: &Path) -> Result<Vec<RawIndexEntry>> {
+    async fn read_raw_index_entries_unlocked(&self, path: &Path) -> Result<Vec<RawIndexEntry>> {
         Ok(self
-            .try_read_json::<Vec<RawIndexEntry>>(path)?
+            .try_read_json::<Vec<RawIndexEntry>>(path)
+            .await?
             .unwrap_or_default())
     }
 
-    fn write_manifest_unlocked<Id>(&self, path: &Path, ids: &[Id]) -> Result<()>
+    async fn write_manifest_unlocked<Id>(&self, path: &Path, ids: &[Id]) -> Result<()>
     where
         Id: Serialize + Clone + Ord,
     {
         let mut ids = ids.to_vec();
         ids.sort();
         ids.dedup();
-        self.write_json(path, &IdManifest { ids })
+        self.write_json(path, &IdManifest { ids }).await
     }
 
-    fn read_manifest_unlocked<Id>(&self, path: &Path) -> Result<Vec<Id>>
+    async fn read_manifest_unlocked<Id>(&self, path: &Path) -> Result<Vec<Id>>
     where
         Id: DeserializeOwned,
     {
         Ok(self
-            .try_read_json::<IdManifest<Id>>(path)?
+            .try_read_json::<IdManifest<Id>>(path)
+            .await?
             .map(|manifest| manifest.ids)
             .unwrap_or_default())
     }
 
-    fn upsert_manifest_id_unlocked<Id>(&self, path: &Path, id: Id) -> Result<()>
+    async fn upsert_manifest_id_unlocked<Id>(&self, path: &Path, id: Id) -> Result<()>
     where
         Id: Serialize + DeserializeOwned + Copy + Ord,
     {
-        let mut ids = self.read_manifest_unlocked::<Id>(path)?;
+        let mut ids = self.read_manifest_unlocked::<Id>(path).await?;
         if !ids.contains(&id) {
             ids.push(id);
         }
-        self.write_manifest_unlocked(path, &ids)
+        self.write_manifest_unlocked(path, &ids).await
     }
 
-    fn read_embedding_ids_scan_unlocked<Id>(&self, directory: &Path) -> Result<Vec<Id>>
+    async fn read_embedding_ids_scan_unlocked<Id>(&self, directory: &Path) -> Result<Vec<Id>>
     where
         Id: DeserializeOwned + Ord + Copy,
     {
         let mut ids = Vec::new();
-        for path in self.list_paths(directory)? {
-            let record: StoredEmbedding<Id> = self.read_json(&path)?;
+        for path in self.list_paths(directory).await? {
+            let record: StoredEmbedding<Id> = self.read_json(&path).await?;
             ids.push(record.id);
         }
         ids.sort();
@@ -516,63 +642,98 @@ impl FileObjectStore {
         Ok(ids)
     }
 
-    fn upsert_raw_index_entry_unlocked(&self, path: &Path, entry: RawIndexEntry) -> Result<()> {
-        let mut entries = self.read_raw_index_entries_unlocked(path)?;
+    async fn upsert_raw_index_entry_unlocked(
+        &self,
+        path: &Path,
+        entry: RawIndexEntry,
+    ) -> Result<()> {
+        let mut entries = self.read_raw_index_entries_unlocked(path).await?;
         entries.retain(|existing| existing.id != entry.id);
         entries.push(entry);
         sort_raw_index_entries(&mut entries);
-        self.write_json(path, &entries)
+        self.write_json(path, &entries).await
     }
 
-    fn remove_raw_index_entry_unlocked(&self, path: &Path, id: RawNodeId) -> Result<()> {
-        let mut entries = self.read_raw_index_entries_unlocked(path)?;
+    async fn remove_raw_index_entry_unlocked(&self, path: &Path, id: RawNodeId) -> Result<()> {
+        let mut entries = self.read_raw_index_entries_unlocked(path).await?;
         let before = entries.len();
         entries.retain(|entry| entry.id != id);
         if before != entries.len() {
-            self.write_json(path, &entries)?;
+            self.write_json(path, &entries).await?;
         }
         Ok(())
     }
 
-    fn sync_raw_indexes_unlocked(&self, node: &RawNode) -> Result<()> {
+    async fn sync_raw_indexes_unlocked(&self, node: &RawNode) -> Result<()> {
         let entry = RawIndexEntry::from(node);
-        self.upsert_raw_index_entry_unlocked(&self.raw_timeline_path(), entry.clone())?;
+        self.upsert_raw_index_entry_unlocked(&self.raw_timeline_path(), entry.clone())
+            .await?;
         if let Some(session_id) = node.session_id {
             self.upsert_raw_index_entry_unlocked(
                 &self.session_index_path(&session_id),
                 entry.clone(),
-            )?;
+            )
+            .await?;
         }
         if let Some(loop_id) = node.loop_id {
-            self.upsert_raw_index_entry_unlocked(&self.loop_index_path(&loop_id), entry.clone())?;
+            self.upsert_raw_index_entry_unlocked(&self.loop_index_path(&loop_id), entry.clone())
+                .await?;
         }
 
         let is_undistilled = node.distillation_state != DistillationState::Distilled;
         if is_undistilled {
-            self.upsert_raw_index_entry_unlocked(&self.undistilled_index_path(), entry.clone())?;
+            self.upsert_raw_index_entry_unlocked(&self.undistilled_index_path(), entry.clone())
+                .await?;
         } else {
-            self.remove_raw_index_entry_unlocked(&self.undistilled_index_path(), node.id)?;
+            self.remove_raw_index_entry_unlocked(&self.undistilled_index_path(), node.id)
+                .await?;
         }
 
         let pushed = is_undistilled && node.overflow.was_pushed_out_of_session;
         if pushed {
-            self.upsert_raw_index_entry_unlocked(&self.pushed_undistilled_index_path(), entry)?;
+            self.upsert_raw_index_entry_unlocked(&self.pushed_undistilled_index_path(), entry)
+                .await?;
         } else {
-            self.remove_raw_index_entry_unlocked(&self.pushed_undistilled_index_path(), node.id)?;
+            self.remove_raw_index_entry_unlocked(&self.pushed_undistilled_index_path(), node.id)
+                .await?;
         }
 
         Ok(())
     }
 
-    fn read_raw_by_ids_unlocked(&self, ids: &[RawNodeId]) -> Result<Vec<RawNode>> {
+    async fn read_raw_by_ids_unlocked(&self, ids: &[RawNodeId]) -> Result<Vec<RawNode>> {
         let mut nodes = Vec::new();
         for id in ids {
-            if let Some(node) = self.try_read_json::<RawNode>(&self.raw_path(id))? {
+            if let Some(node) = self.try_read_json::<RawNode>(&self.raw_path(id)).await? {
                 nodes.push(node);
             }
         }
         Ok(nodes)
     }
+}
+
+/// Bridges synchronous `FileObjectStore::open` callers to the tokio-fs based
+/// async constructor. The work runs on a dedicated thread with its own
+/// current-thread tokio runtime so we never need to assume the caller is on
+/// the multi-threaded scheduler (`block_in_place` panics on current-thread
+/// runtimes) and never re-enter the caller's runtime.
+fn tokio_block_on<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio current-thread runtime should build for object store open");
+                runtime.block_on(future)
+            })
+            .join()
+            .expect("object store open thread should not panic")
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -597,6 +758,15 @@ struct IdManifest<Id> {
 struct StoredEmbedding<Id> {
     id: Id,
     embedding: Embedding,
+    /// Session id this embedding was indexed for. `None` represents either
+    /// (a) legacy entries written before the session-aware index existed, or
+    /// (b) intentionally session-less indexing. The search filter treats
+    /// `None` entries as legacy: they are only returned when the search
+    /// itself passes `session_id = None`, never when a specific session is
+    /// requested. The field is `#[serde(default)]` so existing on-disk JSON
+    /// without the field deserializes cleanly into the legacy bucket.
+    #[serde(default)]
+    session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -641,49 +811,62 @@ impl ObjectNodeRepository {
 #[async_trait]
 impl NodeRepository for ObjectNodeRepository {
     async fn insert_raw(&self, node: RawNode) -> Result<()> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         self.store
-            .write_json(&self.store.raw_path(&node.id), &node)?;
+            .write_json(&self.store.raw_path(&node.id), &node)
+            .await?;
         if let Some(operation_key) = &node.operation_key {
-            self.store.write_json(
-                &self.store.raw_operation_path(operation_key),
-                &StoredId { id: node.id },
-            )?;
+            self.store
+                .write_json(
+                    &self.store.raw_operation_path(operation_key),
+                    &StoredId { id: node.id },
+                )
+                .await?;
         }
-        self.store.sync_raw_indexes_unlocked(&node)?;
-        self.store.touch_metadata_unlocked()
+        self.store.sync_raw_indexes_unlocked(&node).await?;
+        self.store.touch_metadata_unlocked().await
     }
 
     async fn insert_abstract(&self, node: AbstractNode) -> Result<()> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         self.store
-            .write_json(&self.store.abstract_path(&node.id), &node)?;
+            .write_json(&self.store.abstract_path(&node.id), &node)
+            .await?;
         if let Some(operation_key) = &node.operation_key {
-            self.store.write_json(
-                &self.store.abstract_operation_path(operation_key),
-                &StoredId { id: node.id },
-            )?;
+            self.store
+                .write_json(
+                    &self.store.abstract_operation_path(operation_key),
+                    &StoredId { id: node.id },
+                )
+                .await?;
         }
-        self.store.touch_metadata_unlocked()
+        self.store.touch_metadata_unlocked().await
     }
 
     async fn get_raw(&self, id: &RawNodeId) -> Result<Option<RawNode>> {
-        let _guard = self.store.lock()?;
-        self.store.try_read_json(&self.store.raw_path(id))
+        let _guard = self.store.lock().await;
+        self.store.try_read_json(&self.store.raw_path(id)).await
     }
 
     async fn get_abstract(&self, id: &AbstractNodeId) -> Result<Option<AbstractNode>> {
-        let _guard = self.store.lock()?;
-        self.store.try_read_json(&self.store.abstract_path(id))
+        let _guard = self.store.lock().await;
+        self.store
+            .try_read_json(&self.store.abstract_path(id))
+            .await
     }
 
     async fn get_raw_by_operation_key(&self, operation_key: &str) -> Result<Option<RawNode>> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         match self
             .store
-            .try_read_json::<StoredId<RawNodeId>>(&self.store.raw_operation_path(operation_key))?
+            .try_read_json::<StoredId<RawNodeId>>(&self.store.raw_operation_path(operation_key))
+            .await?
         {
-            Some(record) => self.store.try_read_json(&self.store.raw_path(&record.id)),
+            Some(record) => {
+                self.store
+                    .try_read_json(&self.store.raw_path(&record.id))
+                    .await
+            }
             None => Ok(None),
         }
     }
@@ -692,29 +875,36 @@ impl NodeRepository for ObjectNodeRepository {
         &self,
         operation_key: &str,
     ) -> Result<Option<AbstractNode>> {
-        let _guard = self.store.lock()?;
-        match self.store.try_read_json::<StoredId<AbstractNodeId>>(
-            &self.store.abstract_operation_path(operation_key),
-        )? {
-            Some(record) => self
-                .store
-                .try_read_json(&self.store.abstract_path(&record.id)),
+        let _guard = self.store.lock().await;
+        match self
+            .store
+            .try_read_json::<StoredId<AbstractNodeId>>(
+                &self.store.abstract_operation_path(operation_key),
+            )
+            .await?
+        {
+            Some(record) => {
+                self.store
+                    .try_read_json(&self.store.abstract_path(&record.id))
+                    .await
+            }
             None => Ok(None),
         }
     }
 
     async fn list_raw(&self, ids: &[RawNodeId]) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock()?;
-        self.store.read_raw_by_ids_unlocked(ids)
+        let _guard = self.store.lock().await;
+        self.store.read_raw_by_ids_unlocked(ids).await
     }
 
     async fn list_abstract(&self, ids: &[AbstractNodeId]) -> Result<Vec<AbstractNode>> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         let mut nodes = Vec::new();
         for id in ids {
             if let Some(node) = self
                 .store
-                .try_read_json::<AbstractNode>(&self.store.abstract_path(id))?
+                .try_read_json::<AbstractNode>(&self.store.abstract_path(id))
+                .await?
             {
                 nodes.push(node);
             }
@@ -727,33 +917,36 @@ impl NodeRepository for ObjectNodeRepository {
         session_id: &SessionId,
         limit: usize,
     ) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         let mut entries = self
             .store
-            .read_raw_index_entries_unlocked(&self.store.session_index_path(session_id))?;
+            .read_raw_index_entries_unlocked(&self.store.session_index_path(session_id))
+            .await?;
         entries.reverse();
         entries.truncate(limit);
         entries.reverse();
         let ids: Vec<_> = entries.into_iter().map(|entry| entry.id).collect();
-        self.store.read_raw_by_ids_unlocked(&ids)
+        self.store.read_raw_by_ids_unlocked(&ids).await
     }
 
     async fn session_raw(&self, session_id: &SessionId) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         let entries = self
             .store
-            .read_raw_index_entries_unlocked(&self.store.session_index_path(session_id))?;
+            .read_raw_index_entries_unlocked(&self.store.session_index_path(session_id))
+            .await?;
         let ids: Vec<_> = entries.into_iter().map(|entry| entry.id).collect();
-        self.store.read_raw_by_ids_unlocked(&ids)
+        self.store.read_raw_by_ids_unlocked(&ids).await
     }
 
     async fn raw_for_loop(&self, loop_id: &LoopId) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         let entries = self
             .store
-            .read_raw_index_entries_unlocked(&self.store.loop_index_path(loop_id))?;
+            .read_raw_index_entries_unlocked(&self.store.loop_index_path(loop_id))
+            .await?;
         let ids: Vec<_> = entries.into_iter().map(|entry| entry.id).collect();
-        self.store.read_raw_by_ids_unlocked(&ids)
+        self.store.read_raw_by_ids_unlocked(&ids).await
     }
 
     async fn timeline_raw(
@@ -763,12 +956,15 @@ impl NodeRepository for ObjectNodeRepository {
         to: Option<DateTime<Utc>>,
         limit: usize,
     ) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         let index_path = session_id.map_or_else(
             || self.store.raw_timeline_path(),
             |value| self.store.session_index_path(value),
         );
-        let mut entries = self.store.read_raw_index_entries_unlocked(&index_path)?;
+        let mut entries = self
+            .store
+            .read_raw_index_entries_unlocked(&index_path)
+            .await?;
         entries.retain(|entry| from.is_none_or(|value| entry.timestamp >= value));
         entries.retain(|entry| to.is_none_or(|value| entry.timestamp <= value));
         entries.sort_by(|left, right| {
@@ -779,7 +975,7 @@ impl NodeRepository for ObjectNodeRepository {
         });
         entries.truncate(limit);
         let ids: Vec<_> = entries.into_iter().map(|entry| entry.id).collect();
-        self.store.read_raw_by_ids_unlocked(&ids)
+        self.store.read_raw_by_ids_unlocked(&ids).await
     }
 
     async fn update_raw_lifecycle(
@@ -787,12 +983,13 @@ impl NodeRepository for ObjectNodeRepository {
         ids: &[RawNodeId],
         patch: &RawLifecyclePatch,
     ) -> Result<()> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         let mut changed = false;
         for id in ids {
             if let Some(mut node) = self
                 .store
-                .try_read_json::<RawNode>(&self.store.raw_path(id))?
+                .try_read_json::<RawNode>(&self.store.raw_path(id))
+                .await?
             {
                 if let Some(distillation_state) = &patch.distillation_state {
                     node.distillation_state = distillation_state.clone();
@@ -800,28 +997,33 @@ impl NodeRepository for ObjectNodeRepository {
                 if let Some(overflow) = &patch.overflow {
                     node.overflow = overflow.clone();
                 }
-                self.store.write_json(&self.store.raw_path(id), &node)?;
-                self.store.sync_raw_indexes_unlocked(&node)?;
+                self.store
+                    .write_json(&self.store.raw_path(id), &node)
+                    .await?;
+                self.store.sync_raw_indexes_unlocked(&node).await?;
                 changed = true;
             }
         }
         if changed {
-            self.store.touch_metadata_unlocked()?;
+            self.store.touch_metadata_unlocked().await?;
         }
         Ok(())
     }
 
     async fn undistilled_raw(&self, limit: usize, only_pushed_out: bool) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         let index_path = if only_pushed_out {
             self.store.pushed_undistilled_index_path()
         } else {
             self.store.undistilled_index_path()
         };
-        let mut entries = self.store.read_raw_index_entries_unlocked(&index_path)?;
+        let mut entries = self
+            .store
+            .read_raw_index_entries_unlocked(&index_path)
+            .await?;
         entries.truncate(limit);
         let ids: Vec<_> = entries.into_iter().map(|entry| entry.id).collect();
-        self.store.read_raw_by_ids_unlocked(&ids)
+        self.store.read_raw_by_ids_unlocked(&ids).await
     }
 }
 
@@ -840,38 +1042,80 @@ impl ObjectVectorIndex {
 #[async_trait]
 impl VectorIndex for ObjectVectorIndex {
     async fn index_raw(&self, id: RawNodeId, embedding: Embedding) -> Result<()> {
-        let _guard = self.store.lock()?;
-        self.store.write_json(
-            &self.store.raw_embedding_path(&id),
-            &StoredEmbedding { id, embedding },
-        )?;
-        self.store
-            .upsert_manifest_id_unlocked(&self.store.raw_embedding_manifest_path(), id)?;
-        self.store.touch_metadata_unlocked()
+        self.index_raw_with_session(id, embedding, None).await
     }
 
     async fn index_abstract(&self, id: AbstractNodeId, embedding: Embedding) -> Result<()> {
-        let _guard = self.store.lock()?;
-        self.store.write_json(
-            &self.store.abstract_embedding_path(&id),
-            &StoredEmbedding { id, embedding },
-        )?;
-        self.store
-            .upsert_manifest_id_unlocked(&self.store.abstract_embedding_manifest_path(), id)?;
-        self.store.touch_metadata_unlocked()
+        self.index_abstract_with_session(id, embedding, None).await
     }
 
-    async fn search_raw(&self, query: &Embedding, top_k: usize) -> Result<Vec<ScoredRawRef>> {
-        let _guard = self.store.lock()?;
+    async fn index_raw_with_session(
+        &self,
+        id: RawNodeId,
+        embedding: Embedding,
+        session_id: Option<SessionId>,
+    ) -> Result<()> {
+        let _guard = self.store.lock().await;
+        self.store
+            .write_json(
+                &self.store.raw_embedding_path(&id),
+                &StoredEmbedding {
+                    id,
+                    embedding,
+                    session_id,
+                },
+            )
+            .await?;
+        self.store
+            .upsert_manifest_id_unlocked(&self.store.raw_embedding_manifest_path(), id)
+            .await?;
+        self.store.touch_metadata_unlocked().await
+    }
+
+    async fn index_abstract_with_session(
+        &self,
+        id: AbstractNodeId,
+        embedding: Embedding,
+        session_id: Option<SessionId>,
+    ) -> Result<()> {
+        let _guard = self.store.lock().await;
+        self.store
+            .write_json(
+                &self.store.abstract_embedding_path(&id),
+                &StoredEmbedding {
+                    id,
+                    embedding,
+                    session_id,
+                },
+            )
+            .await?;
+        self.store
+            .upsert_manifest_id_unlocked(&self.store.abstract_embedding_manifest_path(), id)
+            .await?;
+        self.store.touch_metadata_unlocked().await
+    }
+
+    async fn search_raw(
+        &self,
+        query: &Embedding,
+        top_k: usize,
+        session_id: Option<&SessionId>,
+    ) -> Result<Vec<ScoredRawRef>> {
+        let _guard = self.store.lock().await;
         let mut scored = Vec::new();
         for id in self
             .store
-            .read_manifest_unlocked::<RawNodeId>(&self.store.raw_embedding_manifest_path())?
+            .read_manifest_unlocked::<RawNodeId>(&self.store.raw_embedding_manifest_path())
+            .await?
         {
             if let Some(record) = self
                 .store
-                .try_read_json::<StoredEmbedding<RawNodeId>>(&self.store.raw_embedding_path(&id))?
+                .try_read_json::<StoredEmbedding<RawNodeId>>(&self.store.raw_embedding_path(&id))
+                .await?
             {
+                if !object_store_session_matches(record.session_id.as_ref(), session_id) {
+                    continue;
+                }
                 scored.push(ScoredRawRef {
                     id: record.id,
                     score: cosine_similarity(query, &record.embedding),
@@ -893,18 +1137,27 @@ impl VectorIndex for ObjectVectorIndex {
         &self,
         query: &Embedding,
         top_k: usize,
+        session_id: Option<&SessionId>,
     ) -> Result<Vec<ScoredAbstractRef>> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         let mut scored = Vec::new();
-        for id in self.store.read_manifest_unlocked::<AbstractNodeId>(
-            &self.store.abstract_embedding_manifest_path(),
-        )? {
+        for id in self
+            .store
+            .read_manifest_unlocked::<AbstractNodeId>(
+                &self.store.abstract_embedding_manifest_path(),
+            )
+            .await?
+        {
             if let Some(record) = self
                 .store
                 .try_read_json::<StoredEmbedding<AbstractNodeId>>(
                     &self.store.abstract_embedding_path(&id),
-                )?
+                )
+                .await?
             {
+                if !object_store_session_matches(record.session_id.as_ref(), session_id) {
+                    continue;
+                }
                 scored.push(ScoredAbstractRef {
                     id: record.id,
                     score: cosine_similarity(query, &record.embedding),
@@ -920,6 +1173,22 @@ impl VectorIndex for ObjectVectorIndex {
         });
         scored.truncate(top_k);
         Ok(scored)
+    }
+}
+
+/// Filter helper for the file-backed vector index.
+///
+/// Mirrors `entry_matches_session_filter` in `vector.rs`:
+/// - `Some(stored) == Some(requested)` matches.
+/// - Both `None` matches (= legacy entry returned for legacy / session-less
+///   searches).
+/// - Anything else does not match (no cross-session leakage, no legacy entry
+///   returned when a specific session is requested).
+fn object_store_session_matches(stored: Option<&SessionId>, requested: Option<&SessionId>) -> bool {
+    match (stored, requested) {
+        (None, None) => true,
+        (Some(stored), Some(requested)) => stored == requested,
+        _ => false,
     }
 }
 
@@ -963,15 +1232,17 @@ impl ObjectGraphRepository {
 #[async_trait]
 impl GraphRepository for ObjectGraphRepository {
     async fn index_abstract(&self, node: &AbstractNode) -> Result<()> {
-        let _guard = self.store.lock()?;
-        self.store.write_json(
-            &self.store.graph_path(&node.id),
-            &StoredGraphEdges {
-                node_id: node.id,
-                edges: Self::edges_for_abstract(node),
-            },
-        )?;
-        self.store.touch_metadata_unlocked()
+        let _guard = self.store.lock().await;
+        self.store
+            .write_json(
+                &self.store.graph_path(&node.id),
+                &StoredGraphEdges {
+                    node_id: node.id,
+                    edges: Self::edges_for_abstract(node),
+                },
+            )
+            .await?;
+        self.store.touch_metadata_unlocked().await
     }
 
     async fn traverse(
@@ -980,7 +1251,7 @@ impl GraphRepository for ObjectGraphRepository {
         max_depth: usize,
         relation_types: Option<&[String]>,
     ) -> Result<Vec<GraphTraversalHit>> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         let filters = relation_types.map(|values| values.iter().cloned().collect::<HashSet<_>>());
         let mut visited = HashSet::new();
         let mut queue = VecDeque::from([(*start, 0usize, None::<String>)]);
@@ -997,7 +1268,8 @@ impl GraphRepository for ObjectGraphRepository {
             });
             if let Some(record) = self
                 .store
-                .try_read_json::<StoredGraphEdges>(&self.store.graph_path(&current))?
+                .try_read_json::<StoredGraphEdges>(&self.store.graph_path(&current))
+                .await?
             {
                 for edge in record.edges {
                     if let Some(filters) = &filters {
@@ -1029,14 +1301,16 @@ impl ObjectLoopStateRepository {
 #[async_trait]
 impl LoopStateRepository for ObjectLoopStateRepository {
     async fn save_checkpoint(&self, state: LoopState) -> Result<()> {
-        let _guard = self.store.lock()?;
-        self.store.write_json(
-            &self
-                .store
-                .checkpoint_path(&state.session_id, &state.loop_id),
-            &state,
-        )?;
-        self.store.touch_metadata_unlocked()
+        let _guard = self.store.lock().await;
+        self.store
+            .write_json(
+                &self
+                    .store
+                    .checkpoint_path(&state.session_id, &state.loop_id),
+                &state,
+            )
+            .await?;
+        self.store.touch_metadata_unlocked().await
     }
 
     async fn load_checkpoint(
@@ -1044,16 +1318,29 @@ impl LoopStateRepository for ObjectLoopStateRepository {
         session_id: &SessionId,
         loop_id: &LoopId,
     ) -> Result<Option<LoopState>> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         self.store
             .try_read_json(&self.store.checkpoint_path(session_id, loop_id))
+            .await
     }
 
     async fn clear_checkpoint(&self, session_id: &SessionId, loop_id: &LoopId) -> Result<()> {
-        let _guard = self.store.lock()?;
+        let _guard = self.store.lock().await;
         self.store
-            .remove_file_if_exists(&self.store.checkpoint_path(session_id, loop_id))?;
-        self.store.touch_metadata_unlocked()
+            .remove_file_if_exists(&self.store.checkpoint_path(session_id, loop_id))
+            .await?;
+        self.store.touch_metadata_unlocked().await
+    }
+}
+
+/// Returns `true` when the path is either absent or parses as JSON. This is a
+/// cheap sanity probe used by `ensure_indexes` to detect a corrupted
+/// materialized index without holding the index version marker hostage.
+async fn path_index_is_parseable_or_missing(path: &Path) -> bool {
+    match fs::read(path).await {
+        Ok(payload) => serde_json::from_slice::<serde_json::Value>(&payload).is_ok(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
     }
 }
 
@@ -1183,7 +1470,7 @@ mod tests {
         assert_eq!(recent[0].id, newer.id);
 
         let scored = vector_index
-            .search_raw(&Embedding(vec![1.0, 0.0]), 2)
+            .search_raw(&Embedding(vec![1.0, 0.0]), 2, None)
             .await?;
         assert_eq!(scored.len(), 2);
         assert_eq!(scored[0].id, older.id);
@@ -1235,10 +1522,109 @@ mod tests {
         assert_eq!(recovered[0].id, node.id);
 
         let scored = vector_index
-            .search_raw(&Embedding(vec![1.0, 0.0]), 1)
+            .search_raw(&Embedding(vec![1.0, 0.0]), 1, None)
             .await?;
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].id, node.id);
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_store_vector_index_filters_by_session_id() -> crate::Result<()> {
+        let root = temp_root("vector-session-filter");
+        let session_a = crate::SessionId::new();
+        let session_b = crate::SessionId::new();
+        let store = FileObjectStore::open(&root)?;
+        let vector_index = ObjectVectorIndex::new(store);
+
+        let raw_a = crate::ids::RawNodeId::new();
+        let raw_b = crate::ids::RawNodeId::new();
+        let raw_legacy = crate::ids::RawNodeId::new();
+
+        vector_index
+            .index_raw_with_session(raw_a, Embedding(vec![1.0, 0.0]), Some(session_a))
+            .await?;
+        vector_index
+            .index_raw_with_session(raw_b, Embedding(vec![1.0, 0.0]), Some(session_b))
+            .await?;
+        // Legacy entry indexed via the no-session path.
+        vector_index
+            .index_raw(raw_legacy, Embedding(vec![1.0, 0.0]))
+            .await?;
+
+        let scoped_a = vector_index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 8, Some(&session_a))
+            .await?;
+        assert_eq!(scoped_a.len(), 1);
+        assert_eq!(scoped_a[0].id, raw_a);
+
+        let legacy_only = vector_index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 8, None)
+            .await?;
+        assert_eq!(legacy_only.len(), 1);
+        assert_eq!(legacy_only[0].id, raw_legacy);
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_store_vector_index_backfills_legacy_payloads_without_session_field(
+    ) -> crate::Result<()> {
+        // A `StoredEmbedding` JSON payload that pre-dates the session_id
+        // field must still load cleanly and be returned by legacy (= None)
+        // searches, but never by session-scoped searches.
+        let root = temp_root("vector-legacy-backfill");
+        let store = FileObjectStore::open(&root)?;
+        let vector_index = ObjectVectorIndex::new(store.clone());
+
+        let raw_legacy = crate::ids::RawNodeId::new();
+        let legacy_path = store.root().join("embeddings").join("raw");
+        std::fs::create_dir_all(&legacy_path).map_err(|err| {
+            crate::EngineError::Storage(format!("failed to prepare legacy embedding dir: {err}"))
+        })?;
+        let legacy_file = legacy_path.join(format!("{raw_legacy}.json"));
+        let legacy_payload = format!(
+            r#"{{"id":"{raw_legacy}","embedding":[1.0,0.0]}}"#,
+            raw_legacy = raw_legacy
+        );
+        std::fs::write(&legacy_file, legacy_payload.as_bytes()).map_err(|err| {
+            crate::EngineError::Storage(format!("failed to write legacy embedding file: {err}"))
+        })?;
+
+        // Manifest must list the id so the search loop visits it.
+        let manifest_path = store
+            .root()
+            .join("indexes")
+            .join("vector")
+            .join("raw_embeddings.json");
+        std::fs::write(
+            &manifest_path,
+            format!(r#"{{"ids":["{raw_legacy}"]}}"#).as_bytes(),
+        )
+        .map_err(|err| {
+            crate::EngineError::Storage(format!("failed to seed manifest with legacy id: {err}"))
+        })?;
+
+        let scoped = vector_index
+            .search_raw(
+                &Embedding(vec![1.0, 0.0]),
+                4,
+                Some(&crate::SessionId::new()),
+            )
+            .await?;
+        assert!(
+            scoped.is_empty(),
+            "legacy entry must not surface for a session-scoped search"
+        );
+
+        let legacy = vector_index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 4, None)
+            .await?;
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].id, raw_legacy);
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::EngineConfig;
 use crate::domain::{AbstractNode, DistillationState, RawNode};
 use crate::error::Result;
+use crate::ids::SessionId;
 use crate::model::embedding::Embedding;
 use crate::storage::{NodeRepository, VectorIndex};
 
@@ -54,11 +55,17 @@ impl ActivationService {
     /// Returns an [`EngineError`](crate::error::EngineError) when the vector
     /// index search or the node repository lookup of the resulting candidate
     /// ids fails.
+    ///
+    /// `session_id` is forwarded to the [`VectorIndex`] search calls so that
+    /// activated memory does not leak across sessions. Pass `None` only when
+    /// running global / session-less activation (e.g. maintenance contexts);
+    /// per-turn execution must always pass the current session id.
     pub async fn activate(
         &self,
         config: &EngineConfig,
         query_embedding: &Embedding,
         now: DateTime<Utc>,
+        session_id: Option<&SessionId>,
     ) -> Result<ActivatedMemory> {
         let raw_ratio = config.memory.activation.target_ratio.raw.max(1);
         let abstract_ratio = config.memory.activation.target_ratio.abstract_nodes.max(1);
@@ -70,7 +77,7 @@ impl ActivationService {
 
         let raw_candidates = self
             .vector_index
-            .search_raw(query_embedding, search_window)
+            .search_raw(query_embedding, search_window, session_id)
             .await?;
         let mut raw_nodes = Vec::new();
         for candidate in raw_candidates {
@@ -101,7 +108,7 @@ impl ActivationService {
 
         let abstract_candidates = self
             .vector_index
-            .search_abstract(query_embedding, search_window)
+            .search_abstract(query_embedding, search_window, session_id)
             .await?;
         let mut abstract_nodes = Vec::new();
         for candidate in abstract_candidates {
@@ -176,7 +183,7 @@ mod tests {
         let query_emb = h.embedder.embed_text("hello").await.unwrap();
         let result = h
             .service
-            .activate(&config, &query_emb, Utc::now())
+            .activate(&config, &query_emb, Utc::now(), None)
             .await
             .unwrap();
         assert!(result.raw_nodes.is_empty());
@@ -207,7 +214,7 @@ mod tests {
         let query_emb = h.embedder.embed_text("hello world").await.unwrap();
         let result = h
             .service
-            .activate(&config, &query_emb, Utc::now())
+            .activate(&config, &query_emb, Utc::now(), None)
             .await
             .unwrap();
         assert!(!result.raw_nodes.is_empty());
@@ -245,7 +252,7 @@ mod tests {
             .unwrap();
         let result = h
             .service
-            .activate(&config, &query_emb, Utc::now())
+            .activate(&config, &query_emb, Utc::now(), None)
             .await
             .unwrap();
         assert!(!result.abstract_nodes.is_empty());
@@ -280,7 +287,7 @@ mod tests {
             .unwrap();
         let result = h
             .service
-            .activate(&config, &query_emb, Utc::now())
+            .activate(&config, &query_emb, Utc::now(), None)
             .await
             .unwrap();
         assert!(result.raw_nodes.is_empty());
@@ -319,7 +326,7 @@ mod tests {
             .unwrap();
         let result = h
             .service
-            .activate(&config, &query_emb, Utc::now())
+            .activate(&config, &query_emb, Utc::now(), None)
             .await
             .unwrap();
         assert!(result.raw_nodes.len() <= 2);
@@ -352,11 +359,65 @@ mod tests {
         let query_emb = h.embedder.embed_text("hello world").await.unwrap();
         let result = h
             .service
-            .activate(&config, &query_emb, Utc::now())
+            .activate(&config, &query_emb, Utc::now(), None)
             .await
             .unwrap();
         for window in result.raw_nodes.windows(2) {
             assert!(window[0].score >= window[1].score);
         }
+    }
+
+    #[tokio::test]
+    async fn activate_filters_by_session_id() {
+        let h = setup();
+        let mut config = EngineConfig::default();
+        config.memory.retrieval.similarity_threshold.raw = 0.0;
+        config.memory.retrieval.similarity_threshold.abstract_nodes = 0.0;
+
+        let session_a = crate::SessionId::new();
+        let session_b = crate::SessionId::new();
+        let text = "hello world";
+
+        let node_a = RawNode::text(
+            RawNodeKind::UserUtterance,
+            Some(session_a),
+            None,
+            "user",
+            text,
+            0.8,
+            Vec::new(),
+        );
+        let node_b = RawNode::text(
+            RawNodeKind::UserUtterance,
+            Some(session_b),
+            None,
+            "user",
+            text,
+            0.8,
+            Vec::new(),
+        );
+        let emb = h.embedder.embed_text(text).await.unwrap();
+        let id_a = node_a.id;
+        let id_b = node_b.id;
+        h.repo.insert_raw(node_a).await.unwrap();
+        h.repo.insert_raw(node_b).await.unwrap();
+        h.vector
+            .index_raw_with_session(id_a, emb.clone(), Some(session_a))
+            .await
+            .unwrap();
+        h.vector
+            .index_raw_with_session(id_b, emb.clone(), Some(session_b))
+            .await
+            .unwrap();
+
+        let query_emb = h.embedder.embed_text(text).await.unwrap();
+        let scoped = h
+            .service
+            .activate(&config, &query_emb, Utc::now(), Some(&session_a))
+            .await
+            .unwrap();
+
+        assert_eq!(scoped.raw_nodes.len(), 1);
+        assert_eq!(scoped.raw_nodes[0].node.id, id_a);
     }
 }
