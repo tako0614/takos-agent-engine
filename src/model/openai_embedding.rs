@@ -8,6 +8,9 @@ use crate::model::embedding::{Embedder, Embedding};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
+/// See `openai_chat.rs` for the rationale: cap retries so total wall-clock
+/// stays bounded even when the upstream rate-limits aggressively.
+const RETRY_MAX_ATTEMPTS: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiEmbeddingConfig {
@@ -94,22 +97,54 @@ impl Embedder for OpenAiCompatibleEmbedder {
             dimensions: self.config.dimensions,
         };
 
-        let response = self
-            .client
-            .post(self.embeddings_url())
-            .bearer_auth(&self.config.api_key)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|err| EngineError::Model(format!("embedding request failed: {err}")))?;
+        // Same retry policy as `OpenAiCompatibleChatModelRunner::run`. Kept
+        // inline (not factored to a shared module) so each transport stays
+        // self-contained and edits to one path cannot accidentally change
+        // the other's error semantics.
+        let mut attempt: u32 = 0;
+        let response = loop {
+            let send_result = self
+                .client
+                .post(self.embeddings_url())
+                .bearer_auth(&self.config.api_key)
+                .json(&request)
+                .send()
+                .await;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(EngineError::Model(format!(
-                "embedding request failed with HTTP {status}: {body}"
-            )));
-        }
+            let response = match send_result {
+                Ok(response) => response,
+                Err(err) => {
+                    return Err(EngineError::Model(format!(
+                        "embedding request failed: {err}"
+                    )));
+                }
+            };
+
+            let status = response.status();
+            if status.is_success() {
+                break response;
+            }
+
+            let retry_after_header = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+
+            let is_retryable_status =
+                status.as_u16() == 429 || matches!(status.as_u16(), 502..=504);
+            if !is_retryable_status || attempt >= RETRY_MAX_ATTEMPTS {
+                let body = response.text().await.unwrap_or_default();
+                return Err(EngineError::Model(format!(
+                    "embedding request failed with HTTP {status}: {body}"
+                )));
+            }
+
+            let _ = response.text().await;
+            let backoff = retry_backoff(attempt, retry_after_header.as_deref());
+            tokio::time::sleep(backoff).await;
+            attempt += 1;
+        };
 
         let response = response.json::<EmbeddingsResponse>().await.map_err(|err| {
             EngineError::Model(format!("failed to parse embedding response: {err}"))
@@ -124,6 +159,42 @@ impl Embedder for OpenAiCompatibleEmbedder {
                 EngineError::Model("embedding response did not contain data".to_string())
             })
     }
+}
+
+/// See `openai_chat.rs::retry_backoff`. Duplicated here to keep this module's
+/// network policy self-contained; the algorithm is intentionally identical.
+fn retry_backoff(attempt: u32, retry_after_header: Option<&str>) -> Duration {
+    let base_secs = 1u64.checked_shl(attempt).unwrap_or(u64::MAX).min(8);
+    let base = Duration::from_secs(base_secs);
+    let jitter_ms = retry_jitter_ms_for_attempt(attempt, base_secs);
+    let with_jitter = base.saturating_add(Duration::from_millis(jitter_ms));
+    if let Some(server_value) = retry_after_header.and_then(parse_retry_after_seconds) {
+        let server_duration = Duration::from_secs(server_value);
+        if server_duration > with_jitter {
+            return server_duration;
+        }
+    }
+    with_jitter
+}
+
+fn retry_jitter_ms_for_attempt(attempt: u32, base_secs: u64) -> u64 {
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let entropy = now_nanos
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(attempt as u64);
+    let max_jitter_ms = base_secs.saturating_mul(250);
+    if max_jitter_ms == 0 {
+        0
+    } else {
+        entropy % max_jitter_ms
+    }
+}
+
+fn parse_retry_after_seconds(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
 }
 
 fn validate_config(config: &OpenAiEmbeddingConfig) -> Result<()> {
@@ -232,10 +303,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embed_text_returns_model_error_for_http_error() {
+    async fn embed_text_returns_model_error_for_non_retryable_http_error() {
+        // 401 is non-retryable (auth failure), so the embedder must surface
+        // the error on the first attempt without consuming any retry budget.
         let server = FakeEmbeddingServer::spawn(
-            429,
-            r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#,
+            401,
+            r#"{"error":{"message":"missing api key","type":"invalid_request_error"}}"#,
         )
         .await;
         let embedder = OpenAiCompatibleEmbedder::with_config(
@@ -248,9 +321,37 @@ mod tests {
 
         assert!(matches!(err, EngineError::Model(_)));
         let message = err.to_string();
-        assert!(message.contains("HTTP 429"));
-        assert!(message.contains("rate limited"));
+        assert!(message.contains("HTTP 401"));
+        assert!(message.contains("missing api key"));
         let _ = server.request().await;
+    }
+
+    #[tokio::test]
+    async fn embed_text_retries_on_429_and_succeeds() {
+        // First connection sees 429 (retryable), second connection sees 200.
+        // We confirm the embedder consumes both responses and ultimately
+        // returns the successful embedding payload.
+        let scripted = ScriptedFakeEmbeddingServer::spawn(vec![
+            (
+                429,
+                r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#,
+                Some("0"),
+            ),
+            (200, r#"{"data":[{"embedding":[0.5,0.5],"index":0}]}"#, None),
+        ])
+        .await;
+
+        let embedder = OpenAiCompatibleEmbedder::with_config(
+            OpenAiEmbeddingConfig::new("embedding-model", "test-key")
+                .with_base_url(scripted.base_url()),
+        )
+        .unwrap();
+
+        let embedding = embedder.embed_text("hello").await.unwrap();
+
+        assert_eq!(embedding, Embedding(vec![0.5, 0.5]));
+        let request_count = scripted.shutdown().await;
+        assert_eq!(request_count, 2, "embedder should have retried once");
     }
 
     #[test]
@@ -287,6 +388,49 @@ mod tests {
         }
 
         async fn request(self) -> String {
+            self.handle.await.unwrap()
+        }
+    }
+
+    /// Multi-shot fake server: serves one canned response per connection,
+    /// in the order supplied. Each item is `(status, body, retry_after)`.
+    /// The `retry_after` value (if `Some`) is sent as a `Retry-After`
+    /// header so the client's backoff path is exercised end-to-end.
+    struct ScriptedFakeEmbeddingServer {
+        address: std::net::SocketAddr,
+        handle: JoinHandle<usize>,
+    }
+
+    impl ScriptedFakeEmbeddingServer {
+        async fn spawn(script: Vec<(u16, &'static str, Option<&'static str>)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let handle = tokio::spawn(async move {
+                let mut served: usize = 0;
+                for (status, body, retry_after) in script {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let _ = read_http_request(&mut stream).await;
+                    let retry_after_header = retry_after
+                        .map(|value| format!("retry-after: {value}\r\n"))
+                        .unwrap_or_default();
+                    let response = format!(
+                        "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\n{retry}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len(),
+                        retry = retry_after_header,
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    served += 1;
+                }
+                served
+            });
+            Self { address, handle }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.address)
+        }
+
+        async fn shutdown(self) -> usize {
             self.handle.await.unwrap()
         }
     }

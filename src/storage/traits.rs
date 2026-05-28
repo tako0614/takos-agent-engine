@@ -71,11 +71,52 @@ pub trait NodeRepository: Send + Sync {
 pub trait VectorIndex: Send + Sync {
     async fn index_raw(&self, id: RawNodeId, embedding: Embedding) -> Result<()>;
     async fn index_abstract(&self, id: AbstractNodeId, embedding: Embedding) -> Result<()>;
-    async fn search_raw(&self, query: &Embedding, top_k: usize) -> Result<Vec<ScoredRawRef>>;
+
+    /// Index a raw embedding together with the session that produced it.
+    ///
+    /// The default implementation defers to [`VectorIndex::index_raw`] so
+    /// existing legacy callers keep working. Production implementations
+    /// override this to persist the `session_id` alongside the embedding so
+    /// later searches can apply a per-session filter.
+    async fn index_raw_with_session(
+        &self,
+        id: RawNodeId,
+        embedding: Embedding,
+        _session_id: Option<SessionId>,
+    ) -> Result<()> {
+        self.index_raw(id, embedding).await
+    }
+
+    /// Same as [`VectorIndex::index_raw_with_session`] but for abstract nodes.
+    async fn index_abstract_with_session(
+        &self,
+        id: AbstractNodeId,
+        embedding: Embedding,
+        _session_id: Option<SessionId>,
+    ) -> Result<()> {
+        self.index_abstract(id, embedding).await
+    }
+
+    /// Search raw embeddings.
+    ///
+    /// When `session_id` is `Some`, only entries whose stored session_id
+    /// matches the requested session are returned. When `session_id` is `None`,
+    /// only entries without a stored session_id (= legacy entries that
+    /// pre-date the session-aware index) are returned. This convention keeps
+    /// existing legacy data reachable without leaking across sessions when
+    /// session-scoped retrieval is requested.
+    async fn search_raw(
+        &self,
+        query: &Embedding,
+        top_k: usize,
+        session_id: Option<&SessionId>,
+    ) -> Result<Vec<ScoredRawRef>>;
+
     async fn search_abstract(
         &self,
         query: &Embedding,
         top_k: usize,
+        session_id: Option<&SessionId>,
     ) -> Result<Vec<ScoredAbstractRef>>;
 }
 

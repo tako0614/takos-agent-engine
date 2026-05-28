@@ -315,7 +315,14 @@ impl MemoryTools {
         top_k: usize,
         threshold: f32,
     ) -> Result<Vec<ScoredRawHit>> {
-        let refs = self.vector_index.search_raw(query_embedding, top_k).await?;
+        // Memory tool searches are session-less (the search is global across
+        // memory). The `None` session filter therefore matches legacy /
+        // non-session-tagged entries; per-session retrieval is the
+        // `ActivationService::activate` path, not this tool.
+        let refs = self
+            .vector_index
+            .search_raw(query_embedding, top_k, None)
+            .await?;
         let mut hits = Vec::new();
         for candidate in refs {
             if candidate.score < threshold {
@@ -339,7 +346,7 @@ impl MemoryTools {
     ) -> Result<Vec<ScoredAbstractHit>> {
         let refs = self
             .vector_index
-            .search_abstract(query_embedding, top_k)
+            .search_abstract(query_embedding, top_k, None)
             .await?;
         let mut hits = Vec::new();
         for candidate in refs {

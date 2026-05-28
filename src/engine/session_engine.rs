@@ -241,7 +241,10 @@ pub async fn run_maintenance_pass(
 
         let mut created_for_loop = 0usize;
         for node in distilled.new_nodes {
-            if persist_abstract_node(deps, node).await?.is_some() {
+            if persist_abstract_node(deps, node, Some(session_id))
+                .await?
+                .is_some()
+            {
                 report.new_abstract_nodes += 1;
                 created_for_loop += 1;
             }
@@ -649,7 +652,12 @@ impl GraphNode for ActivateMemoryNode {
         state.query_embedding = Some(query_embedding.clone());
         state.activated_memory = deps
             .activation_service()
-            .activate(config, &query_embedding, Utc::now())
+            .activate(
+                config,
+                &query_embedding,
+                Utc::now(),
+                Some(&state.session_id),
+            )
             .await?;
         Ok(NodeOutcome::Continue)
     }
@@ -809,24 +817,122 @@ impl GraphNode for ExecuteToolsNode {
     ) -> Result<NodeOutcome> {
         let calls = std::mem::take(&mut state.pending_tool_calls);
         let round = state.tool_rounds_completed.saturating_add(1);
+
+        // Prepare every pending call up front (validation, arg clamping,
+        // operation_key derivation). This stays sequential because it is
+        // cheap, deterministic, and lets us bail early on a configuration
+        // error before spawning any tasks. We also probe the dedup cache
+        // here so already-persisted tool results skip the tool invocation
+        // entirely and parallel execution only fans out the real work.
+        let mut prepared: Vec<PreparedToolCall> = Vec::with_capacity(calls.len());
         for (index, call) in calls.into_iter().enumerate() {
             if options.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
-
             let call = prepare_tool_call_for_config(call, &config.tools)?;
             let operation_key = tool_result_operation_key(state.loop_id, round, index, &call.name);
-            let raw_node = if let Some(existing) = deps
+            let cached = deps
                 .repository
                 .get_raw_by_operation_key(&operation_key)
-                .await?
-            {
+                .await?;
+            prepared.push(PreparedToolCall {
+                index,
+                call,
+                operation_key,
+                cached,
+            });
+        }
+
+        // Fan out: every prepared call that does not have a cached raw node
+        // is spawned with its own `tool_timeout` so a single slow tool can
+        // not consume the entire node budget. `tokio::spawn` ensures the
+        // tasks make progress in parallel on the multi-thread scheduler.
+        let mut handles: Vec<(usize, tokio::task::JoinHandle<TimedToolOutcome>)> = Vec::new();
+        for prep in &prepared {
+            if prep.cached.is_some() {
+                continue;
+            }
+            let executor = deps.tool_executor.clone();
+            let cancellation = options.cancellation_token.clone();
+            let timeout = options.tool_timeout;
+            let call = prep.call.clone();
+            let tool_name = call.name.clone();
+            let handle = tokio::spawn(async move {
+                // Per-task cancellation race: if the run-wide token fires we
+                // surface `Cancelled` immediately instead of waiting for the
+                // tool to honor cancellation.
+                let exec_future = executor.execute(call);
+                let cancel_aware: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<ToolCallResult>> + Send>,
+                > = if let Some(token) = cancellation {
+                    Box::pin(async move {
+                        tokio::select! {
+                            biased;
+                            () = token.cancelled() => Err(EngineError::Cancelled),
+                            result = exec_future => result,
+                        }
+                    })
+                } else {
+                    Box::pin(exec_future)
+                };
+                match tokio::time::timeout(timeout, cancel_aware).await {
+                    Ok(result) => TimedToolOutcome::Completed(result),
+                    Err(_) => TimedToolOutcome::TimedOut { tool_name },
+                }
+            });
+            handles.push((prep.index, handle));
+        }
+
+        // Collect results into a sparse vector keyed by the prepared index so
+        // we can recombine deterministically with the cached entries below.
+        let mut completed: std::collections::HashMap<usize, Result<ToolCallResult>> =
+            std::collections::HashMap::new();
+        for (index, handle) in handles {
+            let outcome = match handle.await {
+                Ok(value) => value,
+                Err(join_err) => {
+                    // A panic / cancellation of the spawn task itself is a
+                    // hard tool error rather than a silent skip.
+                    return Err(EngineError::Tool(format!(
+                        "tool task join failed: {join_err}"
+                    )));
+                }
+            };
+            match outcome {
+                TimedToolOutcome::Completed(result) => {
+                    completed.insert(index, result);
+                }
+                TimedToolOutcome::TimedOut { tool_name } => {
+                    completed.insert(
+                        index,
+                        Err(EngineError::Tool(format!(
+                            "tool {tool_name} exceeded the configured tool_timeout of {:?}",
+                            options.tool_timeout
+                        ))),
+                    );
+                }
+            }
+        }
+
+        if options.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+
+        // Reassemble results in the original tool-call order so downstream
+        // model rounds see them deterministically. Persistence still happens
+        // sequentially because the raw-node insert path is not designed for
+        // concurrent writers (operation_key uniqueness, sync_raw_indexes).
+        for prep in prepared {
+            let raw_node = if let Some(existing) = prep.cached {
                 existing
             } else {
-                let result = deps.tool_executor.execute(call.clone()).await?;
-                if options.is_cancelled() {
-                    return Err(EngineError::Cancelled);
-                }
+                let result_value = completed.remove(&prep.index).ok_or_else(|| {
+                    EngineError::Tool(format!(
+                        "missing tool result for index {} (tool {})",
+                        prep.index, prep.call.name
+                    ))
+                })?;
+                let result = result_value?;
                 let raw = RawNode::json(
                     RawNodeKind::ToolResult,
                     Some(state.session_id),
@@ -838,9 +944,9 @@ impl GraphNode for ExecuteToolsNode {
                     0.72,
                     vec!["tool".to_string()],
                 )
-                .with_operation_key(operation_key.clone());
+                .with_operation_key(prep.operation_key.clone());
                 let raw = persist_raw_node(deps, raw).await?;
-                state.last_effect_key = Some(operation_key);
+                state.last_effect_key = Some(prep.operation_key);
                 raw
             };
 
@@ -852,6 +958,28 @@ impl GraphNode for ExecuteToolsNode {
         state.tool_rounds_completed = round;
         Ok(NodeOutcome::Continue)
     }
+}
+
+/// Holds a fully-prepared tool call ready for either dedup-replay or
+/// parallel execution.
+struct PreparedToolCall {
+    /// Position in the original `pending_tool_calls` vector. Used to keep
+    /// downstream ordering deterministic regardless of which task finishes
+    /// first.
+    index: usize,
+    call: ToolCallRequest,
+    operation_key: String,
+    /// `Some(existing)` when an earlier persisted raw node already covers
+    /// this operation_key. In that case we do not spawn the tool at all.
+    cached: Option<RawNode>,
+}
+
+/// Result of a single parallel tool task. We distinguish a per-tool timeout
+/// from a generic engine error so the surfaced message clearly attributes
+/// the failure mode.
+enum TimedToolOutcome {
+    Completed(Result<ToolCallResult>),
+    TimedOut { tool_name: String },
 }
 
 struct PersistAssistantOutputNode {
@@ -1006,7 +1134,7 @@ impl GraphNode for DistillCurrentLoopNode {
             .await?;
 
         for node in distilled.new_nodes {
-            if let Some(node) = persist_abstract_node(deps, node).await? {
+            if let Some(node) = persist_abstract_node(deps, node, Some(state.session_id)).await? {
                 state.new_abstract_ids.push(node.id);
                 if let Some(operation_key) = &node.operation_key {
                     state.last_effect_key = Some(operation_key.clone());
@@ -1066,14 +1194,20 @@ async fn persist_raw_node(deps: &EngineDeps, node: RawNode) -> Result<RawNode> {
         }
     }
     let embedding = deps.embedder.embed_text(&node.content_text()).await?;
+    let session_id = node.session_id;
     deps.repository.insert_raw(node.clone()).await?;
-    deps.vector_index.index_raw(node.id, embedding).await?;
+    // Use the session-aware indexing path so per-session retrieval stays
+    // isolated. The raw node's own `session_id` is the source of truth here.
+    deps.vector_index
+        .index_raw_with_session(node.id, embedding, session_id)
+        .await?;
     Ok(node)
 }
 
 async fn persist_abstract_node(
     deps: &EngineDeps,
     node: AbstractNode,
+    session_id: Option<SessionId>,
 ) -> Result<Option<AbstractNode>> {
     if let Some(operation_key) = &node.operation_key {
         if let Some(existing) = deps
@@ -1089,7 +1223,11 @@ async fn persist_abstract_node(
         .embed_text(&format!("{} {}", node.title, node.summary))
         .await?;
     deps.repository.insert_abstract(node.clone()).await?;
-    deps.vector_index.index_abstract(node.id, embedding).await?;
+    // Persist the producing session id alongside the abstract embedding so
+    // distilled / summary nodes also respect the per-session retrieval guard.
+    deps.vector_index
+        .index_abstract_with_session(node.id, embedding, session_id)
+        .await?;
     deps.graph_repository.index_abstract(&node).await?;
     Ok(Some(node))
 }

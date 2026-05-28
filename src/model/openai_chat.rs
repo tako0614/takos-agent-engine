@@ -8,6 +8,10 @@ use crate::model::runner::{ModelInput, ModelOutput, ModelRunner, ToolCallRequest
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
+/// Maximum number of additional attempts after the first failure when the
+/// remote side returns a transient status (429 / 502 / 503 / 504). This
+/// caps total backoff at roughly 1 + 2 + 4 + 8 = 15 seconds plus jitter.
+const RETRY_MAX_ATTEMPTS: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiChatConfig {
@@ -153,22 +157,58 @@ impl ModelRunner for OpenAiCompatibleChatModelRunner {
             tool_choice: self.config.tool_choice.as_ref(),
         };
 
-        let response = self
-            .client
-            .post(self.chat_completions_url())
-            .bearer_auth(&self.config.api_key)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|err| EngineError::Model(format!("chat completion request failed: {err}")))?;
+        // Retry loop: re-send the request on transient upstream failures
+        // (`429` rate limit / `502` / `503` / `504`). Each retry waits
+        // `1s, 2s, 4s, 8s` plus jitter (max 4 retries). When the server
+        // returns a `Retry-After` header that exceeds the computed
+        // backoff, we honour it. Non-retryable HTTP errors and
+        // 4xx-other-than-429 still surface immediately, matching the
+        // pre-retry behaviour.
+        let mut attempt: u32 = 0;
+        let response = loop {
+            let send_result = self
+                .client
+                .post(self.chat_completions_url())
+                .bearer_auth(&self.config.api_key)
+                .json(&request)
+                .send()
+                .await;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(EngineError::Model(format!(
-                "chat completion request failed with HTTP {status}: {body}"
-            )));
-        }
+            let response = match send_result {
+                Ok(response) => response,
+                Err(err) => {
+                    return Err(EngineError::Model(format!(
+                        "chat completion request failed: {err}"
+                    )));
+                }
+            };
+
+            let status = response.status();
+            if status.is_success() {
+                break response;
+            }
+
+            let retry_after_header = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+
+            let is_retryable_status =
+                status.as_u16() == 429 || matches!(status.as_u16(), 502..=504);
+            if !is_retryable_status || attempt >= RETRY_MAX_ATTEMPTS {
+                let body = response.text().await.unwrap_or_default();
+                return Err(EngineError::Model(format!(
+                    "chat completion request failed with HTTP {status}: {body}"
+                )));
+            }
+
+            // Drain the body so the connection can be reused for the retry.
+            let _ = response.text().await;
+            let backoff = retry_backoff(attempt, retry_after_header.as_deref());
+            tokio::time::sleep(backoff).await;
+            attempt += 1;
+        };
 
         let response = response
             .json::<ChatCompletionsResponse>()
@@ -190,6 +230,54 @@ impl ModelRunner for OpenAiCompatibleChatModelRunner {
             tool_calls: parse_tool_calls(message.tool_calls, message.function_call)?,
         })
     }
+}
+
+/// Compute the backoff duration before the next retry attempt.
+///
+/// Sequence: `attempt=0 -> 1s`, `attempt=1 -> 2s`, `attempt=2 -> 4s`,
+/// `attempt=3 -> 8s`. Jitter adds 0-25% on top so concurrent clients do not
+/// re-synchronise after a shared rate-limit event. When the server supplies a
+/// `Retry-After` value larger than the computed backoff we use the server
+/// value instead.
+fn retry_backoff(attempt: u32, retry_after_header: Option<&str>) -> Duration {
+    let base_secs = 1u64.checked_shl(attempt).unwrap_or(u64::MAX).min(8);
+    let base = Duration::from_secs(base_secs);
+    let jitter_ms = retry_jitter_ms_for_attempt(attempt, base_secs);
+    let with_jitter = base.saturating_add(Duration::from_millis(jitter_ms));
+    if let Some(server_value) = retry_after_header.and_then(parse_retry_after_seconds) {
+        let server_duration = Duration::from_secs(server_value);
+        if server_duration > with_jitter {
+            return server_duration;
+        }
+    }
+    with_jitter
+}
+
+/// Pseudo-random jitter of up to 25% of the base backoff, sourced from the
+/// system clock so we do not need a `rand` dependency. The exact value does
+/// not need to be cryptographic — its only job is to break up synchronised
+/// retry storms across multiple clients.
+fn retry_jitter_ms_for_attempt(attempt: u32, base_secs: u64) -> u64 {
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let entropy = now_nanos
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(attempt as u64);
+    let max_jitter_ms = base_secs.saturating_mul(250); // 25% of base, in ms.
+    if max_jitter_ms == 0 {
+        0
+    } else {
+        entropy % max_jitter_ms
+    }
+}
+
+/// Parse a `Retry-After: <seconds>` value. We intentionally do not support
+/// the HTTP-date form because OpenAI-compatible endpoints only send integer
+/// seconds and adding a date parser would pull in a heavier dependency.
+fn parse_retry_after_seconds(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
 }
 
 fn validate_config(config: &OpenAiChatConfig) -> Result<()> {
@@ -503,6 +591,36 @@ mod tests {
         let _ = server.request().await;
     }
 
+    #[tokio::test]
+    async fn run_retries_on_503_and_recovers() {
+        // First request gets 503 (retryable transient backend error), second
+        // gets a successful payload. Confirms both the retry and that the
+        // final parsed output reflects the second response.
+        let scripted = ScriptedFakeChatServer::spawn(vec![
+            (
+                503,
+                r#"{"error":{"message":"backend unavailable","type":"server_error"}}"#,
+                Some("0"),
+            ),
+            (
+                200,
+                r#"{"choices":[{"message":{"role":"assistant","content":"recovered"}}]}"#,
+                None,
+            ),
+        ])
+        .await;
+        let runner = OpenAiCompatibleChatModelRunner::with_config(
+            OpenAiChatConfig::new("chat-model", "test-key").with_base_url(scripted.base_url()),
+        )
+        .unwrap();
+
+        let output = runner.run(sample_input()).await.unwrap();
+        assert_eq!(output.assistant_message.as_deref(), Some("recovered"));
+
+        let served = scripted.shutdown().await;
+        assert_eq!(served, 2, "chat runner should have retried once");
+    }
+
     #[test]
     fn empty_model_is_rejected() {
         let err = OpenAiCompatibleChatModelRunner::new("", "test-key").unwrap_err();
@@ -550,6 +668,47 @@ mod tests {
         }
 
         async fn request(self) -> String {
+            self.handle.await.unwrap()
+        }
+    }
+
+    /// Multi-shot fake server, mirrors the helper in `openai_embedding.rs`
+    /// tests. Each tuple in `script` is `(status, body, retry_after)`.
+    struct ScriptedFakeChatServer {
+        address: std::net::SocketAddr,
+        handle: JoinHandle<usize>,
+    }
+
+    impl ScriptedFakeChatServer {
+        async fn spawn(script: Vec<(u16, &'static str, Option<&'static str>)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let handle = tokio::spawn(async move {
+                let mut served: usize = 0;
+                for (status, body, retry_after) in script {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let _ = read_http_request(&mut stream).await;
+                    let retry_after_header = retry_after
+                        .map(|value| format!("retry-after: {value}\r\n"))
+                        .unwrap_or_default();
+                    let response = format!(
+                        "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\n{retry}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len(),
+                        retry = retry_after_header,
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    served += 1;
+                }
+                served
+            });
+            Self { address, handle }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.address)
+        }
+
+        async fn shutdown(self) -> usize {
             self.handle.await.unwrap()
         }
     }
