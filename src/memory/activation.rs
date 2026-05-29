@@ -74,6 +74,7 @@ impl ActivationService {
         let raw_budget = ((top_k_total * raw_ratio) / total_ratio).max(1);
         let abstract_budget = top_k_total.saturating_sub(raw_budget).max(1);
         let search_window = top_k_total * 2;
+        let use_time_decay = config.memory.activation.use_time_decay;
 
         let raw_candidates = self
             .vector_index
@@ -82,7 +83,8 @@ impl ActivationService {
         let mut raw_nodes = Vec::new();
         for candidate in raw_candidates {
             if let Some(node) = self.repository.get_raw(&candidate.id).await? {
-                let threshold = if node.overflow.was_pushed_out_of_session
+                let threshold = if config.memory.activation.overflow_raw_threshold_relaxation
+                    && node.overflow.was_pushed_out_of_session
                     && node.distillation_state != DistillationState::Distilled
                 {
                     config.memory.retrieval.relaxed_threshold_for_pushed_raw
@@ -92,8 +94,19 @@ impl ActivationService {
                 if candidate.score < threshold {
                     continue;
                 }
+                // `memory.activation.use_time_decay = false` disables recency
+                // decay. The `ScoringPolicy` derives the age penalty purely from
+                // `now - node.timestamp`, so passing the node's own timestamp as
+                // the reference instant collapses the age delta to zero, leaving
+                // the semantic / importance / overflow terms untouched. This
+                // keeps the gate contained to activation wiring (mirroring the
+                // `overflow_raw_threshold_relaxation` gate above) instead of
+                // changing the shared `DefaultScoringPolicy` constructor.
+                let scoring_now = if use_time_decay { now } else { node.timestamp };
                 raw_nodes.push(RankedRawNode {
-                    score: self.scoring_policy.score_raw(candidate.score, &node, now),
+                    score: self
+                        .scoring_policy
+                        .score_raw(candidate.score, &node, scoring_now),
                     node,
                 });
             }
@@ -116,10 +129,13 @@ impl ActivationService {
                 if candidate.score < config.memory.retrieval.similarity_threshold.abstract_nodes {
                     continue;
                 }
+                // See the raw path above: with time decay disabled we pass the
+                // node's own timestamp so the age penalty term resolves to zero.
+                let scoring_now = if use_time_decay { now } else { node.timestamp };
                 abstract_nodes.push(RankedAbstractNode {
                     score: self
                         .scoring_policy
-                        .score_abstract(candidate.score, &node, now),
+                        .score_abstract(candidate.score, &node, scoring_now),
                     node,
                 });
             }
@@ -419,5 +435,76 @@ mod tests {
 
         assert_eq!(scoped.raw_nodes.len(), 1);
         assert_eq!(scoped.raw_nodes[0].node.id, id_a);
+    }
+
+    #[tokio::test]
+    async fn disabling_time_decay_scores_old_and_fresh_nodes_equally() {
+        use chrono::Duration;
+
+        let h = setup();
+        let mut config = EngineConfig::default();
+        config.memory.retrieval.similarity_threshold.raw = 0.0;
+        config.memory.activation.use_time_decay = false;
+        config.memory.activation.top_k_total = 20;
+
+        let now = Utc::now();
+        let text = "decay regression probe";
+
+        // Two nodes with identical content (so identical base similarity and
+        // importance) but very different ages. With time decay disabled they
+        // must score equally; with decay on the old one would score lower.
+        let mut fresh = RawNode::text(
+            RawNodeKind::UserUtterance,
+            None,
+            None,
+            "user",
+            text,
+            0.5,
+            Vec::new(),
+        );
+        fresh.timestamp = now;
+        let mut old = RawNode::text(
+            RawNodeKind::UserUtterance,
+            None,
+            None,
+            "user",
+            text,
+            0.5,
+            Vec::new(),
+        );
+        old.timestamp = now - Duration::days(365);
+
+        let fresh_id = fresh.id;
+        let old_id = old.id;
+        let emb = h.embedder.embed_text(text).await.unwrap();
+        h.repo.insert_raw(fresh).await.unwrap();
+        h.repo.insert_raw(old).await.unwrap();
+        h.vector.index_raw(fresh_id, emb.clone()).await.unwrap();
+        h.vector.index_raw(old_id, emb.clone()).await.unwrap();
+
+        let query_emb = h.embedder.embed_text(text).await.unwrap();
+        let result = h
+            .service
+            .activate(&config, &query_emb, now, None)
+            .await
+            .unwrap();
+
+        let fresh_score = result
+            .raw_nodes
+            .iter()
+            .find(|ranked| ranked.node.id == fresh_id)
+            .map(|ranked| ranked.score)
+            .expect("fresh node should be activated");
+        let old_score = result
+            .raw_nodes
+            .iter()
+            .find(|ranked| ranked.node.id == old_id)
+            .map(|ranked| ranked.score)
+            .expect("old node should be activated");
+
+        assert!(
+            (fresh_score - old_score).abs() < f32::EPSILON,
+            "with time decay disabled an old node ({old_score}) and a fresh node ({fresh_score}) must score equally",
+        );
     }
 }
