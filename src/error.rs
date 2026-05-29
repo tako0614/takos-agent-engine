@@ -4,7 +4,6 @@ use crate::domain::LoopStatus;
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("configuration error: {0}")]
@@ -15,10 +14,6 @@ pub enum EngineError {
     Model(String),
     #[error("tool error: {0}")]
     Tool(String),
-    #[error("timeout while executing {0}")]
-    Timeout(String),
-    #[error("unsupported backend: {0}")]
-    Unsupported(&'static str),
     #[error("operation cancelled")]
     Cancelled,
     #[error("loop checkpoint not found for session={session_id} loop={loop_id}")]
@@ -53,18 +48,6 @@ mod tests {
     fn tool_error_display() {
         let err = EngineError::Tool("tool crashed".to_string());
         assert_eq!(err.to_string(), "tool error: tool crashed");
-    }
-
-    #[test]
-    fn timeout_error_display() {
-        let err = EngineError::Timeout("model call".to_string());
-        assert_eq!(err.to_string(), "timeout while executing model call");
-    }
-
-    #[test]
-    fn unsupported_error_display() {
-        let err = EngineError::Unsupported("llama");
-        assert_eq!(err.to_string(), "unsupported backend: llama");
     }
 
     #[test]

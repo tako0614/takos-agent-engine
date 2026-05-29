@@ -8,6 +8,13 @@ use crate::ids::RawNodeId;
 use crate::memory::activation::ActivatedMemory;
 use crate::tools::executor::ToolCallResult;
 
+/// Heuristic, pre-send token estimator used to pack context within the budget.
+///
+/// This is an estimate, not ground truth: it runs before the prompt is sent and
+/// does not reconcile against the provider's reported `usage`. `ModelOutput`
+/// does not currently capture provider token counts, so `total_estimated_tokens`
+/// in [`AssembledContext`] can diverge from the model's real tokenizer. Treat it
+/// as a budgeting predictor only.
 pub trait TokenEstimator: Send + Sync {
     fn estimate_text(&self, text: &str) -> usize;
 }

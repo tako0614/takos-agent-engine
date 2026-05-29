@@ -57,6 +57,21 @@ const REACTIVATE_SUBGOAL_MEMORY_NODE: &str = "reactivate_subgoal_memory";
 const REASSEMBLE_SUBGOAL_CONTEXT_NODE: &str = "reassemble_subgoal_context";
 const RUN_SUBGOAL_MODEL_AFTER_TOOLS_NODE: &str = "run_subgoal_model_after_tools";
 
+// Per-kind importance priors assigned to raw nodes at creation time.
+//
+// These seed `RawNodeMetadata.importance`, which `DefaultScoringPolicy`
+// multiplies by `importance_weight` and adds to the similarity score when
+// ranking memories for activation (see `memory::scoring`). They are a coarse
+// prior, not a learned value: user utterances carry the goal/intent and are
+// weighted highest; assistant utterances are the committed response and rank
+// just below; tool results are supporting evidence that is often verbose and
+// duplicative, so they rank lowest. The relative ordering
+// (user > assistant > tool) is what matters; absolute values are arbitrary
+// within (0.0, 1.0]. Tuning the retrieval prior means editing these constants.
+const USER_UTTERANCE_IMPORTANCE: f32 = 0.85;
+const ASSISTANT_UTTERANCE_IMPORTANCE: f32 = 0.78;
+const TOOL_RESULT_IMPORTANCE: f32 = 0.72;
+
 #[derive(Clone)]
 pub struct EngineDeps {
     pub repository: Arc<dyn NodeRepository>,
@@ -552,7 +567,7 @@ impl GraphNode for IngestUserInputNode {
             Some(state.loop_id),
             "user",
             state.user_message.clone(),
-            0.85,
+            USER_UTTERANCE_IMPORTANCE,
             vec!["input".to_string()],
         )
         .with_operation_key(user_input_operation_key(state.loop_id));
@@ -941,7 +956,7 @@ impl GraphNode for ExecuteToolsNode {
                     serde_json::to_value(&result).map_err(|err| {
                         EngineError::Tool(format!("failed to encode tool result payload: {err}"))
                     })?,
-                    0.72,
+                    TOOL_RESULT_IMPORTANCE,
                     vec!["tool".to_string()],
                 )
                 .with_operation_key(prep.operation_key.clone());
@@ -1015,7 +1030,7 @@ impl GraphNode for PersistAssistantOutputNode {
             Some(state.loop_id),
             "assistant",
             assistant_message.clone(),
-            0.78,
+            ASSISTANT_UTTERANCE_IMPORTANCE,
             vec!["output".to_string()],
         )
         .with_operation_key(assistant_output_operation_key(state.loop_id));

@@ -24,3 +24,8 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 default = []
 openai-chat = ["dep:reqwest"]
 openai-embeddings = ["dep:reqwest"]
+# Cross-source federated memory tools. Fully implemented and unit-tested, but
+# not yet wired into the engine's tool-dispatch path (no `ToolsConfig` gate, no
+# `EngineDeps` construction). Opt in explicitly until a consumer wires it behind
+# a session/source access boundary.
+federated-memory = []

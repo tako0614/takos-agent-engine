@@ -114,15 +114,155 @@ impl FileObjectStore {
         let mut metadata = self.ensure_metadata_unlocked().await?;
         if self.read_index_version().await? == Some(INDEX_VERSION)
             && self.indexes_pass_sanity_check().await
+            && self.indexes_are_complete().await?
+            && self.embedding_indexes_are_complete().await?
         {
-            // The on-disk indexes were written by this code version and our
-            // canonical entries parse cleanly. Trust them: this is what makes
-            // repeated `open()` calls (per request) cheap. A version bump,
-            // missing marker, or corrupted critical index forces a full
-            // rebuild on the next open.
+            // The on-disk indexes were written by this code version, our
+            // canonical entries parse cleanly, every persisted raw node is
+            // accounted for in the global timeline, AND every persisted
+            // embedding body is accounted for in its vector manifest. Trust
+            // them: this is what makes repeated `open()` calls (per request)
+            // cheap. A version bump, missing marker, corrupted critical index, a
+            // raw node that is missing from the timeline, or an embedding body
+            // missing from its manifest (e.g. a body that was written but whose
+            // manifest upsert did not complete before the process was killed
+            // mid-insert) forces a full rebuild on the next open.
             return Ok(());
         }
         self.rebuild_indexes_unlocked(&mut metadata).await
+    }
+
+    /// Completeness reconciliation for the mid-insert crash window (raw bodies
+    /// vs the global timeline). The sibling `embedding_indexes_are_complete`
+    /// covers the structurally-identical window for embedding bodies vs their
+    /// vector manifests.
+    ///
+    /// `insert_raw` / `update_raw_lifecycle` write the durable raw node body
+    /// (`raw/<id>.json`) BEFORE syncing the retrieval indexes (timeline,
+    /// session, loop, backlog). The body is therefore the source of truth and
+    /// `rebuild_indexes_unlocked` reconstructs every index from the bodies,
+    /// pushing every raw node into the global timeline unconditionally
+    /// (`global_timeline.push(entry)`). If the process is SIGKILLed/OOM-killed
+    /// in that window the body exists but is absent from every index, leaving
+    /// the node permanently orphaned from all retrieval paths even though the
+    /// index version + sanity check still pass.
+    ///
+    /// This probe closes that window: it compares the set of `raw/` ids against
+    /// the ids present in the global timeline index. Because the timeline is the
+    /// one index guaranteed to contain *every* raw node, timeline coverage is a
+    /// sound and cheap completeness invariant — any raw id missing from the
+    /// timeline means the indexes are incomplete and must be rebuilt. This is a
+    /// directory listing + set membership test on open (not a per-write cost),
+    /// so it preserves the cheap-repeated-open property for the common
+    /// (consistent) case where every body is already indexed.
+    async fn indexes_are_complete(&self) -> Result<bool> {
+        let raw_paths = self.list_paths(&self.raw_dir()).await?;
+        if raw_paths.is_empty() {
+            // No raw bodies on disk: nothing can be orphaned from the timeline.
+            return Ok(true);
+        }
+        let timeline = self
+            .read_raw_index_entries_unlocked(&self.raw_timeline_path())
+            .await?;
+        let indexed: HashSet<RawNodeId> = timeline.into_iter().map(|entry| entry.id).collect();
+        for path in raw_paths {
+            // `list_paths` already filters to `*.json`; the file stem is the
+            // raw node id (see `raw_path`). Parse it back and require timeline
+            // coverage. A stem that does not parse as a RawNodeId is treated as
+            // a mismatch so a rebuild re-derives a clean index from the bodies.
+            match path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| RawNodeId::from_str(stem).ok())
+            {
+                Some(id) if indexed.contains(&id) => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Completeness reconciliation for the embedding mid-insert crash window
+    /// (embedding bodies vs their vector manifests). This is the
+    /// structurally-identical sibling of `indexes_are_complete`: the latter
+    /// covers raw bodies vs the timeline, this covers embedding bodies vs their
+    /// manifests.
+    ///
+    /// `index_raw_with_session` / `index_abstract_with_session` write the
+    /// durable embedding body (`embeddings/{raw,abstract}/<id>.json`) BEFORE
+    /// upserting the id into the vector manifest
+    /// (`indexes/vector/{raw,abstract}_embeddings.json`). The body is the source
+    /// of truth and `rebuild_indexes_unlocked` regenerates both manifests from a
+    /// body scan (`read_embedding_ids_scan_unlocked` ->
+    /// `write_manifest_unlocked`). If the process is SIGKILLed/OOM-killed in that
+    /// window the body exists but is absent from the manifest, so `search_raw` /
+    /// `search_abstract` (which iterate the manifest, not the directory) never
+    /// visit it — the embedding is permanently invisible to vector search even
+    /// though the index version + sanity check still pass.
+    ///
+    /// The invariant is body-anchored: every embedding BODY id must be present
+    /// in its manifest. A manifest id without a body is harmless — `search_*`
+    /// already `try_read_json`s each id and silently skips a missing body — so
+    /// we deliberately do NOT require the reverse, nor do we require every raw
+    /// node to own an embedding. Like the raw probe this is a directory listing
+    /// + set membership test on open (not a per-write cost), with an empty-dir
+    /// fast path, preserving the cheap-repeated-open property for the common
+    /// (consistent) case.
+    async fn embedding_indexes_are_complete(&self) -> Result<bool> {
+        if !self
+            .embedding_dir_covered_by_manifest::<RawNodeId>(
+                &self.raw_embedding_dir(),
+                &self.raw_embedding_manifest_path(),
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        self.embedding_dir_covered_by_manifest::<AbstractNodeId>(
+            &self.abstract_embedding_dir(),
+            &self.abstract_embedding_manifest_path(),
+        )
+        .await
+    }
+
+    /// Returns `true` when every `*.json` body in `embedding_dir` has its id
+    /// (the file stem) present in the manifest at `manifest_path`. Empty body
+    /// directories are vacuously complete. An unparseable body stem is treated
+    /// as a mismatch so a rebuild re-derives a clean manifest from the bodies.
+    async fn embedding_dir_covered_by_manifest<Id>(
+        &self,
+        embedding_dir: &Path,
+        manifest_path: &Path,
+    ) -> Result<bool>
+    where
+        Id: DeserializeOwned + FromStr + Eq + std::hash::Hash,
+    {
+        let body_paths = self.list_paths(embedding_dir).await?;
+        if body_paths.is_empty() {
+            // No embedding bodies on disk: nothing can be orphaned from the
+            // manifest.
+            return Ok(true);
+        }
+        let manifest_ids: HashSet<Id> = self
+            .read_manifest_unlocked::<Id>(manifest_path)
+            .await?
+            .into_iter()
+            .collect();
+        for path in body_paths {
+            // `list_paths` already filters to `*.json` (so `.tmp` staging files
+            // are ignored); the file stem is the embedding id (see
+            // `raw_embedding_path` / `abstract_embedding_path`). Parse it back
+            // and require manifest coverage.
+            match path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| Id::from_str(stem).ok())
+            {
+                Some(id) if manifest_ids.contains(&id) => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     async fn indexes_pass_sanity_check(&self) -> bool {
@@ -812,6 +952,14 @@ impl ObjectNodeRepository {
 impl NodeRepository for ObjectNodeRepository {
     async fn insert_raw(&self, node: RawNode) -> Result<()> {
         let _guard = self.store.lock().await;
+        // Cross-file write ordering invariant: the durable raw node body MUST be
+        // written (tmp + atomic rename) BEFORE the retrieval indexes are synced.
+        // The body is the source of truth; `FileObjectStore::indexes_are_complete`
+        // reconciles index coverage against the bodies on open and forces a
+        // rebuild if any body is missing from the timeline. If this order were
+        // reversed (index first) a mid-insert crash would instead leave an index
+        // entry pointing at a non-existent body — a worse, self-healing-free
+        // state. Do not reorder these writes.
         self.store
             .write_json(&self.store.raw_path(&node.id), &node)
             .await?;
@@ -997,6 +1145,9 @@ impl NodeRepository for ObjectNodeRepository {
                 if let Some(overflow) = &patch.overflow {
                     node.overflow = overflow.clone();
                 }
+                // Same body-before-indexes ordering invariant as `insert_raw`:
+                // persist the updated body first so a crash before the index
+                // sync is reconciled (rebuilt from the body) on the next open.
                 self.store
                     .write_json(&self.store.raw_path(id), &node)
                     .await?;
@@ -1683,6 +1834,217 @@ mod tests {
 
         assert_eq!(repository.undistilled_raw(10, false).await?.len(), 0);
         assert_eq!(repository.undistilled_raw(10, true).await?.len(), 0);
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_store_reindexes_node_missing_from_timeline_on_open() -> crate::Result<()> {
+        // Simulate a mid-insert crash: the raw node body and the still-valid
+        // `.index-version` marker survive, but the node never made it into the
+        // timeline index (its index sync was interrupted). On reopen the
+        // completeness reconciliation must detect the orphaned body and rebuild,
+        // so the node is reachable again through every retrieval path. The two
+        // existing recovery tests only cover an unparseable index / a wiped
+        // index dir — neither covers a structurally-valid-but-incomplete index.
+        let root = temp_root("incomplete-timeline");
+        let session_id = crate::SessionId::new();
+        let loop_id = crate::LoopId::new();
+
+        let store = FileObjectStore::open(&root)?;
+        let repository = ObjectNodeRepository::new(store.clone());
+
+        let kept = RawNode::text(
+            RawNodeKind::UserUtterance,
+            Some(session_id),
+            Some(loop_id),
+            "user",
+            "kept node",
+            0.5,
+            Vec::new(),
+        );
+        let orphan = RawNode::text(
+            RawNodeKind::AssistantUtterance,
+            Some(session_id),
+            Some(loop_id),
+            "assistant",
+            "orphaned node",
+            0.6,
+            Vec::new(),
+        );
+        repository.insert_raw(kept.clone()).await?;
+        repository.insert_raw(orphan.clone()).await?;
+
+        // Rewrite the timeline to drop only the orphan's entry, leaving the raw
+        // body, the `.index-version` marker, and the JSON shape all intact — so
+        // the index-version check and the parse sanity check both still pass and
+        // the *only* trigger for a rebuild is the completeness probe.
+        let timeline_path = root.join("indexes").join("timeline").join("raw.json");
+        let timeline_payload = std::fs::read_to_string(&timeline_path).map_err(|err| {
+            crate::EngineError::Storage(format!("failed to read timeline index for test: {err}"))
+        })?;
+        let mut timeline: Value = serde_json::from_str(&timeline_payload).map_err(|err| {
+            crate::EngineError::Storage(format!("failed to parse timeline index for test: {err}"))
+        })?;
+        let orphan_id = orphan.id.to_string();
+        if let Some(entries) = timeline.as_array_mut() {
+            entries.retain(|entry| entry["id"].as_str() != Some(orphan_id.as_str()));
+        }
+        std::fs::write(
+            &timeline_path,
+            serde_json::to_vec(&timeline).map_err(|err| {
+                crate::EngineError::Storage(format!(
+                    "failed to serialize trimmed timeline for test: {err}"
+                ))
+            })?,
+        )
+        .map_err(|err| {
+            crate::EngineError::Storage(format!("failed to write trimmed timeline for test: {err}"))
+        })?;
+
+        // Confirm the orphan really is invisible through the stale index we
+        // trimmed. We removed it from the global timeline index, so probe via
+        // `timeline_raw` (which reads `raw_timeline_path`); `session_raw` reads
+        // the session index, which we deliberately left intact and would still
+        // surface the orphan.
+        let stale = ObjectNodeRepository::new(store);
+        let stale_timeline = stale.timeline_raw(None, None, None, 16).await?;
+        assert_eq!(
+            stale_timeline.len(),
+            1,
+            "before reconciliation the orphaned node must be invisible in the trimmed timeline"
+        );
+
+        // Reopen: the completeness probe must force a rebuild from the bodies.
+        let reopened = FileObjectStore::open(&root)?;
+        let repository = ObjectNodeRepository::new(reopened);
+
+        let session_nodes = repository.session_raw(&session_id).await?;
+        assert_eq!(
+            session_nodes.len(),
+            2,
+            "reopen must reindex the orphaned node from its surviving body"
+        );
+        let timeline_nodes = repository.timeline_raw(None, None, None, 16).await?;
+        let ids: Vec<_> = timeline_nodes.iter().map(|node| node.id).collect();
+        assert!(ids.contains(&kept.id));
+        assert!(ids.contains(&orphan.id));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_store_reindexes_embedding_missing_from_manifest_on_open() -> crate::Result<()> {
+        // Simulate the embedding mid-insert crash: the embedding body and the
+        // still-valid `.index-version` marker survive, but the embedding id
+        // never made it into the vector manifest (its manifest upsert was
+        // interrupted between the body write and the upsert). On reopen the
+        // embedding completeness probe must detect the orphaned body and
+        // rebuild, so the embedding is reachable again through vector search.
+        // This mirrors the raw-timeline incompleteness test but for the
+        // structurally-identical embedding-body/manifest window.
+        let root = temp_root("incomplete-embedding-manifest");
+        let store = FileObjectStore::open(&root)?;
+        let vector_index = ObjectVectorIndex::new(store.clone());
+
+        let kept_raw = crate::ids::RawNodeId::new();
+        let orphan_raw = crate::ids::RawNodeId::new();
+        let orphan_abstract = crate::ids::AbstractNodeId::new();
+
+        vector_index
+            .index_raw(kept_raw, Embedding(vec![0.0, 1.0]))
+            .await?;
+        vector_index
+            .index_raw(orphan_raw, Embedding(vec![1.0, 0.0]))
+            .await?;
+        vector_index
+            .index_abstract(orphan_abstract, Embedding(vec![1.0, 0.0]))
+            .await?;
+
+        // Rewrite each manifest to drop only the orphan id, leaving the
+        // embedding body, the `.index-version` marker, and the JSON shape all
+        // intact — so the index-version check and the parse sanity check both
+        // still pass and the *only* trigger for a rebuild is the embedding
+        // completeness probe.
+        let drop_id_from_manifest = |relative: &str, orphan: &str| -> crate::Result<()> {
+            let manifest_path = root.join("indexes").join("vector").join(relative);
+            let payload = std::fs::read_to_string(&manifest_path).map_err(|err| {
+                crate::EngineError::Storage(format!(
+                    "failed to read embedding manifest for test: {err}"
+                ))
+            })?;
+            let mut manifest: Value = serde_json::from_str(&payload).map_err(|err| {
+                crate::EngineError::Storage(format!(
+                    "failed to parse embedding manifest for test: {err}"
+                ))
+            })?;
+            if let Some(ids) = manifest.get_mut("ids").and_then(Value::as_array_mut) {
+                ids.retain(|id| id.as_str() != Some(orphan));
+            }
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_vec(&manifest).map_err(|err| {
+                    crate::EngineError::Storage(format!(
+                        "failed to serialize trimmed embedding manifest for test: {err}"
+                    ))
+                })?,
+            )
+            .map_err(|err| {
+                crate::EngineError::Storage(format!(
+                    "failed to write trimmed embedding manifest for test: {err}"
+                ))
+            })
+        };
+        drop_id_from_manifest("raw_embeddings.json", &orphan_raw.to_string())?;
+        drop_id_from_manifest("abstract_embeddings.json", &orphan_abstract.to_string())?;
+
+        // Confirm the orphaned embeddings really are invisible through the
+        // stale manifests (search iterates the manifest, not the directory).
+        let stale_index = ObjectVectorIndex::new(store);
+        let stale_raw = stale_index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 8, None)
+            .await?;
+        assert!(
+            stale_raw.iter().all(|hit| hit.id != orphan_raw),
+            "before reconciliation the orphaned raw embedding must be invisible"
+        );
+        let stale_abstract = stale_index
+            .search_abstract(&Embedding(vec![1.0, 0.0]), 8, None)
+            .await?;
+        assert!(
+            stale_abstract.is_empty(),
+            "before reconciliation the orphaned abstract embedding must be invisible"
+        );
+
+        // Reopen: the embedding completeness probe must force a rebuild from the
+        // bodies, regenerating both manifests.
+        let reopened = FileObjectStore::open(&root)?;
+        let vector_index = ObjectVectorIndex::new(reopened);
+
+        let recovered_raw = vector_index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 8, None)
+            .await?;
+        let recovered_raw_ids: Vec<_> = recovered_raw.iter().map(|hit| hit.id).collect();
+        assert!(
+            recovered_raw_ids.contains(&orphan_raw),
+            "reopen must reindex the orphaned raw embedding from its surviving body"
+        );
+        assert!(
+            recovered_raw_ids.contains(&kept_raw),
+            "the already-indexed embedding must remain searchable after rebuild"
+        );
+
+        let recovered_abstract = vector_index
+            .search_abstract(&Embedding(vec![1.0, 0.0]), 8, None)
+            .await?;
+        assert_eq!(
+            recovered_abstract.len(),
+            1,
+            "reopen must reindex the orphaned abstract embedding from its surviving body"
+        );
+        assert_eq!(recovered_abstract[0].id, orphan_abstract);
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
