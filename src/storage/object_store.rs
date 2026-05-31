@@ -206,8 +206,8 @@ impl FileObjectStore {
     /// we deliberately do NOT require the reverse, nor do we require every raw
     /// node to own an embedding. Like the raw probe this is a directory listing
     /// + set membership test on open (not a per-write cost), with an empty-dir
-    /// fast path, preserving the cheap-repeated-open property for the common
-    /// (consistent) case.
+    ///   fast path, preserving the cheap-repeated-open property for the common
+    ///   (consistent) case.
     async fn embedding_indexes_are_complete(&self) -> Result<bool> {
         if !self
             .embedding_dir_covered_by_manifest::<RawNodeId>(
