@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -13,7 +12,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use crate::domain::{AbstractNode, DistillationState, LoopState, RawNode};
 use crate::error::{EngineError, Result};
 use crate::ids::{AbstractNodeId, LoopId, RawNodeId, SessionId};
-use crate::model::embedding::{cosine_similarity, Embedding};
+use crate::model::embedding::{cmp_score_desc, cosine_similarity, Embedding};
 
 use super::traits::{
     GraphRepository, GraphTraversalHit, LoopStateRepository, NodeRepository, RawLifecyclePatch,
@@ -1274,11 +1273,7 @@ impl VectorIndex for ObjectVectorIndex {
             }
         }
         scored.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left.id.cmp(&right.id))
+            cmp_score_desc(left.score, right.score).then_with(|| left.id.cmp(&right.id))
         });
         scored.truncate(top_k);
         Ok(scored)
@@ -1316,11 +1311,7 @@ impl VectorIndex for ObjectVectorIndex {
             }
         }
         scored.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left.id.cmp(&right.id))
+            cmp_score_desc(left.score, right.score).then_with(|| left.id.cmp(&right.id))
         });
         scored.truncate(top_k);
         Ok(scored)

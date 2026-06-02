@@ -38,6 +38,16 @@ pub fn cosine_similarity(left: &Embedding, right: &Embedding) -> f32 {
     }
 }
 
+/// Compare two scores for a descending (highest-first) ordering.
+///
+/// Mirrors the hand-written `b.partial_cmp(&a).unwrap_or(Ordering::Equal)`
+/// pattern used across the vector index, object store, and activation paths:
+/// larger scores sort first and `NaN` comparisons fall back to `Ordering::Equal`.
+#[must_use]
+pub(crate) fn cmp_score_desc(a: f32, b: f32) -> std::cmp::Ordering {
+    b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal)
+}
+
 #[async_trait]
 pub trait Embedder: Send + Sync {
     async fn embed_text(&self, text: &str) -> Result<Embedding>;

@@ -32,7 +32,7 @@ agent runtime の正本 library であり、 service wrapper は `takos/agent/` 
 ## Substitutability
 
 library 内部は **代替可能**: LLM provider / memory backend / vector store を trait 経由で inject する設計。 production
-vendor は feature gate で生かし、 unit test は mock-llm / mock-vector で回す。
+vendor は feature gate で生かし、 unit test は `test-support` feature の deterministic stub で回す。
 
 ## Workflow
 
@@ -40,7 +40,7 @@ vendor は feature gate で生かし、 unit test は mock-llm / mock-vector で
 cd takos-agent-engine
 cargo build
 cargo test
-cargo test --features mock-llm
+cargo test --features test-support
 cargo fmt --check
 cargo clippy
 ```

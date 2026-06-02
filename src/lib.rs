@@ -21,5 +21,15 @@ pub use engine::session_engine::{
 pub use error::{EngineError, Result};
 pub use ids::{AbstractNodeId, LoopId, RawNodeId, SessionId};
 
-#[cfg(test)]
+// Deterministic stub implementations (hash embedder, whitespace token
+// estimator, rule-based model runner, simple distiller) shared between the
+// crate's own tests and the bundled examples. Internal tests reach these via
+// `pub(crate)`; the bundled examples enable the non-default `test-support`
+// feature, which promotes the module to `pub` so `examples/common/support.rs`
+// can reuse the same stubs instead of redefining them. Neither the default
+// build nor downstream consumers (which do not enable `test-support`) compile
+// this module.
+#[cfg(all(test, not(feature = "test-support")))]
 pub(crate) mod test_support;
+#[cfg(feature = "test-support")]
+pub mod test_support;

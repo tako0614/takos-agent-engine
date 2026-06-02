@@ -29,3 +29,16 @@ openai-embeddings = ["dep:reqwest"]
 # `EngineDeps` construction). Opt in explicitly until a consumer wires it behind
 # a session/source access boundary.
 federated-memory = []
+# Deterministic stub implementations shared between the crate's own tests and
+# the bundled examples (see `src/test_support.rs`). Non-default: enabling it
+# promotes the otherwise `#[cfg(test)]`-only `test_support` module to `pub` so
+# the examples can reuse the stubs. The bundled examples turn this on through
+# the self dev-dependency below; downstream consumers never enable it.
+test-support = []
+
+[dev-dependencies]
+# Enable the `test-support` feature for the crate's own examples (and tests)
+# without making it a default feature. This self path-dependency is only active
+# when this crate is the top-level package being built (examples/tests/benches);
+# it does not propagate to downstream consumers' builds.
+takos-agent-engine = { path = ".", features = ["test-support"] }

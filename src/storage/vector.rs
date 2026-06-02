@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
 
@@ -7,7 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::error::Result;
 use crate::ids::{AbstractNodeId, RawNodeId, SessionId};
-use crate::model::embedding::{cosine_similarity, Embedding};
+use crate::model::embedding::{cmp_score_desc, cosine_similarity, Embedding};
 use crate::storage::traits::{ScoredAbstractRef, ScoredRawRef, VectorIndex};
 
 const DEFAULT_PROJECTION_BITS: usize = 16;
@@ -281,10 +280,7 @@ fn entry_matches_session_filter(entry: Option<&SessionId>, query: Option<&Sessio
 
 fn sort_scored_by_score_then_id<ID: Ord>(scored: &mut [(ID, f32)]) {
     scored.sort_by(|(left_id, left_score), (right_id, right_score)| {
-        right_score
-            .partial_cmp(left_score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left_id.cmp(right_id))
+        cmp_score_desc(*left_score, *right_score).then_with(|| left_id.cmp(right_id))
     });
 }
 
@@ -418,10 +414,7 @@ impl VectorIndex for InMemoryVectorIndex {
             })
             .collect();
         scored.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
+            cmp_score_desc(left.score, right.score)
                 .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
         });
         scored.truncate(top_k);
@@ -446,10 +439,7 @@ impl VectorIndex for InMemoryVectorIndex {
             })
             .collect();
         scored.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
+            cmp_score_desc(left.score, right.score)
                 .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
         });
         scored.truncate(top_k);

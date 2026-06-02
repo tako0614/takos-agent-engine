@@ -1016,6 +1016,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "takos-agent-engine",
  "thiserror",
  "tokio",
  "tokio-util",

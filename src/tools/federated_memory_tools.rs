@@ -9,6 +9,7 @@ use crate::config::ToolsConfig;
 use crate::domain::{AbstractNode, RawNode};
 use crate::error::{EngineError, Result};
 use crate::ids::{AbstractNodeId, SessionId};
+use crate::model::embedding::cmp_score_desc;
 use crate::model::{Embedder, Embedding};
 use crate::storage::{GraphRepository, NodeRepository, VectorIndex};
 use crate::tools::memory_tools::{
@@ -328,10 +329,7 @@ fn sort_federated_hits(hits: &mut [FederatedMemoryHit]) {
 }
 
 fn compare_federated_hits(left: &FederatedMemoryHit, right: &FederatedMemoryHit) -> Ordering {
-    right
-        .score
-        .partial_cmp(&left.score)
-        .unwrap_or(Ordering::Equal)
+    cmp_score_desc(left.score, right.score)
         .then_with(|| left.source_id.cmp(&right.source_id))
         .then_with(|| left.node.id_string().cmp(&right.node.id_string()))
         .then_with(|| left.node.kind_rank().cmp(&right.node.kind_rank()))

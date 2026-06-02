@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -8,7 +7,7 @@ use crate::config::EngineConfig;
 use crate::domain::{AbstractNode, DistillationState, RawNode};
 use crate::error::Result;
 use crate::ids::SessionId;
-use crate::model::embedding::Embedding;
+use crate::model::embedding::{cmp_score_desc, Embedding};
 use crate::storage::{NodeRepository, VectorIndex};
 
 use super::scoring::ScoringPolicy;
@@ -111,12 +110,7 @@ impl ActivationService {
                 });
             }
         }
-        raw_nodes.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-        });
+        raw_nodes.sort_by(|left, right| cmp_score_desc(left.score, right.score));
         raw_nodes.truncate(raw_budget);
 
         let abstract_candidates = self
@@ -140,12 +134,7 @@ impl ActivationService {
                 });
             }
         }
-        abstract_nodes.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-        });
+        abstract_nodes.sort_by(|left, right| cmp_score_desc(left.score, right.score));
         abstract_nodes.truncate(abstract_budget);
 
         Ok(ActivatedMemory {
