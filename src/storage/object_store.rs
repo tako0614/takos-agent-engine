@@ -228,6 +228,9 @@ impl FileObjectStore {
     /// (the file stem) present in the manifest at `manifest_path`. Empty body
     /// directories are vacuously complete. An unparseable body stem is treated
     /// as a mismatch so a rebuild re-derives a clean manifest from the bodies.
+    /// A wrong-shape (but valid-JSON) manifest is likewise treated as not
+    /// covering the bodies (`Ok(false)`), forcing a rebuild rather than
+    /// surfacing a Storage error.
     async fn embedding_dir_covered_by_manifest<Id>(
         &self,
         embedding_dir: &Path,
@@ -242,11 +245,12 @@ impl FileObjectStore {
             // manifest.
             return Ok(true);
         }
-        let manifest_ids: HashSet<Id> = self
-            .read_manifest_unlocked::<Id>(manifest_path)
-            .await?
-            .into_iter()
-            .collect();
+        let manifest_ids: HashSet<Id> =
+            match self.try_read_json::<IdManifest<Id>>(manifest_path).await {
+                Ok(Some(manifest)) => manifest.ids.into_iter().collect(),
+                Ok(None) => HashSet::new(),
+                Err(_) => return Ok(false),
+            };
         for path in body_paths {
             // `list_paths` already filters to `*.json` (so `.tmp` staging files
             // are ignored); the file stem is the embedding id (see
@@ -1668,6 +1672,49 @@ mod tests {
             .await?;
         assert_eq!(scored.len(), 1);
         assert_eq!(scored[0].id, node.id);
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_store_rebuilds_from_wrong_shape_embedding_manifest_on_open() -> crate::Result<()>
+    {
+        // A valid-JSON but wrong-shape embedding manifest (e.g. a bare array
+        // instead of `{"ids": [...]}`) must force a rebuild on open rather
+        // than surfacing a Storage error.
+        let root = temp_root("wrong-shape-manifest");
+        let store = FileObjectStore::open(&root)?;
+        let vector_index = ObjectVectorIndex::new(store.clone());
+
+        let raw = crate::ids::RawNodeId::new();
+        vector_index
+            .index_raw(raw, Embedding(vec![1.0, 0.0]))
+            .await?;
+
+        // Embedding body stays on disk; clobber the manifest with valid JSON
+        // of the wrong shape.
+        let manifest_path = store
+            .root()
+            .join("indexes")
+            .join("vector")
+            .join("raw_embeddings.json");
+        std::fs::write(&manifest_path, b"[1,2,3]").map_err(|err| {
+            crate::EngineError::Storage(format!(
+                "failed to write wrong-shape embedding manifest: {err}"
+            ))
+        })?;
+
+        // Reopen: rebuild must succeed (not error) and re-derive the manifest
+        // from the surviving body so the embedding is searchable again.
+        let reopened = FileObjectStore::open(&root)?;
+        let vector_index = ObjectVectorIndex::new(reopened);
+
+        let scored = vector_index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 1, None)
+            .await?;
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].id, raw);
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
