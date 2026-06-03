@@ -13,4 +13,4 @@ pub use openai_chat::{
 };
 #[cfg(feature = "openai-embeddings")]
 pub use openai_embedding::{OpenAiCompatibleEmbedder, OpenAiEmbeddingConfig};
-pub use runner::{ModelInput, ModelOutput, ModelRunner, ToolCallRequest};
+pub use runner::{ModelInput, ModelOutput, ModelRunner, ModelUsage, ToolCallRequest};

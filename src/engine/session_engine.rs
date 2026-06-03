@@ -1995,6 +1995,7 @@ mod tests {
                     name: "timeline_search".to_string(),
                     arguments: serde_json::json!({ "limit": 1 }),
                 }],
+                usage: None,
             })
         }
     }

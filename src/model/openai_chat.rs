@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{EngineError, Result};
-use crate::model::runner::{ModelInput, ModelOutput, ModelRunner, ToolCallRequest};
+use crate::model::runner::{
+    ModelInput, ModelOutput, ModelRunner, ModelUsage, ToolCallRequest,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
@@ -216,6 +218,14 @@ impl ModelRunner for OpenAiCompatibleChatModelRunner {
             .map_err(|err| {
                 EngineError::Model(format!("failed to parse chat completion response: {err}"))
             })?;
+        let usage = response.usage.as_ref().map(|u| ModelUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cached_input_tokens: u
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cached_tokens),
+        });
         let message = response
             .choices
             .into_iter()
@@ -228,6 +238,7 @@ impl ModelRunner for OpenAiCompatibleChatModelRunner {
         Ok(ModelOutput {
             assistant_message: message.content.filter(|content| !content.is_empty()),
             tool_calls: parse_tool_calls(message.tool_calls, message.function_call)?,
+            usage,
         })
     }
 }
@@ -410,6 +421,24 @@ struct ChatMessage {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionsResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]

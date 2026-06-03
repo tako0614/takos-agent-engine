@@ -76,6 +76,7 @@ impl ModelRunner for TestRuleBasedModelRunner {
                             "top_k": 4
                         }),
                     }],
+                    usage: None,
                 });
             }
 
@@ -88,6 +89,7 @@ impl ModelRunner for TestRuleBasedModelRunner {
                             "limit": 8
                         }),
                     }],
+                    usage: None,
                 });
             }
         }
@@ -119,6 +121,7 @@ impl ModelRunner for TestRuleBasedModelRunner {
         Ok(ModelOutput {
             assistant_message: Some(lines.join("\n")),
             tool_calls: Vec::new(),
+            usage: None,
         })
     }
 }
