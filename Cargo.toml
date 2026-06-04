@@ -24,11 +24,6 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 default = []
 openai-chat = ["dep:reqwest"]
 openai-embeddings = ["dep:reqwest"]
-# Cross-source federated memory tools. Fully implemented and unit-tested, but
-# not yet wired into the engine's tool-dispatch path (no `ToolsConfig` gate, no
-# `EngineDeps` construction). Opt in explicitly until a consumer wires it behind
-# a session/source access boundary.
-federated-memory = []
 # Deterministic stub implementations shared between the crate's own tests and
 # the bundled examples (see `src/test_support.rs`). Non-default: enabling it
 # promotes the otherwise `#[cfg(test)]`-only `test_support` module to `pub` so
