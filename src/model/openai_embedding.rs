@@ -5,12 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{EngineError, Result};
 use crate::model::embedding::{Embedder, Embedding};
+use crate::model::openai_http::send_with_retry;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
-/// See `openai_chat.rs` for the rationale: cap retries so total wall-clock
-/// stays bounded even when the upstream rate-limits aggressively.
-const RETRY_MAX_ATTEMPTS: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiEmbeddingConfig {
@@ -97,54 +95,16 @@ impl Embedder for OpenAiCompatibleEmbedder {
             dimensions: self.config.dimensions,
         };
 
-        // Same retry policy as `OpenAiCompatibleChatModelRunner::run`. Kept
-        // inline (not factored to a shared module) so each transport stays
-        // self-contained and edits to one path cannot accidentally change
-        // the other's error semantics.
-        let mut attempt: u32 = 0;
-        let response = loop {
-            let send_result = self
-                .client
+        // Transport policy (retry / backoff / jitter / `Retry-After`) lives in
+        // `openai_http::send_with_retry`; this client keeps only its request
+        // and response shapes.
+        let response = send_with_retry("embedding request failed", || {
+            self.client
                 .post(self.embeddings_url())
                 .bearer_auth(&self.config.api_key)
                 .json(&request)
-                .send()
-                .await;
-
-            let response = match send_result {
-                Ok(response) => response,
-                Err(err) => {
-                    return Err(EngineError::Model(format!(
-                        "embedding request failed: {err}"
-                    )));
-                }
-            };
-
-            let status = response.status();
-            if status.is_success() {
-                break response;
-            }
-
-            let retry_after_header = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-
-            let is_retryable_status =
-                status.as_u16() == 429 || matches!(status.as_u16(), 502..=504);
-            if !is_retryable_status || attempt >= RETRY_MAX_ATTEMPTS {
-                let body = response.text().await.unwrap_or_default();
-                return Err(EngineError::Model(format!(
-                    "embedding request failed with HTTP {status}: {body}"
-                )));
-            }
-
-            let _ = response.text().await;
-            let backoff = retry_backoff(attempt, retry_after_header.as_deref());
-            tokio::time::sleep(backoff).await;
-            attempt += 1;
-        };
+        })
+        .await?;
 
         let response = response.json::<EmbeddingsResponse>().await.map_err(|err| {
             EngineError::Model(format!("failed to parse embedding response: {err}"))
@@ -159,42 +119,6 @@ impl Embedder for OpenAiCompatibleEmbedder {
                 EngineError::Model("embedding response did not contain data".to_string())
             })
     }
-}
-
-/// See `openai_chat.rs::retry_backoff`. Duplicated here to keep this module's
-/// network policy self-contained; the algorithm is intentionally identical.
-fn retry_backoff(attempt: u32, retry_after_header: Option<&str>) -> Duration {
-    let base_secs = 1u64.checked_shl(attempt).unwrap_or(u64::MAX).min(8);
-    let base = Duration::from_secs(base_secs);
-    let jitter_ms = retry_jitter_ms_for_attempt(attempt, base_secs);
-    let with_jitter = base.saturating_add(Duration::from_millis(jitter_ms));
-    if let Some(server_value) = retry_after_header.and_then(parse_retry_after_seconds) {
-        let server_duration = Duration::from_secs(server_value);
-        if server_duration > with_jitter {
-            return server_duration;
-        }
-    }
-    with_jitter
-}
-
-fn retry_jitter_ms_for_attempt(attempt: u32, base_secs: u64) -> u64 {
-    let now_nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.subsec_nanos() as u64)
-        .unwrap_or(0);
-    let entropy = now_nanos
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        .wrapping_add(attempt as u64);
-    let max_jitter_ms = base_secs.saturating_mul(250);
-    if max_jitter_ms == 0 {
-        0
-    } else {
-        entropy % max_jitter_ms
-    }
-}
-
-fn parse_retry_after_seconds(value: &str) -> Option<u64> {
-    value.trim().parse::<u64>().ok()
 }
 
 fn validate_config(config: &OpenAiEmbeddingConfig) -> Result<()> {

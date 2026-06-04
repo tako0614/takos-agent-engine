@@ -4,6 +4,7 @@ mod graph;
 mod in_memory;
 pub mod object_store;
 pub mod traits;
+#[cfg(test)]
 mod vector;
 
 #[cfg(test)]
@@ -20,4 +21,3 @@ pub use traits::{
 };
 #[cfg(test)]
 pub(crate) use vector::InMemoryVectorIndex;
-pub use vector::{AnnVectorIndex, AnnVectorIndexConfig};
