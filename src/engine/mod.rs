@@ -1,5 +1,7 @@
 pub mod context_assembler;
 pub mod execution_graph;
+pub mod graph_spec;
+pub mod nodes;
 pub mod session_engine;
 
 pub use context_assembler::{

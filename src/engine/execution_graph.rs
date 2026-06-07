@@ -270,6 +270,18 @@ impl ExecutionGraph {
         &self.start
     }
 
+    /// Number of registered nodes. Used by tests asserting graph topology.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Number of registered edges. Used by tests asserting graph topology.
+    #[must_use]
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
     fn resolve_next(&self, current_node: &str, outcome: &NodeOutcome) -> Result<Option<String>> {
         match outcome {
             NodeOutcome::Finish | NodeOutcome::Pause => Ok(None),
