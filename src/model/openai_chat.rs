@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{EngineError, Result};
 use crate::model::openai_http::send_with_retry;
-use crate::model::runner::{
-    ModelInput, ModelOutput, ModelRunner, ModelUsage, ToolCallRequest,
-};
+use crate::model::runner::{ModelInput, ModelOutput, ModelRunner, ModelUsage, ToolCallRequest};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";

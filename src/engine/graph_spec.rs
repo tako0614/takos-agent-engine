@@ -1,8 +1,8 @@
 //! Declarative, table-driven construction of the execution-graph presets.
 //!
 //! The three [`ExecutionGraphPreset`] variants are the same linear pipeline
-//! with a few axes flipped, so a single [`GraphSpec`] table drives
-//! [`build_graph_from_spec`] instead of hand-wiring nodes and edges per preset.
+//! with a few axes flipped, so a single internal graph-spec table drives the
+//! graph builder instead of hand-wiring nodes and edges per preset.
 //! The node implementations these builders register live in
 //! [`nodes`](crate::engine::nodes).
 
@@ -151,7 +151,11 @@ fn build_graph_from_spec(spec: &GraphSpec) -> ExecutionGraph {
     }));
 
     graph.add_edge(INGEST_USER_INPUT_NODE, DEFAULT_EDGE, LOAD_SESSION_VIEW_NODE);
-    graph.add_edge(LOAD_SESSION_VIEW_NODE, DEFAULT_EDGE, spec.prefix.build_query);
+    graph.add_edge(
+        LOAD_SESSION_VIEW_NODE,
+        DEFAULT_EDGE,
+        spec.prefix.build_query,
+    );
     graph.add_edge(spec.prefix.build_query, DEFAULT_EDGE, spec.prefix.activate);
     graph.add_edge(spec.prefix.activate, DEFAULT_EDGE, spec.prefix.assemble);
     graph.add_edge(spec.prefix.assemble, DEFAULT_EDGE, spec.prefix.model);

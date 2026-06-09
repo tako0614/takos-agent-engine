@@ -15,9 +15,7 @@ use tracing::{info_span, instrument};
 use crate::config::EngineConfig;
 use crate::domain::{LoopStatus, RawNode};
 use crate::engine::context_assembler::{ContextAssembler, TokenEstimator};
-use crate::engine::execution_graph::{
-    ExecutionState, GraphRunner, ResolvedRunOptions, RunOptions,
-};
+use crate::engine::execution_graph::{ExecutionState, GraphRunner, ResolvedRunOptions, RunOptions};
 use crate::engine::nodes::{build_response, persist_abstract_node};
 use crate::error::{EngineError, Result};
 use crate::ids::{LoopId, SessionId};

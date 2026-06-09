@@ -675,10 +675,7 @@ impl GraphNode for DistillCurrentLoopNode {
     }
 }
 
-pub(crate) fn build_response(
-    state: ExecutionState,
-    result: GraphRunResult,
-) -> SessionResponse {
+pub(crate) fn build_response(state: ExecutionState, result: GraphRunResult) -> SessionResponse {
     SessionResponse {
         session_id: state.session_id,
         loop_id: state.loop_id,
