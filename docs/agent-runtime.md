@@ -31,7 +31,7 @@ Workers / control plane 側に残すもの:
 この分離が current canonical architecture です。
 
 `takos-agent-engine/` 単体の tool surface は `executor` と `memory_tools` です。\
-`skill_list` / `skill_get` / `skill_context` / `skill_catalog` / `skill_describe` の local intercept は `takos/agent/`
+`skill_list` / `skill_get` / `skill_context` / `skill_catalog` / `skill_describe` の local intercept は `takos/containers/agent/`
 側の wrapper が担い、managed skill と custom skill の合成結果を返します。
 
 ## 実行構成
@@ -79,7 +79,7 @@ wrapper-side local skill intercept:
 - `skill_catalog`
 - `skill_describe`
 
-`skill_*` 系は `takos-agent-engine` の公開 tool surface ではなく、`takos/agent/` の wrapper が local intercept します。
+`skill_*` 系は `takos-agent-engine` の公開 tool surface ではなく、`takos/containers/agent/` の wrapper が local intercept します。
 
 remote:
 
@@ -106,8 +106,8 @@ custom skill:
 ## 実装上の source of truth
 
 - agent core: standalone `takos-agent-engine/` の `Cargo.toml` と `src/`
-- service wrapper: `takos/agent/` は bootstrap / control RPC / prompt / skill wiring を担う wrapper
+- service wrapper: `takos/containers/agent/` は bootstrap / control RPC / prompt / skill wiring を担う wrapper
 - control RPC contract: Takos control plane 側の container-hosts / executor 間 RPC 定義
 
 Takos-agent の Rust 実装は、engine core を standalone `takos-agent-engine/` に置き、ecosystem checkout 側では
-`takos/agent/` service wrapper から path dependency として参照する。
+`takos/containers/agent/` service wrapper から path dependency として参照する。

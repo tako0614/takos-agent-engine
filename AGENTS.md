@@ -2,7 +2,7 @@
 
 `takos-agent-engine` は Takos の **stateless agent runtime library** (Rust) で、 session 履歴と長期 memory を同一基盤で
 扱い、 RawNode / AbstractNode の二層記憶を activation しながら checkpoint 可能な graph runtime で長期継続実行する。
-agent runtime の正本 library であり、 service wrapper は `takos/agent/` が持つ。
+agent runtime の正本 library であり、 service wrapper は `takos/containers/agent/` が持つ。
 
 ## 責務
 
@@ -20,14 +20,14 @@ agent runtime の正本 library であり、 service wrapper は `takos/agent/` 
 
 ### 持たない
 
-- service wrapping (HTTP server、 RPC binding 等は `takos/agent/` の責務)
+- service wrapping (HTTP server、 RPC binding 等は `takos/containers/agent/` の責務)
 - production vendor implementation (OpenAI / Claude 等は feature gate のみ提供)
-- Takos-specific orchestration (skill catalog、 system prompt 等は `takos/agent/` 側)
+- Takos-specific orchestration (skill catalog、 system prompt 等は `takos/containers/agent/` 側)
 
 ## 隣接 product との contract
 
 - **Upstream**: なし (library)
-- **Downstream consumer**: `takos/agent/` (Takos の agent execution service)
+- **Downstream consumer**: `takos/containers/agent/` (Takos の agent execution service)
 
 ## Substitutability
 
