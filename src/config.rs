@@ -1,5 +1,3 @@
-use std::fs;
-use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -93,32 +91,6 @@ impl EngineConfig {
         Ok(())
     }
 
-    /// # Errors
-    ///
-    /// Returns an [`EngineError::Configuration`] when the TOML cannot be
-    /// parsed or the resulting config fails [`Self::validate`].
-    pub fn from_toml_str(source: &str) -> Result<Self> {
-        let config: Self = toml::from_str(source).map_err(|err| {
-            EngineError::Configuration(format!("failed to parse engine config from TOML: {err}"))
-        })?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    /// # Errors
-    ///
-    /// Returns an [`EngineError::Configuration`] when the file cannot be
-    /// read or the contents fail [`Self::from_toml_str`].
-    pub fn from_toml_path(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let contents = fs::read_to_string(path).map_err(|err| {
-            EngineError::Configuration(format!(
-                "failed to read engine config {}: {err}",
-                path.display()
-            ))
-        })?;
-        Self::from_toml_str(&contents)
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -317,57 +289,6 @@ mod tests {
     fn default_config_is_valid() {
         let config = EngineConfig::default();
         assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn config_can_be_parsed_from_toml() {
-        let config = EngineConfig::from_toml_str(
-            r#"
-            system_prompt = "You are a configurable Takos engine."
-
-            [memory.activation.target_ratio]
-            raw = 1
-            abstract = 1
-
-            [memory.activation]
-            top_k_total = 12
-            use_time_decay = true
-            overflow_raw_threshold_relaxation = true
-
-            [memory.retrieval.similarity_threshold]
-            raw = 0.72
-            abstract = 0.74
-
-            [memory.retrieval]
-            relaxed_threshold_for_pushed_raw = 0.63
-
-            [context_budget]
-            total_tokens = 64000
-            reserve_system = 4000
-            reserve_tools = 12000
-            reserve_working = 8000
-            session_ratio = 0.5
-            memory_ratio = 0.5
-
-            [tools]
-            memory_search = true
-            graph_search = true
-            provenance_lookup = true
-            timeline_search = true
-            max_memory_search_top_k = 32
-            max_graph_search_depth = 4
-            max_timeline_search_limit = 100
-
-            [runtime]
-            max_graph_steps = 64
-            max_tool_rounds = 8
-            node_timeout_ms = 10000
-            tool_timeout_ms = 30000
-            distillation_timeout_ms = 15000
-            maintenance_batch_size = 32
-            "#,
-        );
-        assert!(config.is_ok());
     }
 
     #[test]
