@@ -8,7 +8,6 @@ use crate::model::embedding::{Embedder, Embedding};
 use crate::model::openai_http::send_with_retry;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 #[derive(Debug, Clone)]
 pub struct OpenAiEmbeddingConfig {
@@ -30,15 +29,6 @@ impl OpenAiEmbeddingConfig {
         }
     }
 
-    pub fn from_env(model: impl Into<String>) -> Result<Self> {
-        let api_key = std::env::var(DEFAULT_API_KEY_ENV).map_err(|_| {
-            EngineError::Configuration(format!(
-                "missing {DEFAULT_API_KEY_ENV} for OpenAI-compatible embeddings"
-            ))
-        })?;
-        Ok(Self::new(model, api_key))
-    }
-
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
@@ -46,11 +36,6 @@ impl OpenAiEmbeddingConfig {
 
     pub fn with_dimensions(mut self, dimensions: u32) -> Self {
         self.dimensions = Some(dimensions);
-        self
-    }
-
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
         self
     }
 }
@@ -64,10 +49,6 @@ pub struct OpenAiCompatibleEmbedder {
 impl OpenAiCompatibleEmbedder {
     pub fn new(model: impl Into<String>, api_key: impl Into<String>) -> Result<Self> {
         Self::with_config(OpenAiEmbeddingConfig::new(model, api_key))
-    }
-
-    pub fn from_env(model: impl Into<String>) -> Result<Self> {
-        Self::with_config(OpenAiEmbeddingConfig::from_env(model)?)
     }
 
     pub fn with_config(config: OpenAiEmbeddingConfig) -> Result<Self> {
