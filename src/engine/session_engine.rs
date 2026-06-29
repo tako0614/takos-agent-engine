@@ -24,12 +24,9 @@ use crate::model::{Embedder, ModelRunner};
 use crate::storage::{GraphRepository, LoopStateRepository, NodeRepository, VectorIndex};
 use crate::tools::executor::ToolExecutor;
 
-// Re-export the graph builders so the crate-facing API keeps serving them from
-// `crate::engine::session_engine::*` (lib.rs and engine/mod.rs re-export these).
-pub use crate::engine::graph_spec::{
-    build_default_execution_graph, build_execution_graph_preset, build_planner_execution_graph,
-    build_subgoal_execution_graph,
-};
+// Re-export the graph builder so the crate-facing API keeps serving it from
+// `crate::engine::session_engine::*` (lib.rs and engine/mod.rs re-export it).
+pub use crate::engine::graph_spec::build_default_execution_graph;
 
 #[derive(Clone)]
 pub struct EngineDeps {
@@ -79,13 +76,6 @@ pub struct SessionResponse {
     pub tool_rounds_completed: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionGraphPreset {
-    Default,
-    Planner,
-    Subgoal,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MaintenanceReport {
     pub processed_loops: usize,
@@ -126,7 +116,7 @@ pub async fn run_turn_with_options(
     tracing::Span::current().record("loop_id", tracing::field::display(loop_id));
 
     let resolved_options = ResolvedRunOptions::from_config(config, options);
-    let graph = Arc::new(build_execution_graph_preset(ExecutionGraphPreset::Default));
+    let graph = Arc::new(build_default_execution_graph());
     let runner = GraphRunner::new(graph);
     let mut state = ExecutionState::from_request(request, session_id, loop_id);
     let result = runner
@@ -164,7 +154,7 @@ pub async fn resume_loop(
         })?;
 
     let resolved_options = ResolvedRunOptions::from_config(config, options);
-    let graph = Arc::new(build_execution_graph_preset(ExecutionGraphPreset::Default));
+    let graph = Arc::new(build_default_execution_graph());
     let runner = GraphRunner::new(graph);
     let (state, result) = runner
         .resume(checkpoint, config, deps, &resolved_options)
@@ -258,12 +248,11 @@ mod tests {
     };
     use crate::engine::nodes::{
         assistant_output_operation_key, prepare_tool_call_for_config, tool_result_operation_key,
-        user_input_operation_key, INGEST_USER_INPUT_NODE,
+        user_input_operation_key,
     };
     use crate::engine::session_engine::{
-        build_default_execution_graph, build_execution_graph_preset, build_planner_execution_graph,
-        build_subgoal_execution_graph, run_maintenance_pass, run_turn, run_turn_with_options,
-        EngineDeps, ExecutionGraphPreset, SessionRequest,
+        build_default_execution_graph, run_maintenance_pass, run_turn, run_turn_with_options,
+        EngineDeps, SessionRequest,
     };
     use crate::error::{EngineError, Result};
     use crate::ids::{AbstractNodeId, LoopId, SessionId};
@@ -899,101 +888,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn planner_graph_captures_model_output_as_plan_without_tools() -> Result<()> {
-        let mut deps = build_demo_deps();
-        deps.model_runner = Arc::new(RepeatingToolModelRunner);
-        let graph = build_execution_graph_preset(ExecutionGraphPreset::Planner);
-        let runner = GraphRunner::new(Arc::new(graph));
-        let session_id = SessionId::new();
-        let loop_id = LoopId::new();
-        let request = SessionRequest {
-            session_id: Some(session_id),
-            user_message: "create a plan".to_string(),
-            plan: None,
-        };
-        let mut state = ExecutionState::from_request(request, session_id, loop_id);
-
-        let result = runner
-            .run(
-                &mut state,
-                &EngineConfig::default(),
-                &deps,
-                &ResolvedRunOptions::from_config(&EngineConfig::default(), RunOptions::default()),
-            )
-            .await?;
-
-        assert_eq!(result.status, LoopStatus::Finished);
-        assert_eq!(result.tool_rounds_completed, 0);
-        assert!(state.pending_tool_calls.is_empty());
-        assert_eq!(
-            state.assistant_message.as_deref(),
-            Some("Tool execution is disabled for this graph preset.")
-        );
-        assert_eq!(state.plan, state.assistant_message);
-        assert!(state.new_abstract_ids.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn subgoal_graph_runs_tool_loop_without_distillation() -> Result<()> {
-        let deps = build_demo_deps();
-        let graph = build_subgoal_execution_graph();
-        let runner = GraphRunner::new(Arc::new(graph));
-        let session_id = SessionId::new();
-        let loop_id = LoopId::new();
-        let request = SessionRequest {
-            session_id: Some(session_id),
-            user_message: "timeline: recent".to_string(),
-            plan: Some("Use the timeline to answer the subgoal.".to_string()),
-        };
-        let mut state = ExecutionState::from_request(request, session_id, loop_id);
-
-        let result = runner
-            .run(
-                &mut state,
-                &EngineConfig::default(),
-                &deps,
-                &ResolvedRunOptions::from_config(&EngineConfig::default(), RunOptions::default()),
-            )
-            .await?;
-
-        assert_eq!(result.status, LoopStatus::Finished);
-        assert_eq!(result.tool_rounds_completed, 1);
-        assert_eq!(state.tool_results.len(), 1);
-        assert!(state.assistant_message.is_some());
-        assert!(state.new_abstract_ids.is_empty());
-        Ok(())
-    }
-
+    // Locks the builder to the expected execution-graph topology: the opening
+    // pass, the post-tool re-activation pass, persist, and the overflow/distill
+    // tail must register exactly these node and edge counts.
     #[test]
-    fn named_graph_builders_return_runnable_presets() {
-        assert_eq!(
-            build_planner_execution_graph().start_node(),
-            INGEST_USER_INPUT_NODE
-        );
-        assert_eq!(
-            build_execution_graph_preset(ExecutionGraphPreset::Subgoal).start_node(),
-            INGEST_USER_INPUT_NODE
-        );
-    }
-
-    // Locks the table-driven builder to the hand-wired topology it replaced.
-    // Each preset must register exactly these node and edge counts; a drift here
-    // means the `GraphSpec` table diverged from the original graphs.
-    #[test]
-    fn preset_graph_topology_is_stable() {
+    fn default_graph_topology_is_stable() {
         let default = build_default_execution_graph();
         assert_eq!(default.node_count(), 14);
         assert_eq!(default.edge_count(), 15);
-
-        let planner = build_planner_execution_graph();
-        assert_eq!(planner.node_count(), 8);
-        assert_eq!(planner.edge_count(), 7);
-
-        let subgoal = build_subgoal_execution_graph();
-        assert_eq!(subgoal.node_count(), 12);
-        assert_eq!(subgoal.edge_count(), 13);
     }
 
     #[tokio::test]

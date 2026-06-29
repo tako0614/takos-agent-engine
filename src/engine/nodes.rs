@@ -1,6 +1,6 @@
 //! Execution-graph node implementations and the shared helpers they call.
 //!
-//! Each preset's [`ExecutionGraph`](crate::engine::execution_graph::ExecutionGraph)
+//! The engine's [`ExecutionGraph`](crate::engine::execution_graph::ExecutionGraph)
 //! is wired from these [`GraphNode`] structs by
 //! [`graph_spec`](crate::engine::graph_spec). The lifecycle entry points in
 //! [`session_engine`](crate::engine::session_engine) drive the runner; the node
@@ -28,18 +28,17 @@ use crate::tools::memory_tools::{
     GraphSearchParams, MemorySearchParams, MemoryToolBounds, TimelineSearchParams,
 };
 
-// Node ids that are also returned by a fixed-id node's `GraphNode::id`
-// implementation (or referenced from tests), so they must stay named. The
-// per-preset query/activate/assemble/model ids live in the `GraphSpec` table
-// in `graph_spec`: those nodes carry their id as a field, so the table supplies
-// them as `&'static str` literals instead of one constant per preset.
+// Node ids that a fixed-id node returns from `GraphNode::id` (or that tests
+// reference), so they must stay named. The query/activate/assemble/model nodes
+// carry their id as a `&'static str` field instead of one constant each,
+// because the graph instantiates two of each: the opening pass and the
+// post-tool re-activation pass.
 pub(crate) const INGEST_USER_INPUT_NODE: &str = "ingest_user_input";
 pub(crate) const LOAD_SESSION_VIEW_NODE: &str = "load_session_view";
 pub(crate) const EXECUTE_TOOLS_NODE: &str = "execute_tools";
 pub(crate) const PERSIST_ASSISTANT_OUTPUT_NODE: &str = "persist_assistant_output";
 pub(crate) const MARK_SESSION_OVERFLOW_NODE: &str = "mark_session_overflow";
 pub(crate) const DISTILL_CURRENT_LOOP_NODE: &str = "distill_current_loop";
-pub(crate) const CAPTURE_PLANNER_OUTPUT_NODE: &str = "capture_planner_output";
 
 // Per-kind importance priors assigned to raw nodes at creation time.
 //
@@ -229,7 +228,6 @@ impl GraphNode for AssembleContextNode {
 
 pub(crate) struct ModelNode {
     pub(crate) id: &'static str,
-    pub(crate) allow_tools: bool,
 }
 
 #[async_trait]
@@ -265,58 +263,18 @@ impl GraphNode for ModelNode {
         }
         state.latest_model_output = Some(output);
 
-        if self.allow_tools
-            && !state.pending_tool_calls.is_empty()
+        if !state.pending_tool_calls.is_empty()
             && state.tool_rounds_completed < options.max_tool_rounds
         {
             return Ok(NodeOutcome::Branch("needs_tools".to_string()));
         }
 
         if !state.pending_tool_calls.is_empty() && state.assistant_message.is_none() {
-            let message = if self.allow_tools {
-                format!(
-                    "Tool round limit reached after {} rounds without a final assistant message.",
-                    options.max_tool_rounds
-                )
-            } else {
-                "Tool execution is disabled for this graph preset.".to_string()
-            };
-            state.assistant_message = Some(message);
+            state.assistant_message = Some(format!(
+                "Tool round limit reached after {} rounds without a final assistant message.",
+                options.max_tool_rounds
+            ));
         }
-        if !self.allow_tools {
-            state.pending_tool_calls.clear();
-        }
-        Ok(NodeOutcome::Continue)
-    }
-}
-
-pub(crate) struct CapturePlannerOutputNode;
-
-#[async_trait]
-impl GraphNode for CapturePlannerOutputNode {
-    fn id(&self) -> &'static str {
-        CAPTURE_PLANNER_OUTPUT_NODE
-    }
-
-    async fn run(
-        &self,
-        state: &mut ExecutionState,
-        _config: &EngineConfig,
-        _deps: &EngineDeps,
-        _options: &ResolvedRunOptions,
-    ) -> Result<NodeOutcome> {
-        let planner_output = state
-            .assistant_message
-            .clone()
-            .or_else(|| {
-                state
-                    .latest_model_output
-                    .as_ref()
-                    .and_then(|output| output.assistant_message.clone())
-            })
-            .unwrap_or_else(|| "No assistant message generated.".to_string());
-        state.assistant_message = Some(planner_output.clone());
-        state.plan = Some(planner_output);
         Ok(NodeOutcome::Continue)
     }
 }
@@ -507,9 +465,7 @@ enum TimedToolOutcome {
     TimedOut { tool_name: String },
 }
 
-pub(crate) struct PersistAssistantOutputNode {
-    pub(crate) finish_after_persist: bool,
-}
+pub(crate) struct PersistAssistantOutputNode;
 
 #[async_trait]
 impl GraphNode for PersistAssistantOutputNode {
@@ -547,11 +503,7 @@ impl GraphNode for PersistAssistantOutputNode {
         let node = persist_raw_node(deps, node).await?;
         state.assistant_message = Some(assistant_message);
         push_raw_node_into_state(state, node);
-        if self.finish_after_persist {
-            Ok(NodeOutcome::Finish)
-        } else {
-            Ok(NodeOutcome::Continue)
-        }
+        Ok(NodeOutcome::Continue)
     }
 }
 
