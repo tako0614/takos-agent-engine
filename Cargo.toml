@@ -22,7 +22,6 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 [features]
 default = []
-openai-chat = ["dep:reqwest"]
 openai-embeddings = ["dep:reqwest"]
 # Deterministic stub implementations shared between the crate's own tests and
 # the bundled examples (see `src/test_support.rs`). Non-default: enabling it
