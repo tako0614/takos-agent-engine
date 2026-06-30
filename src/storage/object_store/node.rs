@@ -178,23 +178,32 @@ impl NodeRepository for ObjectNodeRepository {
         limit: usize,
     ) -> Result<Vec<RawNode>> {
         let _guard = self.store.lock().await;
-        let index_path = session_id.map_or_else(
-            || self.store.raw_timeline_path(),
-            |value| self.store.session_index_path(value),
-        );
-        let mut entries = self
-            .store
-            .read_raw_index_entries_unlocked(&index_path)
-            .await?;
-        entries.retain(|entry| from.is_none_or(|value| entry.timestamp >= value));
-        entries.retain(|entry| to.is_none_or(|value| entry.timestamp <= value));
-        entries.sort_by(|left, right| {
-            right
-                .timestamp
-                .cmp(&left.timestamp)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        entries.truncate(limit);
+        let entries = match session_id {
+            // Session-scoped: read the (naturally bounded) per-session index.
+            Some(value) => {
+                let mut entries = self
+                    .store
+                    .read_raw_index_entries_unlocked(&self.store.session_index_path(value))
+                    .await?;
+                entries.retain(|entry| from.is_none_or(|value| entry.timestamp >= value));
+                entries.retain(|entry| to.is_none_or(|value| entry.timestamp <= value));
+                entries.sort_by(|left, right| {
+                    right
+                        .timestamp
+                        .cmp(&left.timestamp)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                entries.truncate(limit);
+                entries
+            }
+            // Global: merge the per-day timeline shards newest-first with a
+            // bounded read (see `read_global_timeline_entries_unlocked`).
+            None => {
+                self.store
+                    .read_global_timeline_entries_unlocked(from, to, limit)
+                    .await?
+            }
+        };
         let ids: Vec<_> = entries.into_iter().map(|entry| entry.id).collect();
         self.store.read_raw_by_ids_unlocked(&ids).await
     }
@@ -364,11 +373,18 @@ mod tests {
             .index_raw(node.id, Embedding(vec![1.0, 0.0]))
             .await?;
 
-        std::fs::write(
-            root.join("indexes").join("timeline").join("raw.json"),
-            b"{ broken json",
-        )
-        .map_err(|err| {
+        // Corrupt the (single) per-day timeline shard so the parse sanity check
+        // forces a rebuild on reopen.
+        let shard_dir = root.join("indexes").join("timeline").join("raw");
+        let shard = std::fs::read_dir(&shard_dir)
+            .map_err(|err| {
+                crate::EngineError::Storage(format!("failed to read timeline shard dir: {err}"))
+            })?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .expect("a timeline shard should exist after an insert");
+        std::fs::write(&shard, b"{ broken json").map_err(|err| {
             crate::EngineError::Storage(format!(
                 "failed to corrupt object store index for test: {err}"
             ))
@@ -487,38 +503,54 @@ mod tests {
         repository.insert_raw(kept.clone()).await?;
         repository.insert_raw(orphan.clone()).await?;
 
-        // Rewrite the timeline to drop only the orphan's entry, leaving the raw
-        // body, the `.index-version` marker, and the JSON shape all intact — so
-        // the index-version check and the parse sanity check both still pass and
-        // the *only* trigger for a rebuild is the completeness probe.
-        let timeline_path = root.join("indexes").join("timeline").join("raw.json");
-        let timeline_payload = std::fs::read_to_string(&timeline_path).map_err(|err| {
-            crate::EngineError::Storage(format!("failed to read timeline index for test: {err}"))
-        })?;
-        let mut timeline: Value = serde_json::from_str(&timeline_payload).map_err(|err| {
-            crate::EngineError::Storage(format!("failed to parse timeline index for test: {err}"))
-        })?;
+        // Rewrite the timeline shards to drop only the orphan's entry, leaving
+        // the raw body, the `.index-version` marker, and the JSON shape all
+        // intact — so the index-version check and the parse sanity check both
+        // still pass and the *only* trigger for a rebuild is the completeness
+        // probe. Both nodes were inserted ~now, so they share a day shard, but
+        // iterate every shard to be robust across a midnight boundary.
+        let shard_dir = root.join("indexes").join("timeline").join("raw");
         let orphan_id = orphan.id.to_string();
-        if let Some(entries) = timeline.as_array_mut() {
-            entries.retain(|entry| entry["id"].as_str() != Some(orphan_id.as_str()));
-        }
-        std::fs::write(
-            &timeline_path,
-            serde_json::to_vec(&timeline).map_err(|err| {
+        let shard_paths: Vec<_> = std::fs::read_dir(&shard_dir)
+            .map_err(|err| {
+                crate::EngineError::Storage(format!("failed to read timeline shard dir: {err}"))
+            })?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect();
+        for shard_path in shard_paths {
+            let payload = std::fs::read_to_string(&shard_path).map_err(|err| {
+                crate::EngineError::Storage(format!("failed to read timeline shard for test: {err}"))
+            })?;
+            let mut shard: Value = serde_json::from_str(&payload).map_err(|err| {
                 crate::EngineError::Storage(format!(
-                    "failed to serialize trimmed timeline for test: {err}"
+                    "failed to parse timeline shard for test: {err}"
                 ))
-            })?,
-        )
-        .map_err(|err| {
-            crate::EngineError::Storage(format!("failed to write trimmed timeline for test: {err}"))
-        })?;
+            })?;
+            if let Some(entries) = shard.as_array_mut() {
+                entries.retain(|entry| entry["id"].as_str() != Some(orphan_id.as_str()));
+            }
+            std::fs::write(
+                &shard_path,
+                serde_json::to_vec(&shard).map_err(|err| {
+                    crate::EngineError::Storage(format!(
+                        "failed to serialize trimmed timeline shard for test: {err}"
+                    ))
+                })?,
+            )
+            .map_err(|err| {
+                crate::EngineError::Storage(format!(
+                    "failed to write trimmed timeline shard for test: {err}"
+                ))
+            })?;
+        }
 
         // Confirm the orphan really is invisible through the stale index we
-        // trimmed. We removed it from the global timeline index, so probe via
-        // `timeline_raw` (which reads `raw_timeline_path`); `session_raw` reads
-        // the session index, which we deliberately left intact and would still
-        // surface the orphan.
+        // trimmed. We removed it from the global timeline shards, so probe via
+        // `timeline_raw(None, ...)` (which merges the shards); `session_raw`
+        // reads the session index, which we deliberately left intact and would
+        // still surface the orphan.
         let stale = ObjectNodeRepository::new(store);
         let stale_timeline = stale.timeline_raw(None, None, None, 16).await?;
         assert_eq!(
@@ -541,6 +573,91 @@ mod tests {
         let ids: Vec<_> = timeline_nodes.iter().map(|node| node.id).collect();
         assert!(ids.contains(&kept.id));
         assert!(ids.contains(&orphan.id));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timeline_insert_touches_only_its_day_shard() -> crate::Result<()> {
+        // C2 regression: an insert must rewrite only the bounded per-day shard
+        // for the node's timestamp, not the whole never-pruned timeline. We
+        // prove this by inserting into one day, snapshotting that shard's bytes,
+        // inserting into a *different* day, and asserting the first shard is
+        // byte-for-byte unchanged — and that the merged read still returns
+        // correctly ordered + limited results.
+        let root = temp_root("timeline-shard-bounded");
+        let session_id = crate::SessionId::new();
+        let loop_id = crate::LoopId::new();
+        let store = FileObjectStore::open(&root)?;
+        let repository = ObjectNodeRepository::new(store);
+
+        let mut old = RawNode::text(
+            RawNodeKind::UserUtterance,
+            Some(session_id),
+            Some(loop_id),
+            "user",
+            "old day",
+            0.5,
+            Vec::new(),
+        );
+        old.timestamp = Utc::now() - ChronoDuration::days(2);
+        repository.insert_raw(old.clone()).await?;
+
+        let shard_dir = root.join("indexes").join("timeline").join("raw");
+        let list_shards = || -> Vec<PathBuf> {
+            std::fs::read_dir(&shard_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+                .collect()
+        };
+        let old_shards = list_shards();
+        assert_eq!(old_shards.len(), 1, "one day inserted -> one shard");
+        let old_shard_path = old_shards[0].clone();
+        let old_shard_bytes = std::fs::read(&old_shard_path).map_err(|err| {
+            crate::EngineError::Storage(format!("failed to snapshot timeline shard: {err}"))
+        })?;
+
+        // Two inserts on a different (current) day.
+        for label in ["today a", "today b"] {
+            let mut node = RawNode::text(
+                RawNodeKind::AssistantUtterance,
+                Some(session_id),
+                Some(loop_id),
+                "assistant",
+                label,
+                0.6,
+                Vec::new(),
+            );
+            node.timestamp = Utc::now();
+            repository.insert_raw(node).await?;
+        }
+
+        // The earlier day's shard must be untouched by the later inserts.
+        let after_bytes = std::fs::read(&old_shard_path).map_err(|err| {
+            crate::EngineError::Storage(format!("failed to re-read timeline shard: {err}"))
+        })?;
+        assert_eq!(
+            after_bytes, old_shard_bytes,
+            "inserting into another day must not rewrite an existing day's shard"
+        );
+        assert_eq!(list_shards().len(), 2, "second day -> a second shard");
+
+        // Read semantics preserved: newest-first, limited, and full merge.
+        let recent = repository.timeline_raw(None, None, None, 2).await?;
+        assert_eq!(recent.len(), 2);
+        assert!(
+            recent.iter().all(|node| node.id != old.id),
+            "the two newest entries are from today, not the old day"
+        );
+        let all = repository.timeline_raw(None, None, None, 16).await?;
+        assert_eq!(all.len(), 3);
+        for window in all.windows(2) {
+            assert!(window[0].timestamp >= window[1].timestamp);
+        }
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())

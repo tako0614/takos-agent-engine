@@ -18,7 +18,13 @@ const STORE_FORMAT_VERSION: u32 = 1;
 /// `rebuild_indexes_unlocked` changes. `open()` compares this with the value
 /// stored in `<root>/indexes/.index-version` and skips the (expensive) full
 /// rebuild whenever they match.
-const INDEX_VERSION: u32 = 1;
+///
+/// v2: the global timeline moved from a single monolithic
+/// `indexes/timeline/raw.json` (rewritten in full on every insert — O(N) per
+/// write, O(N^2) over the store's life) to per-day shards under
+/// `indexes/timeline/raw/<YYYYMMDD>.json`, so an insert only rewrites the
+/// bounded shard for the node's day.
+const INDEX_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct FileObjectStore {
@@ -154,9 +160,7 @@ impl FileObjectStore {
             // No raw bodies on disk: nothing can be orphaned from the timeline.
             return Ok(true);
         }
-        let timeline = self
-            .read_raw_index_entries_unlocked(&self.raw_timeline_path())
-            .await?;
+        let timeline = self.read_all_timeline_entries_unlocked().await?;
         let indexed: HashSet<RawNodeId> = timeline.into_iter().map(|entry| entry.id).collect();
         for path in raw_paths {
             // `list_paths` already filters to `*.json`; the file stem is the
@@ -268,12 +272,20 @@ impl FileObjectStore {
         // rather than surfacing a Storage error for what's a recoverable
         // on-disk inconsistency.
         for path in [
-            self.raw_timeline_path(),
             self.undistilled_index_path(),
             self.pushed_undistilled_index_path(),
             self.raw_embedding_manifest_path(),
             self.abstract_embedding_manifest_path(),
         ] {
+            if !path_index_is_parseable_or_missing(&path).await {
+                return false;
+            }
+        }
+        // Every timeline shard must parse too; a corrupt shard forces a rebuild.
+        let Ok(shard_paths) = self.list_paths(&self.raw_timeline_shard_dir()).await else {
+            return false;
+        };
+        for path in shard_paths {
             if !path_index_is_parseable_or_missing(&path).await {
                 return false;
             }
@@ -335,7 +347,7 @@ impl FileObjectStore {
         let raw_nodes = self.list_raw_nodes_scan_unlocked().await?;
         let abstract_nodes = self.list_abstract_nodes_scan_unlocked().await?;
 
-        let mut global_timeline = Vec::new();
+        let mut timeline_shards: HashMap<String, Vec<RawIndexEntry>> = HashMap::new();
         let mut session_timelines: HashMap<SessionId, Vec<RawIndexEntry>> = HashMap::new();
         let mut loop_timelines: HashMap<LoopId, Vec<RawIndexEntry>> = HashMap::new();
         let mut undistilled = Vec::new();
@@ -343,7 +355,10 @@ impl FileObjectStore {
 
         for node in raw_nodes {
             let entry = RawIndexEntry::from(&node);
-            global_timeline.push(entry.clone());
+            timeline_shards
+                .entry(timeline_bucket(node.timestamp))
+                .or_default()
+                .push(entry.clone());
             if let Some(session_id) = node.session_id {
                 session_timelines
                     .entry(session_id)
@@ -371,9 +386,11 @@ impl FileObjectStore {
             }
         }
 
-        sort_raw_index_entries(&mut global_timeline);
-        self.write_json(&self.raw_timeline_path(), &global_timeline)
-            .await?;
+        for (bucket, mut entries) in timeline_shards {
+            sort_raw_index_entries(&mut entries);
+            self.write_json(&self.raw_timeline_shard_path(&bucket), &entries)
+                .await?;
+        }
         sort_raw_index_entries(&mut undistilled);
         self.write_json(&self.undistilled_index_path(), &undistilled)
             .await?;
@@ -570,8 +587,78 @@ impl FileObjectStore {
         self.loop_index_dir().join(format!("{loop_id}.json"))
     }
 
-    pub(super) fn raw_timeline_path(&self) -> PathBuf {
-        self.timeline_index_dir().join("raw.json")
+    /// Directory holding the per-day global-timeline shards
+    /// (`indexes/timeline/raw/<YYYYMMDD>.json`). Sharding by day keeps each
+    /// insert's read-modify-write bounded to a single day's entries instead of
+    /// the entire never-pruned timeline.
+    fn raw_timeline_shard_dir(&self) -> PathBuf {
+        self.timeline_index_dir().join("raw")
+    }
+
+    pub(super) fn raw_timeline_shard_path(&self, bucket: &str) -> PathBuf {
+        self.raw_timeline_shard_dir().join(format!("{bucket}.json"))
+    }
+
+    /// List the timeline shard buckets (file stems, i.e. `YYYYMMDD`) currently
+    /// on disk, ascending. `list_paths` already sorts and filters to `*.json`.
+    pub(super) async fn list_timeline_shard_buckets(&self) -> Result<Vec<String>> {
+        let mut buckets = Vec::new();
+        for path in self.list_paths(&self.raw_timeline_shard_dir()).await? {
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                buckets.push(stem.to_string());
+            }
+        }
+        Ok(buckets)
+    }
+
+    /// Read every global-timeline entry across all shards. Used only on open by
+    /// the completeness probe and by full rebuilds — never on the per-insert
+    /// hot path.
+    async fn read_all_timeline_entries_unlocked(&self) -> Result<Vec<RawIndexEntry>> {
+        let mut all = Vec::new();
+        for bucket in self.list_timeline_shard_buckets().await? {
+            let mut shard = self
+                .read_raw_index_entries_unlocked(&self.raw_timeline_shard_path(&bucket))
+                .await?;
+            all.append(&mut shard);
+        }
+        Ok(all)
+    }
+
+    /// Merge the global timeline shards newest-day-first into the most-recent
+    /// `limit` entries (timestamp DESC, id ASC tiebreak), applying the optional
+    /// `from`/`to` window. Because shards partition by whole UTC days, once we
+    /// have collected `limit` entries from the newest days, every older shard
+    /// can only contain strictly-older entries, so we stop early — bounding the
+    /// read to a few shards instead of the whole store.
+    pub(super) async fn read_global_timeline_entries_unlocked(
+        &self,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<RawIndexEntry>> {
+        let buckets = self.list_timeline_shard_buckets().await?;
+        let mut collected: Vec<RawIndexEntry> = Vec::new();
+        // `list_timeline_shard_buckets` is ascending; iterate newest first.
+        for bucket in buckets.into_iter().rev() {
+            let mut shard = self
+                .read_raw_index_entries_unlocked(&self.raw_timeline_shard_path(&bucket))
+                .await?;
+            shard.retain(|entry| from.is_none_or(|value| entry.timestamp >= value));
+            shard.retain(|entry| to.is_none_or(|value| entry.timestamp <= value));
+            collected.append(&mut shard);
+            if collected.len() >= limit {
+                break;
+            }
+        }
+        collected.sort_by(|left, right| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        collected.truncate(limit);
+        Ok(collected)
     }
 
     pub(super) fn undistilled_index_path(&self) -> PathBuf {
@@ -809,8 +896,15 @@ impl FileObjectStore {
 
     pub(super) async fn sync_raw_indexes_unlocked(&self, node: &RawNode) -> Result<()> {
         let entry = RawIndexEntry::from(node);
-        self.upsert_raw_index_entry_unlocked(&self.raw_timeline_path(), entry.clone())
-            .await?;
+        // Write the secondary indexes (session, loop, backlog) FIRST and the
+        // global timeline LAST. Combined with the body-before-indexes ordering
+        // in `insert_raw`/`update_raw_lifecycle`, this makes timeline coverage a
+        // sound completeness invariant: if a node is present in the timeline,
+        // every secondary index for it was already written, so a mid-insert
+        // crash that the timeline-anchored `indexes_are_complete` probe accepts
+        // can never leave the node missing from session/loop/backlog retrieval
+        // (it would instead be missing from the timeline -> probe fails ->
+        // rebuild). [C5]
         if let Some(session_id) = node.session_id {
             self.upsert_raw_index_entry_unlocked(
                 &self.session_index_path(&session_id),
@@ -834,12 +928,24 @@ impl FileObjectStore {
 
         let pushed = is_undistilled && node.overflow.was_pushed_out_of_session;
         if pushed {
-            self.upsert_raw_index_entry_unlocked(&self.pushed_undistilled_index_path(), entry)
-                .await?;
+            self.upsert_raw_index_entry_unlocked(
+                &self.pushed_undistilled_index_path(),
+                entry.clone(),
+            )
+            .await?;
         } else {
             self.remove_raw_index_entry_unlocked(&self.pushed_undistilled_index_path(), node.id)
                 .await?;
         }
+
+        // Timeline last, into the bounded per-day shard. The shard's
+        // read-modify-write touches only this node's day, not the whole
+        // never-pruned timeline (C2).
+        self.upsert_raw_index_entry_unlocked(
+            &self.raw_timeline_shard_path(&timeline_bucket(node.timestamp)),
+            entry,
+        )
+        .await?;
 
         Ok(())
     }
@@ -936,6 +1042,13 @@ async fn path_index_is_parseable_or_missing(path: &Path) -> bool {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => false,
     }
+}
+
+/// Day bucket (`YYYYMMDD`, UTC) used to shard the global timeline. Lexical
+/// ordering of these strings matches chronological ordering, so newest-first
+/// shard iteration is just a reverse sort of the bucket names.
+fn timeline_bucket(timestamp: DateTime<Utc>) -> String {
+    timestamp.format("%Y%m%d").to_string()
 }
 
 fn sort_raw_index_entries(entries: &mut [RawIndexEntry]) {
