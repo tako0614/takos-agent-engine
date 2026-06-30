@@ -51,10 +51,16 @@ impl FileObjectStore {
     /// Returns an [`EngineError::Storage`] when the on-disk layout cannot be
     /// created or the index rebuild fails on a corrupt store.
     pub async fn open_async(root: impl AsRef<Path>) -> Result<Self> {
-        let store = Self {
-            root: root.as_ref().to_path_buf(),
-            gate: Arc::new(Mutex::new(())),
-        };
+        let root = root.as_ref().to_path_buf();
+        // The agent opens a brand-new `FileObjectStore` per run on a directory
+        // shared by every run for the same (space, installation). A per-instance
+        // gate would NOT serialize two such runs, so their interleaved
+        // read-modify-write of the shared store.json / index files would race
+        // (rename ENOENT, lost index updates, rebuild wiping another run's
+        // writes). Share ONE gate per canonical root across all instances so all
+        // runs for a directory mutually exclude. [S1]
+        let gate = shared_gate_for_root(&root).await;
+        let store = Self { root, gate };
         store.ensure_layout().await?;
         store.ensure_indexes().await?;
         Ok(store)
@@ -693,19 +699,28 @@ impl FileObjectStore {
                 path.display()
             ))
         })?;
-        let temporary = path.with_extension("tmp");
+        // Unique temp name (not a deterministic `<stem>.tmp`) so two writers
+        // staging the same target never clobber each other's staging file — the
+        // rename is then always tmp -> target with no cross-writer ENOENT. The
+        // `.tmp` extension keeps it out of every `*.json` index/body listing.
+        // [S1]
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
         fs::write(&temporary, payload).await.map_err(|err| {
             EngineError::Storage(format!(
                 "failed to write temporary object {}: {err}",
                 temporary.display()
             ))
         })?;
-        fs::rename(&temporary, path).await.map_err(|err| {
-            EngineError::Storage(format!(
+        if let Err(err) = fs::rename(&temporary, path).await {
+            // Best-effort cleanup so a failed rename does not leak the staged
+            // temp file (a hard kill mid-write can still leave one, which is
+            // harmless — readers only ever consider `*.json`).
+            let _ = fs::remove_file(&temporary).await;
+            return Err(EngineError::Storage(format!(
                 "failed to move object {} into place: {err}",
                 path.display()
-            ))
-        })?;
+            )));
+        }
         Ok(())
     }
 
@@ -961,6 +976,39 @@ impl FileObjectStore {
     }
 }
 
+/// Process-wide registry mapping a canonical store root to the single gate
+/// shared by every `FileObjectStore` opened on that root. This is what makes
+/// concurrent runs on one (space, installation) directory mutually exclude even
+/// though each run constructs its own store handle. Entries are never removed
+/// (one tiny entry per installation ever opened in this process).
+fn store_gate_registry() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<Mutex<()>>>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Fetch (or create) the shared gate for `root`. The key is the canonicalized
+/// path so two callers that name the same directory differently (relative vs
+/// absolute, symlinks) still share one gate; if canonicalization fails (e.g.
+/// the directory does not exist yet) we fall back to the literal path, which is
+/// still stable for the common case where every run passes the same string.
+async fn shared_gate_for_root(root: &Path) -> Arc<Mutex<()>> {
+    // Best-effort: ensure the directory exists so canonicalization succeeds and
+    // produces a stable key. Ignore errors here — `ensure_layout` surfaces any
+    // real failure with a precise message right after.
+    let _ = fs::create_dir_all(root).await;
+    let key = fs::canonicalize(root)
+        .await
+        .unwrap_or_else(|_| root.to_path_buf());
+    let mut registry = store_gate_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 /// Bridges synchronous `FileObjectStore::open` callers to the tokio-fs based
 /// async constructor. The work runs on a dedicated thread with its own
 /// current-thread tokio runtime so we never need to assume the caller is on
@@ -1108,6 +1156,64 @@ mod tests {
         assert!(metadata["created_at"].is_string());
         assert!(metadata["updated_at"].is_string());
         assert!(metadata["last_index_rebuild_at"].is_string());
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    // S1 regression: two `FileObjectStore` handles opened on the SAME root must
+    // share one gate, so concurrent inserts serialize instead of racing the
+    // shared store.json / index files. Without the shared-root lock these
+    // interleaved read-modify-writes drop timeline entries and/or fail a run
+    // with a rename ENOENT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_stores_on_one_root_serialize() -> crate::Result<()> {
+        use crate::domain::{RawNode, RawNodeKind};
+        use crate::storage::object_store::ObjectNodeRepository;
+        use crate::storage::traits::NodeRepository;
+
+        let root = temp_root("concurrent");
+        let session_id = crate::SessionId::new();
+        let loop_id = crate::LoopId::new();
+
+        // Two independent handles on the same directory, exactly like two runs.
+        let repo_a = ObjectNodeRepository::new(FileObjectStore::open_async(&root).await?);
+        let repo_b = ObjectNodeRepository::new(FileObjectStore::open_async(&root).await?);
+
+        let total = 24usize;
+        let mut handles = Vec::new();
+        for index in 0..total {
+            let repo = if index % 2 == 0 {
+                repo_a.clone()
+            } else {
+                repo_b.clone()
+            };
+            handles.push(tokio::spawn(async move {
+                let node = RawNode::text(
+                    RawNodeKind::UserUtterance,
+                    Some(session_id),
+                    Some(loop_id),
+                    "user",
+                    format!("message {index}"),
+                    0.5,
+                    Vec::new(),
+                );
+                repo.insert_raw(node).await
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("insert task panicked")?;
+        }
+
+        let reopened = ObjectNodeRepository::new(FileObjectStore::open_async(&root).await?);
+        let timeline = reopened.timeline_raw(None, None, None, 1000).await?;
+        assert_eq!(
+            timeline.len(),
+            total,
+            "every concurrent insert must be present in the global timeline"
+        );
+        let session = reopened.session_raw(&session_id).await?;
+        assert_eq!(session.len(), total);
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
