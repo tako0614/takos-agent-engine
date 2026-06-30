@@ -24,7 +24,13 @@ const STORE_FORMAT_VERSION: u32 = 1;
 /// write, O(N^2) over the store's life) to per-day shards under
 /// `indexes/timeline/raw/<YYYYMMDD>.json`, so an insert only rewrites the
 /// bounded shard for the node's day.
-const INDEX_VERSION: u32 = 2;
+///
+/// v3: the embedding manifests moved from a single global
+/// `indexes/vector/{raw,abstract}_embeddings.json` (scanned in full on every
+/// activation — every embedding ever written for the installation) to
+/// per-session shards under `indexes/vector/{raw,abstract}/<session|none>.json`,
+/// so a session-scoped search only reads its own session's embeddings.
+const INDEX_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct FileObjectStore {
@@ -193,12 +199,12 @@ impl FileObjectStore {
     ///
     /// `index_raw_with_session` / `index_abstract_with_session` write the
     /// durable embedding body (`embeddings/{raw,abstract}/<id>.json`) BEFORE
-    /// upserting the id into the vector manifest
-    /// (`indexes/vector/{raw,abstract}_embeddings.json`). The body is the source
-    /// of truth and `rebuild_indexes_unlocked` regenerates both manifests from a
-    /// body scan (`read_embedding_ids_scan_unlocked` ->
-    /// `write_manifest_unlocked`). If the process is SIGKILLed/OOM-killed in that
-    /// window the body exists but is absent from the manifest, so `search_raw` /
+    /// upserting the id into its per-session vector shard
+    /// (`indexes/vector/{raw,abstract}/<session|none>.json`). The body is the
+    /// source of truth and `rebuild_indexes_unlocked` regenerates the shards from
+    /// a body scan (`rebuild_embedding_shards_unlocked`). If the process is
+    /// SIGKILLed/OOM-killed in that window the body exists but is absent from any
+    /// shard, so `search_raw` /
     /// `search_abstract` (which iterate the manifest, not the directory) never
     /// visit it — the embedding is permanently invisible to vector search even
     /// though the index version + sanity check still pass.
@@ -213,48 +219,49 @@ impl FileObjectStore {
     ///   (consistent) case.
     async fn embedding_indexes_are_complete(&self) -> Result<bool> {
         if !self
-            .embedding_dir_covered_by_manifest::<RawNodeId>(
+            .embedding_dir_covered_by_shards::<RawNodeId>(
                 &self.raw_embedding_dir(),
-                &self.raw_embedding_manifest_path(),
+                &self.raw_embedding_shard_dir(),
             )
             .await?
         {
             return Ok(false);
         }
-        self.embedding_dir_covered_by_manifest::<AbstractNodeId>(
+        self.embedding_dir_covered_by_shards::<AbstractNodeId>(
             &self.abstract_embedding_dir(),
-            &self.abstract_embedding_manifest_path(),
+            &self.abstract_embedding_shard_dir(),
         )
         .await
     }
 
     /// Returns `true` when every `*.json` body in `embedding_dir` has its id
-    /// (the file stem) present in the manifest at `manifest_path`. Empty body
-    /// directories are vacuously complete. An unparseable body stem is treated
-    /// as a mismatch so a rebuild re-derives a clean manifest from the bodies.
-    /// A wrong-shape (but valid-JSON) manifest is likewise treated as not
+    /// (the file stem) present in SOME per-session shard under `shard_dir`.
+    /// Empty body directories are vacuously complete. An unparseable body stem
+    /// is treated as a mismatch so a rebuild re-derives clean shards from the
+    /// bodies. A wrong-shape (but valid-JSON) shard is likewise treated as not
     /// covering the bodies (`Ok(false)`), forcing a rebuild rather than
     /// surfacing a Storage error.
-    async fn embedding_dir_covered_by_manifest<Id>(
+    async fn embedding_dir_covered_by_shards<Id>(
         &self,
         embedding_dir: &Path,
-        manifest_path: &Path,
+        shard_dir: &Path,
     ) -> Result<bool>
     where
         Id: DeserializeOwned + FromStr + Eq + std::hash::Hash,
     {
         let body_paths = self.list_paths(embedding_dir).await?;
         if body_paths.is_empty() {
-            // No embedding bodies on disk: nothing can be orphaned from the
-            // manifest.
+            // No embedding bodies on disk: nothing can be orphaned.
             return Ok(true);
         }
-        let manifest_ids: HashSet<Id> =
-            match self.try_read_json::<IdManifest<Id>>(manifest_path).await {
-                Ok(Some(manifest)) => manifest.ids.into_iter().collect(),
-                Ok(None) => HashSet::new(),
+        let mut shard_ids: HashSet<Id> = HashSet::new();
+        for shard_path in self.list_embedding_shard_paths(shard_dir).await? {
+            match self.try_read_json::<IdManifest<Id>>(&shard_path).await {
+                Ok(Some(manifest)) => shard_ids.extend(manifest.ids),
+                Ok(None) => {}
                 Err(_) => return Ok(false),
-            };
+            }
+        }
         for path in body_paths {
             // `list_paths` already filters to `*.json` (so `.tmp` staging files
             // are ignored); the file stem is the embedding id (see
@@ -265,7 +272,7 @@ impl FileObjectStore {
                 .and_then(|stem| stem.to_str())
                 .and_then(|stem| Id::from_str(stem).ok())
             {
-                Some(id) if manifest_ids.contains(&id) => {}
+                Some(id) if shard_ids.contains(&id) => {}
                 _ => return Ok(false),
             }
         }
@@ -280,20 +287,25 @@ impl FileObjectStore {
         for path in [
             self.undistilled_index_path(),
             self.pushed_undistilled_index_path(),
-            self.raw_embedding_manifest_path(),
-            self.abstract_embedding_manifest_path(),
         ] {
             if !path_index_is_parseable_or_missing(&path).await {
                 return false;
             }
         }
-        // Every timeline shard must parse too; a corrupt shard forces a rebuild.
-        let Ok(shard_paths) = self.list_paths(&self.raw_timeline_shard_dir()).await else {
-            return false;
-        };
-        for path in shard_paths {
-            if !path_index_is_parseable_or_missing(&path).await {
+        // Every sharded index file (timeline + per-session embeddings) must
+        // parse too; a corrupt shard forces a rebuild.
+        for shard_dir in [
+            self.raw_timeline_shard_dir(),
+            self.raw_embedding_shard_dir(),
+            self.abstract_embedding_shard_dir(),
+        ] {
+            let Ok(shard_paths) = self.list_paths(&shard_dir).await else {
                 return false;
+            };
+            for path in shard_paths {
+                if !path_index_is_parseable_or_missing(&path).await {
+                    return false;
+                }
             }
         }
         true
@@ -425,17 +437,14 @@ impl FileObjectStore {
             }
         }
 
-        let raw_embedding_ids = self
-            .read_embedding_ids_scan_unlocked::<RawNodeId>(&self.raw_embedding_dir())
-            .await?;
-        self.write_manifest_unlocked(&self.raw_embedding_manifest_path(), &raw_embedding_ids)
-            .await?;
-        let abstract_embedding_ids = self
-            .read_embedding_ids_scan_unlocked::<AbstractNodeId>(&self.abstract_embedding_dir())
-            .await?;
-        self.write_manifest_unlocked(
-            &self.abstract_embedding_manifest_path(),
-            &abstract_embedding_ids,
+        self.rebuild_embedding_shards_unlocked::<RawNodeId>(
+            &self.raw_embedding_dir(),
+            &self.raw_embedding_shard_dir(),
+        )
+        .await?;
+        self.rebuild_embedding_shards_unlocked::<AbstractNodeId>(
+            &self.abstract_embedding_dir(),
+            &self.abstract_embedding_shard_dir(),
         )
         .await?;
 
@@ -675,12 +684,31 @@ impl FileObjectStore {
         self.backlog_index_dir().join("pushed_undistilled_raw.json")
     }
 
-    pub(super) fn raw_embedding_manifest_path(&self) -> PathBuf {
-        self.vector_index_dir().join("raw_embeddings.json")
+    fn raw_embedding_shard_dir(&self) -> PathBuf {
+        self.vector_index_dir().join("raw")
     }
 
-    pub(super) fn abstract_embedding_manifest_path(&self) -> PathBuf {
-        self.vector_index_dir().join("abstract_embeddings.json")
+    fn abstract_embedding_shard_dir(&self) -> PathBuf {
+        self.vector_index_dir().join("abstract")
+    }
+
+    /// Per-session embedding shard path. `None` (session-less / legacy entries)
+    /// maps to the reserved `none` bucket. A session-scoped search reads only
+    /// its own shard, bounding the scan to a single session's embeddings instead
+    /// of every embedding in the installation.
+    pub(super) fn raw_embedding_shard_path(&self, session_id: Option<&SessionId>) -> PathBuf {
+        self.raw_embedding_shard_dir()
+            .join(format!("{}.json", embedding_shard_bucket(session_id)))
+    }
+
+    pub(super) fn abstract_embedding_shard_path(&self, session_id: Option<&SessionId>) -> PathBuf {
+        self.abstract_embedding_shard_dir()
+            .join(format!("{}.json", embedding_shard_bucket(session_id)))
+    }
+
+    /// List the embedding shard files in `shard_dir` (`*.json`, sorted).
+    pub(super) async fn list_embedding_shard_paths(&self, shard_dir: &Path) -> Result<Vec<PathBuf>> {
+        self.list_paths(shard_dir).await
     }
 
     #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
@@ -873,18 +901,32 @@ impl FileObjectStore {
         self.write_manifest_unlocked(path, &ids).await
     }
 
-    async fn read_embedding_ids_scan_unlocked<Id>(&self, directory: &Path) -> Result<Vec<Id>>
+    /// Regenerate the per-session embedding shard manifests for one body
+    /// directory from a full body scan. Each `StoredEmbedding` body carries the
+    /// session it was indexed for, so we group ids into the matching shard
+    /// bucket (`<session>` or `none`) and write one `IdManifest` per bucket.
+    /// Only used on rebuild (never the per-insert hot path).
+    async fn rebuild_embedding_shards_unlocked<Id>(
+        &self,
+        body_dir: &Path,
+        shard_dir: &Path,
+    ) -> Result<()>
     where
-        Id: DeserializeOwned + Ord + Copy,
+        Id: DeserializeOwned + Serialize + Ord + Copy,
     {
-        let mut ids = Vec::new();
-        for path in self.list_paths(directory).await? {
+        let mut shards: HashMap<String, Vec<Id>> = HashMap::new();
+        for path in self.list_paths(body_dir).await? {
             let record: StoredEmbedding<Id> = self.read_json(&path).await?;
-            ids.push(record.id);
+            shards
+                .entry(embedding_shard_bucket(record.session_id.as_ref()))
+                .or_default()
+                .push(record.id);
         }
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
+        for (bucket, ids) in shards {
+            self.write_manifest_unlocked(&shard_dir.join(format!("{bucket}.json")), &ids)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn upsert_raw_index_entry_unlocked(
@@ -1097,6 +1139,13 @@ async fn path_index_is_parseable_or_missing(path: &Path) -> bool {
 /// shard iteration is just a reverse sort of the bucket names.
 fn timeline_bucket(timestamp: DateTime<Utc>) -> String {
     timestamp.format("%Y%m%d").to_string()
+}
+
+/// Bucket name for an embedding shard. A session id renders as its UUID string
+/// (filesystem-safe); session-less / legacy entries use the reserved `none`
+/// bucket (UUIDs never render as the literal "none", so there is no collision).
+fn embedding_shard_bucket(session_id: Option<&SessionId>) -> String {
+    session_id.map_or_else(|| "none".to_string(), ToString::to_string)
 }
 
 fn sort_raw_index_entries(entries: &mut [RawIndexEntry]) {

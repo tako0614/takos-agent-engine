@@ -47,8 +47,14 @@ impl VectorIndex for ObjectVectorIndex {
                 },
             )
             .await?;
+        // Index into the per-session shard so a session-scoped search only scans
+        // its own session's embeddings (the `none` shard for legacy/session-less
+        // entries). [C3]
         self.store
-            .upsert_manifest_id_unlocked(&self.store.raw_embedding_manifest_path(), id)
+            .upsert_manifest_id_unlocked(
+                &self.store.raw_embedding_shard_path(session_id.as_ref()),
+                id,
+            )
             .await?;
         self.store.touch_metadata_unlocked().await
     }
@@ -71,7 +77,10 @@ impl VectorIndex for ObjectVectorIndex {
             )
             .await?;
         self.store
-            .upsert_manifest_id_unlocked(&self.store.abstract_embedding_manifest_path(), id)
+            .upsert_manifest_id_unlocked(
+                &self.store.abstract_embedding_shard_path(session_id.as_ref()),
+                id,
+            )
             .await?;
         self.store.touch_metadata_unlocked().await
     }
@@ -84,9 +93,12 @@ impl VectorIndex for ObjectVectorIndex {
     ) -> Result<Vec<ScoredRawRef>> {
         let _guard = self.store.lock().await;
         let mut scored = Vec::new();
+        // Read only the requested session's shard (the `none` shard for a
+        // session-less search). Every id in that shard belongs to the session,
+        // so no per-entry session filter is needed. [C3]
         for id in self
             .store
-            .read_manifest_unlocked::<RawNodeId>(&self.store.raw_embedding_manifest_path())
+            .read_manifest_unlocked::<RawNodeId>(&self.store.raw_embedding_shard_path(session_id))
             .await?
         {
             if let Some(record) = self
@@ -94,9 +106,6 @@ impl VectorIndex for ObjectVectorIndex {
                 .try_read_json::<StoredEmbedding<RawNodeId>>(&self.store.raw_embedding_path(&id))
                 .await?
             {
-                if !object_store_session_matches(record.session_id.as_ref(), session_id) {
-                    continue;
-                }
                 scored.push(ScoredRawRef {
                     id: record.id,
                     score: cosine_similarity(query, &record.embedding),
@@ -121,7 +130,7 @@ impl VectorIndex for ObjectVectorIndex {
         for id in self
             .store
             .read_manifest_unlocked::<AbstractNodeId>(
-                &self.store.abstract_embedding_manifest_path(),
+                &self.store.abstract_embedding_shard_path(session_id),
             )
             .await?
         {
@@ -132,9 +141,6 @@ impl VectorIndex for ObjectVectorIndex {
                 )
                 .await?
             {
-                if !object_store_session_matches(record.session_id.as_ref(), session_id) {
-                    continue;
-                }
                 scored.push(ScoredAbstractRef {
                     id: record.id,
                     score: cosine_similarity(query, &record.embedding),
@@ -146,22 +152,6 @@ impl VectorIndex for ObjectVectorIndex {
         });
         scored.truncate(top_k);
         Ok(scored)
-    }
-}
-
-/// Filter helper for the file-backed vector index.
-///
-/// Mirrors `entry_matches_session_filter` in `vector.rs`:
-/// - `Some(stored) == Some(requested)` matches.
-/// - Both `None` matches (= legacy entry returned for legacy / session-less
-///   searches).
-/// - Anything else does not match (no cross-session leakage, no legacy entry
-///   returned when a specific session is requested).
-fn object_store_session_matches(stored: Option<&SessionId>, requested: Option<&SessionId>) -> bool {
-    match (stored, requested) {
-        (None, None) => true,
-        (Some(stored), Some(requested)) => stored == requested,
-        _ => false,
     }
 }
 
@@ -197,13 +187,14 @@ mod tests {
             .index_raw(raw, Embedding(vec![1.0, 0.0]))
             .await?;
 
-        // Embedding body stays on disk; clobber the manifest with valid JSON
-        // of the wrong shape.
+        // Embedding body stays on disk; clobber the (session-less) shard with
+        // valid JSON of the wrong shape.
         let manifest_path = store
             .root()
             .join("indexes")
             .join("vector")
-            .join("raw_embeddings.json");
+            .join("raw")
+            .join("none.json");
         std::fs::write(&manifest_path, b"[1,2,3]").map_err(|err| {
             crate::EngineError::Storage(format!(
                 "failed to write wrong-shape embedding manifest: {err}"
@@ -264,6 +255,57 @@ mod tests {
         Ok(())
     }
 
+    // C3 regression: embeddings are sharded per session, so a session-scoped
+    // search only reads its own session's shard (bounded by that session, not
+    // the whole installation). Assert the shard files are separate and the
+    // session-A shard holds only session-A ids.
+    #[tokio::test]
+    async fn vector_search_uses_per_session_shards() -> crate::Result<()> {
+        let root = temp_root("vector-per-session-shard");
+        let session_a = crate::SessionId::new();
+        let session_b = crate::SessionId::new();
+        let store = FileObjectStore::open(&root)?;
+        let vector_index = ObjectVectorIndex::new(store);
+
+        let a1 = crate::ids::RawNodeId::new();
+        let a2 = crate::ids::RawNodeId::new();
+        let b1 = crate::ids::RawNodeId::new();
+        for (id, session) in [(a1, session_a), (a2, session_a), (b1, session_b)] {
+            vector_index
+                .index_raw_with_session(id, Embedding(vec![1.0, 0.0]), Some(session))
+                .await?;
+        }
+
+        let shard_dir = root.join("indexes").join("vector").join("raw");
+        let shard_a = shard_dir.join(format!("{session_a}.json"));
+        let shard_b = shard_dir.join(format!("{session_b}.json"));
+        assert!(shard_a.exists(), "session A must have its own shard file");
+        assert!(shard_b.exists(), "session B must have its own shard file");
+
+        let payload = std::fs::read_to_string(&shard_a).map_err(|err| {
+            crate::EngineError::Storage(format!("failed to read session-A shard: {err}"))
+        })?;
+        let manifest: serde_json::Value = serde_json::from_str(&payload).map_err(|err| {
+            crate::EngineError::Storage(format!("failed to parse session-A shard: {err}"))
+        })?;
+        let ids: Vec<String> = manifest["ids"]
+            .as_array()
+            .expect("shard has ids array")
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 2, "session-A shard holds only session-A entries");
+        assert!(!ids.contains(&b1.to_string()), "no cross-session bleed");
+
+        let scoped_a = vector_index
+            .search_raw(&Embedding(vec![1.0, 0.0]), 8, Some(&session_a))
+            .await?;
+        assert_eq!(scoped_a.len(), 2);
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn object_store_vector_index_backfills_legacy_payloads_without_session_field(
     ) -> crate::Result<()> {
@@ -288,12 +330,16 @@ mod tests {
             crate::EngineError::Storage(format!("failed to write legacy embedding file: {err}"))
         })?;
 
-        // Manifest must list the id so the search loop visits it.
+        // The session-less shard must list the id so the search loop visits it.
         let manifest_path = store
             .root()
             .join("indexes")
             .join("vector")
-            .join("raw_embeddings.json");
+            .join("raw")
+            .join("none.json");
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).map_err(|err| {
+            crate::EngineError::Storage(format!("failed to create shard dir: {err}"))
+        })?;
         std::fs::write(
             &manifest_path,
             format!(r#"{{"ids":["{raw_legacy}"]}}"#).as_bytes(),
@@ -390,8 +436,8 @@ mod tests {
                 ))
             })
         };
-        drop_id_from_manifest("raw_embeddings.json", &orphan_raw.to_string())?;
-        drop_id_from_manifest("abstract_embeddings.json", &orphan_abstract.to_string())?;
+        drop_id_from_manifest("raw/none.json", &orphan_raw.to_string())?;
+        drop_id_from_manifest("abstract/none.json", &orphan_abstract.to_string())?;
 
         // Confirm the orphaned embeddings really are invisible through the
         // stale manifests (search iterates the manifest, not the directory).
