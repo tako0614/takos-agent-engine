@@ -456,9 +456,7 @@ impl GraphNode for ExecuteToolsNode {
                     vec!["tool".to_string()],
                 )
                 .with_operation_key(prep.operation_key.clone());
-                let raw = persist_raw_node(deps, raw).await?;
-                state.last_effect_key = Some(prep.operation_key);
-                raw
+                persist_raw_node(deps, raw).await?
             };
 
             let tool_result = decode_tool_result_from_raw(&raw_node)?;
@@ -652,9 +650,6 @@ impl GraphNode for DistillCurrentLoopNode {
         for node in distilled.new_nodes {
             if let Some(node) = persist_abstract_node(deps, node, Some(state.session_id)).await? {
                 state.new_abstract_ids.push(node.id);
-                if let Some(operation_key) = &node.operation_key {
-                    state.last_effect_key = Some(operation_key.clone());
-                }
             }
         }
         for update in distilled.raw_updates {

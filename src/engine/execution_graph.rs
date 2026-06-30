@@ -45,7 +45,6 @@ pub struct ExecutionState {
     pub tool_rounds_completed: u32,
     pub model_invocations: u32,
     pub last_completed_node: Option<String>,
-    pub last_effect_key: Option<String>,
 }
 
 impl ExecutionState {
@@ -74,7 +73,6 @@ impl ExecutionState {
             tool_rounds_completed: 0,
             model_invocations: 0,
             last_completed_node: None,
-            last_effect_key: None,
         }
     }
 
@@ -86,32 +84,8 @@ impl ExecutionState {
         Ok(LoopState {
             session_id: self.session_id,
             loop_id: self.loop_id,
-            user_goal: self.user_message.clone(),
-            plan: self.plan.clone(),
             current_node,
-            iteration: self.iteration,
-            tool_rounds_completed: self.tool_rounds_completed,
-            model_invocations: self.model_invocations,
             status,
-            last_completed_node: self.last_completed_node.clone(),
-            last_effect_key: self.last_effect_key.clone(),
-            recent_events: self.persisted_raw_ids.clone(),
-            activated_raw: self
-                .activated_memory
-                .raw_nodes
-                .iter()
-                .map(|entry| entry.node.id)
-                .collect(),
-            activated_abstract: self
-                .activated_memory
-                .abstract_nodes
-                .iter()
-                .map(|entry| entry.node.id)
-                .collect(),
-            session_window: self.session_window_ids.clone(),
-            pushed_out_raw: self.pushed_out_raw_ids.clone(),
-            tool_result_ids: self.tool_result_ids.clone(),
-            assistant_message: self.assistant_message.clone(),
             state_json: serde_json::to_value(self).map_err(|err| {
                 EngineError::Storage(format!("failed to serialize loop checkpoint state: {err}"))
             })?,
