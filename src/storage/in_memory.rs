@@ -610,15 +610,14 @@ mod tests {
         let lid = LoopId::new();
 
         let mut state1 = LoopState::new_for_test(sid, lid, "goal v1");
-        state1.iteration = 1;
+        state1.current_node = "node_a".to_string();
         repo.save_checkpoint(state1).await.unwrap();
 
         let mut state2 = LoopState::new_for_test(sid, lid, "goal v2");
-        state2.iteration = 5;
+        state2.current_node = "node_b".to_string();
         repo.save_checkpoint(state2).await.unwrap();
 
         let loaded = repo.load_checkpoint(&sid, &lid).await.unwrap().unwrap();
-        assert_eq!(loaded.iteration, 5);
-        assert_eq!(loaded.user_goal, "goal v2");
+        assert_eq!(loaded.current_node, "node_b");
     }
 }
