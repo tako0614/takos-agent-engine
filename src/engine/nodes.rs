@@ -319,7 +319,7 @@ impl GraphNode for ExecuteToolsNode {
             if options.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
-            let call = prepare_tool_call_for_config(call, &config.tools)?;
+            let call = prepare_tool_call_for_config(call, &config.tools, state.session_id)?;
             let operation_key = tool_result_operation_key(state.loop_id, round, index, &call.name);
             let cached = deps
                 .repository
@@ -755,6 +755,7 @@ fn decode_tool_result_from_raw(node: &RawNode) -> Result<ToolCallResult> {
 pub(crate) fn prepare_tool_call_for_config(
     mut call: ToolCallRequest,
     tools: &ToolsConfig,
+    session_id: SessionId,
 ) -> Result<ToolCallRequest> {
     let bounds = MemoryToolBounds::from(tools);
     match call.name.as_str() {
@@ -765,6 +766,11 @@ pub(crate) fn prepare_tool_call_for_config(
                     EngineError::Tool(format!("invalid semantic search args: {err}"))
                 })?;
             params.top_k = bounds.clamp_memory_search_top_k(params.top_k);
+            // Bind the search to THIS run's session. This both prevents a
+            // model-supplied scope from reading another session's memory and
+            // makes the search match the engine's session-tagged embeddings
+            // (a `None` scope would match only legacy entries -> empty). [S2, C8]
+            params.session_id = Some(session_id.to_string());
             call.arguments = serde_json::to_value(params).map_err(|err| {
                 EngineError::Tool(format!("failed to encode semantic search args: {err}"))
             })?;
@@ -777,6 +783,10 @@ pub(crate) fn prepare_tool_call_for_config(
                     EngineError::Tool(format!("invalid graph search args: {err}"))
                 })?;
             params.max_depth = bounds.clamp_graph_search_depth(params.max_depth);
+            // NOTE: graph_search / provenance_lookup dereference abstract-node
+            // ids in the (non-session-partitioned) graph + abstract store, so
+            // they cannot be session-gated without partitioning that store.
+            // Left global on purpose; see the S2 deferral note.
             call.arguments = serde_json::to_value(params).map_err(|err| {
                 EngineError::Tool(format!("failed to encode graph search args: {err}"))
             })?;
@@ -792,6 +802,9 @@ pub(crate) fn prepare_tool_call_for_config(
                 serde_json::from_value(std::mem::take(&mut call.arguments))
                     .map_err(|err| EngineError::Tool(format!("invalid timeline args: {err}")))?;
             params.limit = bounds.clamp_timeline_search_limit(params.limit);
+            // Force the run's session: a `None`/foreign session_id otherwise
+            // reads the global cross-session timeline. [S2]
+            params.session_id = Some(session_id.to_string());
             call.arguments = serde_json::to_value(params).map_err(|err| {
                 EngineError::Tool(format!("failed to encode timeline args: {err}"))
             })?;

@@ -670,6 +670,7 @@ mod tests {
             max_timeline_search_limit: 3,
             ..ToolsConfig::default()
         };
+        let session_id = SessionId::new();
 
         let semantic = prepare_tool_call_for_config(
             ToolCallRequest {
@@ -681,10 +682,16 @@ mod tests {
                 }),
             },
             &tools,
+            session_id,
         )?;
         let semantic_params: MemorySearchParams =
             serde_json::from_value(semantic.arguments).expect("semantic args should deserialize");
         assert_eq!(semantic_params.top_k, 2);
+        assert_eq!(
+            semantic_params.session_id.as_deref(),
+            Some(session_id.to_string().as_str()),
+            "semantic search must be bound to the run's session"
+        );
 
         let graph = prepare_tool_call_for_config(
             ToolCallRequest {
@@ -695,6 +702,7 @@ mod tests {
                 }),
             },
             &tools,
+            session_id,
         )?;
         let graph_params: GraphSearchParams =
             serde_json::from_value(graph.arguments).expect("graph args should deserialize");
@@ -708,11 +716,47 @@ mod tests {
                 }),
             },
             &tools,
+            session_id,
         )?;
         let timeline_params: TimelineSearchParams =
             serde_json::from_value(timeline.arguments).expect("timeline args should deserialize");
         assert_eq!(timeline_params.limit, 3);
+        assert_eq!(
+            timeline_params.session_id.as_deref(),
+            Some(session_id.to_string().as_str()),
+            "timeline search must be bound to the run's session"
+        );
 
+        Ok(())
+    }
+
+    // S2 regression: a model-supplied session_id (here a foreign one) must be
+    // overridden with the run's session, so a tool call cannot read another
+    // session's timeline.
+    #[test]
+    fn prepare_tool_call_overrides_model_supplied_session() -> Result<()> {
+        let tools = ToolsConfig::default();
+        let run_session = SessionId::new();
+        let attacker_session = SessionId::new();
+
+        let timeline = prepare_tool_call_for_config(
+            ToolCallRequest {
+                name: "timeline_search".to_string(),
+                arguments: serde_json::json!({
+                    "session_id": attacker_session.to_string(),
+                    "limit": 10
+                }),
+            },
+            &tools,
+            run_session,
+        )?;
+        let params: TimelineSearchParams =
+            serde_json::from_value(timeline.arguments).expect("timeline args should deserialize");
+        assert_eq!(params.session_id.as_deref(), Some(run_session.to_string().as_str()));
+        assert_ne!(
+            params.session_id.as_deref(),
+            Some(attacker_session.to_string().as_str())
+        );
         Ok(())
     }
 
