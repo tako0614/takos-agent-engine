@@ -688,18 +688,28 @@ async fn persist_raw_node(deps: &EngineDeps, node: RawNode) -> Result<RawNode> {
     Ok(node)
 }
 
+/// Persist a distilled abstract node, deduplicating on its `operation_key`.
+///
+/// Returns `Ok(Some(node))` when a NEW abstract was inserted, and `Ok(None)`
+/// when an abstract already existed for the `operation_key` (a dedup hit, no
+/// write). Callers use this distinction to count only fresh creations.
 pub(crate) async fn persist_abstract_node(
     deps: &EngineDeps,
     node: AbstractNode,
     session_id: Option<SessionId>,
 ) -> Result<Option<AbstractNode>> {
     if let Some(operation_key) = &node.operation_key {
-        if let Some(existing) = deps
+        if deps
             .repository
             .get_abstract_by_operation_key(operation_key)
             .await?
+            .is_some()
         {
-            return Ok(Some(existing));
+            // Already persisted under this operation_key. Return `None` (not
+            // `Some(existing)`) so callers can distinguish a NEW abstract from a
+            // dedup hit — otherwise "created" is always true, miscounting
+            // maintenance stats and the engine's new_abstract_ids. [C6]
+            return Ok(None);
         }
     }
     let embedding = deps

@@ -7,13 +7,13 @@
 //! lives in [`nodes`](crate::engine::nodes); both are re-exported here so the
 //! crate-facing API paths stay stable.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use tracing::{info_span, instrument};
 
 use crate::config::EngineConfig;
-use crate::domain::{LoopStatus, RawNode};
+use crate::domain::{DistillationState, LoopStatus, RawNode};
 use crate::engine::context_assembler::{ContextAssembler, TokenEstimator};
 use crate::engine::execution_graph::{ExecutionState, GraphRunner, ResolvedRunOptions, RunOptions};
 use crate::engine::nodes::{build_response, persist_abstract_node};
@@ -177,15 +177,37 @@ pub async fn run_maintenance_pass(
     let resolved_options = ResolvedRunOptions::from_config(config, RunOptions::default());
     let backlog_limit = limit.max(1).min(resolved_options.maintenance_batch_size);
     let backlog = deps.repository.undistilled_raw(backlog_limit, true).await?;
-    let mut grouped: BTreeMap<(SessionId, LoopId), Vec<RawNode>> = BTreeMap::new();
+    // Identify the distinct loops with pushed-out backlog. We use the truncated
+    // backlog only to discover WHICH loops need work; each loop is then distilled
+    // over its FULL pushed-out-undistilled raw set (re-fetched below). This
+    // prevents a loop whose raws straddle the `backlog_limit` boundary from being
+    // distilled in two batches that collide on the same `operation_key`, which
+    // would silently drop the second batch from the distilled layer while still
+    // marking those raws Distilled. [C6]
+    let mut loop_keys: BTreeSet<(SessionId, LoopId)> = BTreeSet::new();
     for node in backlog {
         if let (Some(session_id), Some(loop_id)) = (node.session_id, node.loop_id) {
-            grouped.entry((session_id, loop_id)).or_default().push(node);
+            loop_keys.insert((session_id, loop_id));
         }
     }
 
     let mut report = MaintenanceReport::default();
-    for ((session_id, loop_id), raw_nodes) in grouped {
+    for (session_id, loop_id) in loop_keys {
+        // Full pushed-out, undistilled set for this loop (not the truncated
+        // batch), so the whole loop is distilled atomically in one pass.
+        let raw_nodes: Vec<RawNode> = deps
+            .repository
+            .raw_for_loop(&loop_id)
+            .await?
+            .into_iter()
+            .filter(|node| {
+                node.distillation_state != DistillationState::Distilled
+                    && node.overflow.was_pushed_out_of_session
+            })
+            .collect();
+        if raw_nodes.is_empty() {
+            continue;
+        }
         let span = info_span!(
             "maintenance_distillation",
             session_id = %session_id,
@@ -789,6 +811,55 @@ mod tests {
         assert_eq!(first.processed_loops, 1);
         assert_eq!(first.new_abstract_nodes, 1);
         assert_eq!(second.processed_loops, 0);
+        Ok(())
+    }
+
+    // C6 regression: a single loop whose pushed-out backlog is larger than the
+    // maintenance batch limit must still be distilled in full (no raw left
+    // undistilled / dropped from the distilled layer), and the counters must
+    // distinguish a created loop from a deduped/skipped one.
+    #[tokio::test]
+    async fn maintenance_distills_full_loop_when_backlog_straddles_batch() -> Result<()> {
+        let deps = build_demo_deps();
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+
+        let total = 5usize;
+        for i in 0..total {
+            let mut node = RawNode::text(
+                RawNodeKind::Note,
+                Some(session_id),
+                Some(loop_id),
+                "system",
+                format!("backlog item {i}"),
+                0.5,
+                Vec::new(),
+            );
+            node.overflow.was_pushed_out_of_session = true;
+            node.distillation_state = DistillationState::Undistilled;
+            deps.repository.insert_raw(node.clone()).await?;
+            deps.vector_index
+                .index_raw(node.id, deps.embedder.embed_text(&node.content_text()).await?)
+                .await?;
+        }
+
+        // limit = 2 < total: the discovery query is truncated, but the whole
+        // loop must still be distilled atomically.
+        let first = run_maintenance_pass(&EngineConfig::default(), &deps, 2).await?;
+        assert_eq!(first.processed_loops, 1);
+        assert_eq!(first.new_abstract_nodes, 1);
+        // Every raw of the loop is now distilled -> no pushed-out backlog left.
+        assert!(deps
+            .repository
+            .undistilled_raw(100, true)
+            .await?
+            .is_empty());
+
+        // A second pass finds nothing to do and is counted as neither created
+        // nor skipped (no loops in the backlog at all).
+        let second = run_maintenance_pass(&EngineConfig::default(), &deps, 2).await?;
+        assert_eq!(second.processed_loops, 0);
+        assert_eq!(second.new_abstract_nodes, 0);
         Ok(())
     }
 
