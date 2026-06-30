@@ -529,11 +529,15 @@ impl GraphNode for MarkSessionOverflowNode {
         deps: &EngineDeps,
         _options: &ResolvedRunOptions,
     ) -> Result<NodeOutcome> {
+        // Clear the overflow mark on nodes that are back inside the window —
+        // but only those that actually carry a mark, so we don't rewrite
+        // never-overflowed nodes every turn.
         let clear_ids: Vec<_> = state
             .recent_session
             .iter()
             .filter(|node| {
                 node.distillation_state != DistillationState::Distilled
+                    && node.overflow.was_pushed_out_of_session
                     && state.session_window_ids.contains(&node.id)
             })
             .map(|node| node.id)
@@ -553,12 +557,17 @@ impl GraphNode for MarkSessionOverflowNode {
                 .await?;
         }
 
+        // Stamp the relaxation deadline ONCE, only on newly pushed-out nodes
+        // (those without an existing deadline). Re-stamping every turn would
+        // keep extending the window so it never elapses, defeating the 24h
+        // expiry enforced in activation/scoring. [C7]
         let pushed_ids: Vec<_> = state
             .recent_session
             .iter()
             .filter(|node| {
                 node.distillation_state != DistillationState::Distilled
                     && state.pushed_out_raw_ids.contains(&node.id)
+                    && node.overflow.relax_retrieval_until.is_none()
             })
             .map(|node| node.id)
             .collect();

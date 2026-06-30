@@ -30,6 +30,23 @@ pub struct ActivatedMemory {
     pub abstract_nodes: Vec<RankedAbstractNode>,
 }
 
+/// Whether a raw node's pushed-out retrieval relaxation (lowered similarity
+/// threshold + scoring bonus) is currently in effect.
+///
+/// `MarkSessionOverflowNode` stamps `overflow.relax_retrieval_until` with a
+/// deadline (now + 24h) when a node is pushed out of the session window. The
+/// relaxation must apply only until that deadline; a node with no deadline
+/// (`None`) is treated as already expired (no relaxation). This is what makes
+/// the 24h window real instead of permanent. [C7]
+pub(crate) fn overflow_relaxation_active(node: &RawNode, now: DateTime<Utc>) -> bool {
+    node.overflow.was_pushed_out_of_session
+        && node.distillation_state != DistillationState::Distilled
+        && node
+            .overflow
+            .relax_retrieval_until
+            .is_some_and(|deadline| now <= deadline)
+}
+
 pub struct ActivationService {
     repository: Arc<dyn NodeRepository>,
     vector_index: Arc<dyn VectorIndex>,
@@ -83,8 +100,7 @@ impl ActivationService {
         for candidate in raw_candidates {
             if let Some(node) = self.repository.get_raw(&candidate.id).await? {
                 let threshold = if config.memory.activation.overflow_raw_threshold_relaxation
-                    && node.overflow.was_pushed_out_of_session
-                    && node.distillation_state != DistillationState::Distilled
+                    && overflow_relaxation_active(&node, now)
                 {
                     config.memory.retrieval.relaxed_threshold_for_pushed_raw
                 } else {
@@ -424,6 +440,83 @@ mod tests {
 
         assert_eq!(scoped.raw_nodes.len(), 1);
         assert_eq!(scoped.raw_nodes[0].node.id, id_a);
+    }
+
+    #[tokio::test]
+    async fn overflow_relaxation_expires_after_deadline() {
+        use chrono::Duration;
+
+        let h = setup();
+        let mut config = EngineConfig::default();
+        // Strict threshold is unreachable (> 1.0, the cosine max) and the
+        // relaxed threshold is trivially passable, so a pushed-out node survives
+        // iff the relaxation is still active — independent of the embedder's
+        // exact similarity value.
+        config.memory.retrieval.similarity_threshold.raw = 1.01;
+        config.memory.retrieval.relaxed_threshold_for_pushed_raw = 0.0;
+        config.memory.activation.top_k_total = 20;
+
+        let now = Utc::now();
+        let make_pushed = |deadline: chrono::DateTime<Utc>| {
+            let mut node = RawNode::text(
+                RawNodeKind::UserUtterance,
+                None,
+                None,
+                "user",
+                "apples and oranges",
+                0.5,
+                Vec::new(),
+            );
+            node.overflow.was_pushed_out_of_session = true;
+            node.overflow.relax_retrieval_until = Some(deadline);
+            node
+        };
+
+        let query_emb = h.embedder.embed_text("apples and oranges").await.unwrap();
+
+        // Active relaxation -> node survives the (relaxed) threshold.
+        let active = make_pushed(now + Duration::hours(1));
+        let active_id = active.id;
+        h.repo.insert_raw(active).await.unwrap();
+        h.vector
+            .index_raw(
+                active_id,
+                h.embedder.embed_text("apples and oranges").await.unwrap(),
+            )
+            .await
+            .unwrap();
+        let result = h
+            .service
+            .activate(&config, &query_emb, now, None)
+            .await
+            .unwrap();
+        assert!(
+            result.raw_nodes.iter().any(|ranked| ranked.node.id == active_id),
+            "a within-deadline pushed-out node should pass the relaxed threshold"
+        );
+
+        // Fresh store: expired relaxation -> node filtered by the strict
+        // threshold.
+        let h2 = setup();
+        let expired = make_pushed(now - Duration::hours(1));
+        let expired_id = expired.id;
+        h2.repo.insert_raw(expired).await.unwrap();
+        h2.vector
+            .index_raw(
+                expired_id,
+                h2.embedder.embed_text("apples and oranges").await.unwrap(),
+            )
+            .await
+            .unwrap();
+        let result2 = h2
+            .service
+            .activate(&config, &query_emb, now, None)
+            .await
+            .unwrap();
+        assert!(
+            result2.raw_nodes.is_empty(),
+            "an expired pushed-out node must fall back to the strict threshold and be filtered"
+        );
     }
 
     #[tokio::test]

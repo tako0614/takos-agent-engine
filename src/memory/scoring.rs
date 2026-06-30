@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 
-use crate::domain::{AbstractNode, DistillationState, RawNode};
+use crate::domain::{AbstractNode, RawNode};
+use crate::memory::activation::overflow_relaxation_active;
 
 pub trait ScoringPolicy: Send + Sync {
     fn score_raw(&self, base_similarity: f32, node: &RawNode, now: DateTime<Utc>) -> f32;
@@ -39,9 +40,10 @@ impl DefaultScoringPolicy {
 impl ScoringPolicy for DefaultScoringPolicy {
     fn score_raw(&self, base_similarity: f32, node: &RawNode, now: DateTime<Utc>) -> f32 {
         let age_penalty = Self::age_in_days(node.timestamp, now) * self.decay_per_day;
-        let overflow_bonus = if node.overflow.was_pushed_out_of_session
-            && node.distillation_state != DistillationState::Distilled
-        {
+        // The overflow bonus expires with the same deadline as the threshold
+        // relaxation (see `overflow_relaxation_active`); `now` here is the
+        // activation reference instant. [C7]
+        let overflow_bonus = if overflow_relaxation_active(node, now) {
             self.overflow_bonus
         } else {
             0.0
@@ -87,10 +89,35 @@ mod tests {
         );
         let now = Utc::now();
         node.overflow.was_pushed_out_of_session = true;
+        // Bonus applies only within the relaxation deadline.
+        node.overflow.relax_retrieval_until = Some(now + Duration::hours(1));
         let boosted = scorer.score_raw(0.5, &node, now);
         node.overflow.was_pushed_out_of_session = false;
         let normal = scorer.score_raw(0.5, &node, now);
         assert!(boosted > normal);
+    }
+
+    #[test]
+    fn overflow_bonus_expires_after_deadline() {
+        let scorer = DefaultScoringPolicy::default();
+        let mut node = RawNode::text(
+            RawNodeKind::UserUtterance,
+            None,
+            None,
+            "user",
+            "hello",
+            0.5,
+            Vec::new(),
+        );
+        let now = Utc::now();
+        node.overflow.was_pushed_out_of_session = true;
+        // Deadline already elapsed -> no bonus (same score as a non-overflow
+        // node), proving the relaxation window is enforced.
+        node.overflow.relax_retrieval_until = Some(now - Duration::hours(1));
+        let expired = scorer.score_raw(0.5, &node, now);
+        node.overflow.was_pushed_out_of_session = false;
+        let normal = scorer.score_raw(0.5, &node, now);
+        assert!((expired - normal).abs() < f32::EPSILON);
     }
 
     #[test]
