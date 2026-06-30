@@ -55,6 +55,12 @@ impl OpenAiCompatibleEmbedder {
         validate_config(&config)?;
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
+            // Do not follow redirects. This is a secret-bearing POST whose body
+            // is user/memory conversation content; a 3xx from the configured
+            // endpoint must not silently re-target the request to another host
+            // (SSRF defense-in-depth). A redirect surfaces as a Model error
+            // instead of being chased. [S4]
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| {
                 EngineError::Configuration(format!("failed to build HTTP client: {err}"))
@@ -257,6 +263,40 @@ mod tests {
         assert_eq!(embedding, Embedding(vec![0.5, 0.5]));
         let request_count = scripted.shutdown().await;
         assert_eq!(request_count, 2, "embedder should have retried once");
+    }
+
+    #[tokio::test]
+    async fn embed_text_does_not_follow_redirects() {
+        // S4: a 3xx from the embedding endpoint must NOT be chased to another
+        // host. The server returns a 302 with a link-local Location; with the
+        // redirect guard the embedder surfaces the 302 as an error and never
+        // connects to the redirect target.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            let body = "redirected";
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://169.254.169.254/embeddings\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let embedder = OpenAiCompatibleEmbedder::with_config(
+            OpenAiEmbeddingConfig::new("embedding-model", "test-key")
+                .with_base_url(format!("http://{address}")),
+        )
+        .unwrap();
+
+        let err = embedder.embed_text("hello").await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("302"),
+            "redirect must surface as an error, not be followed: {message}"
+        );
+        handle.await.unwrap();
     }
 
     #[test]
