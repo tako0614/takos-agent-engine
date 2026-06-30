@@ -40,9 +40,11 @@ impl InMemoryGraphRepository {
         }
         let mut edges: Vec<_> = edges.into_iter().collect();
         edges.sort_by(|left, right| {
+            // Match the production object store's native-id tiebreak (not a
+            // stringified comparison) so the doubles cannot diverge. [Q4]
             left.predicate
                 .cmp(&right.predicate)
-                .then_with(|| left.to.to_string().cmp(&right.to.to_string()))
+                .then_with(|| left.to.cmp(&right.to))
         });
         edges
     }
