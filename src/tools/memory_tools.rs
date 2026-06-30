@@ -162,7 +162,6 @@ pub struct MemoryTools {
     vector_index: Arc<dyn VectorIndex>,
     graph_repository: Arc<dyn GraphRepository>,
     embedder: Arc<dyn Embedder>,
-    bounds: MemoryToolBounds,
 }
 
 impl MemoryTools {
@@ -172,28 +171,15 @@ impl MemoryTools {
         graph_repository: Arc<dyn GraphRepository>,
         embedder: Arc<dyn Embedder>,
     ) -> Self {
-        Self::new_with_bounds(
-            repository,
-            vector_index,
-            graph_repository,
-            embedder,
-            MemoryToolBounds::default(),
-        )
-    }
-
-    pub fn new_with_bounds(
-        repository: Arc<dyn NodeRepository>,
-        vector_index: Arc<dyn VectorIndex>,
-        graph_repository: Arc<dyn GraphRepository>,
-        embedder: Arc<dyn Embedder>,
-        bounds: MemoryToolBounds,
-    ) -> Self {
+        // Argument bounds are enforced once, at the engine's
+        // `prepare_tool_call_for_config` chokepoint using the LIVE config; the
+        // tool methods below intentionally do not re-clamp (a second clamp from a
+        // separate source would silently override raised operator config). [Q2]
         Self {
             repository,
             vector_index,
             graph_repository,
             embedder,
-            bounds,
         }
     }
 
@@ -202,7 +188,7 @@ impl MemoryTools {
     /// Returns an [`EngineError`] when the embedder fails to embed the query
     /// or the underlying vector / node repositories return an error.
     pub async fn semantic_search(&self, params: MemorySearchParams) -> Result<MemorySearchResult> {
-        let top_k = self.bounds.clamp_memory_search_top_k(params.top_k);
+        let top_k = params.top_k.max(1);
         let session_id = params
             .session_id
             .as_deref()
@@ -245,7 +231,7 @@ impl MemoryTools {
     pub async fn graph_search(&self, params: GraphSearchParams) -> Result<GraphSearchResult> {
         let start = AbstractNodeId::from_str(&params.start_node_id)
             .map_err(|err| EngineError::Tool(format!("invalid abstract node id: {err}")))?;
-        let max_depth = self.bounds.clamp_graph_search_depth(params.max_depth);
+        let max_depth = params.max_depth;
         let hits = self
             .graph_repository
             .traverse(&start, max_depth, params.relation_types.as_deref())
@@ -319,7 +305,7 @@ impl MemoryTools {
                 session_id.as_ref(),
                 params.from,
                 params.to,
-                self.bounds.clamp_timeline_search_limit(params.limit),
+                params.limit.max(1),
             )
             .await?;
         Ok(TimelineSearchResult { raw_nodes })
@@ -387,7 +373,6 @@ mod tests {
     use super::*;
     use crate::domain::{
         AbstractNode, AbstractNodeMetadata, GraphFragment, RawNode, RawNodeKind, References,
-        Relation,
     };
     use crate::model::Embedder;
     use crate::storage::{InMemoryGraphRepository, InMemoryNodeRepository, InMemoryVectorIndex};
@@ -397,32 +382,25 @@ mod tests {
         tools: MemoryTools,
         repo: Arc<InMemoryNodeRepository>,
         vector: Arc<InMemoryVectorIndex>,
-        graph: Arc<InMemoryGraphRepository>,
         embedder: TestHashEmbedder,
     }
 
     fn setup() -> TestHarness {
-        setup_with_bounds(MemoryToolBounds::default())
-    }
-
-    fn setup_with_bounds(bounds: MemoryToolBounds) -> TestHarness {
         let repo = Arc::new(InMemoryNodeRepository::default());
         let vector = Arc::new(InMemoryVectorIndex::default());
         let graph = Arc::new(InMemoryGraphRepository::default());
         let embedder = TestHashEmbedder::default();
 
-        let tools = MemoryTools::new_with_bounds(
+        let tools = MemoryTools::new(
             repo.clone() as Arc<dyn NodeRepository>,
             vector.clone() as Arc<dyn VectorIndex>,
             graph.clone() as Arc<dyn GraphRepository>,
             Arc::new(embedder.clone()) as Arc<dyn Embedder>,
-            bounds,
         );
         TestHarness {
             tools,
             repo,
             vector,
-            graph,
             embedder,
         }
     }
@@ -638,105 +616,9 @@ mod tests {
         assert!(result.raw_hits.is_empty());
     }
 
-    #[tokio::test]
-    async fn semantic_search_clamps_top_k_to_bounds() {
-        let h = setup_with_bounds(MemoryToolBounds {
-            max_memory_search_top_k: 2,
-            max_graph_search_depth: 4,
-            max_timeline_search_limit: 100,
-        });
-
-        for i in 0..5 {
-            let node = RawNode::text(
-                RawNodeKind::UserUtterance,
-                None,
-                None,
-                "user",
-                format!("shared topic {i}"),
-                0.5,
-                Vec::new(),
-            );
-            let node_id = node.id;
-            let emb = h.embedder.embed_text(&node.content_text()).await.unwrap();
-            h.repo.insert_raw(node).await.unwrap();
-            h.vector.index_raw(node_id, emb).await.unwrap();
-        }
-
-        let result = h
-            .tools
-            .semantic_search(MemorySearchParams {
-                query: "shared topic".to_string(),
-                target: MemorySearchTarget::Raw,
-                top_k: 100,
-                threshold: None,
-                session_id: None,
-            })
-            .await
-            .unwrap();
-
-        assert!(result.raw_hits.len() <= 2);
-    }
-
-    #[tokio::test]
-    async fn graph_search_clamps_depth_to_bounds() {
-        let h = setup_with_bounds(MemoryToolBounds {
-            max_memory_search_top_k: 32,
-            max_graph_search_depth: 1,
-            max_timeline_search_limit: 100,
-        });
-
-        let leaf = AbstractNode::new(
-            "leaf",
-            "leaf summary",
-            References::default(),
-            GraphFragment::default(),
-            AbstractNodeMetadata::default(),
-        );
-        let middle = AbstractNode::new(
-            "middle",
-            "middle summary",
-            References {
-                abstract_node_ids: vec![leaf.id],
-                raw_node_ids: Vec::new(),
-            },
-            GraphFragment::default(),
-            AbstractNodeMetadata::default(),
-        );
-        let root = AbstractNode::new(
-            "root",
-            "root summary",
-            References::default(),
-            GraphFragment {
-                entities: Vec::new(),
-                relations: vec![Relation {
-                    subject: "root".to_string(),
-                    predicate: "links".to_string(),
-                    object: middle.id.to_string(),
-                    weight: 1.0,
-                    provenance_raw_node_ids: Vec::new(),
-                }],
-            },
-            AbstractNodeMetadata::default(),
-        );
-
-        for node in [&root, &middle, &leaf] {
-            h.repo.insert_abstract(node.clone()).await.unwrap();
-            h.graph.index_abstract(node).await.unwrap();
-        }
-
-        let result = h
-            .tools
-            .graph_search(GraphSearchParams {
-                start_node_id: root.id.to_string(),
-                max_depth: 10,
-                relation_types: None,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result.hits.len(), 2);
-        assert!(result.hits.iter().all(|hit| hit.depth <= 1));
-    }
+    // Argument-bound clamping is enforced once at the engine chokepoint
+    // (`prepare_tool_call_for_config`, tested in session_engine), so MemoryTools
+    // no longer re-clamps and the former per-tool clamp tests were removed. [Q2]
 
     #[tokio::test]
     async fn timeline_search_empty() {
@@ -776,41 +658,6 @@ mod tests {
         };
         let result = h.tools.timeline_search(params).await.unwrap();
         assert_eq!(result.raw_nodes.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn timeline_search_clamps_limit_to_bounds() {
-        let h = setup_with_bounds(MemoryToolBounds {
-            max_memory_search_top_k: 32,
-            max_graph_search_depth: 4,
-            max_timeline_search_limit: 2,
-        });
-
-        for i in 0..5 {
-            let node = RawNode::text(
-                RawNodeKind::UserUtterance,
-                None,
-                None,
-                "user",
-                format!("message {i}"),
-                0.5,
-                Vec::new(),
-            );
-            h.repo.insert_raw(node).await.unwrap();
-        }
-
-        let result = h
-            .tools
-            .timeline_search(TimelineSearchParams {
-                session_id: None,
-                from: None,
-                to: None,
-                limit: 100,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result.raw_nodes.len(), 2);
     }
 
     #[tokio::test]
