@@ -143,6 +143,11 @@ pub enum NodeOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRuntimeClass {
     Standard,
+    /// Model-inference nodes. These await the LLM, whose own HTTP client is
+    /// budgeted far higher than a `Standard` node, so they get a dedicated
+    /// `model_timeout` instead of the small `node_timeout` (otherwise any
+    /// completion taking longer than `node_timeout` is spuriously aborted).
+    Model,
     ToolExecution,
     Distillation,
 }
@@ -160,6 +165,7 @@ pub struct RunOptions {
     pub max_graph_steps: Option<u32>,
     pub max_tool_rounds: Option<u32>,
     pub node_timeout: Option<Duration>,
+    pub model_timeout: Option<Duration>,
     pub tool_timeout: Option<Duration>,
     pub distillation_timeout: Option<Duration>,
     pub maintenance_batch_size: Option<usize>,
@@ -171,6 +177,7 @@ pub struct ResolvedRunOptions {
     pub max_graph_steps: u32,
     pub max_tool_rounds: u32,
     pub node_timeout: Duration,
+    pub model_timeout: Duration,
     pub tool_timeout: Duration,
     pub distillation_timeout: Duration,
     pub maintenance_batch_size: usize,
@@ -190,6 +197,9 @@ impl ResolvedRunOptions {
             node_timeout: options
                 .node_timeout
                 .unwrap_or_else(|| config.runtime.node_timeout()),
+            model_timeout: options
+                .model_timeout
+                .unwrap_or_else(|| config.runtime.model_timeout()),
             tool_timeout: options
                 .tool_timeout
                 .unwrap_or_else(|| config.runtime.tool_timeout()),
@@ -207,6 +217,7 @@ impl ResolvedRunOptions {
     pub const fn timeout_for_class(&self, class: NodeRuntimeClass) -> Duration {
         match class {
             NodeRuntimeClass::Standard => self.node_timeout,
+            NodeRuntimeClass::Model => self.model_timeout,
             NodeRuntimeClass::ToolExecution => self.tool_timeout,
             NodeRuntimeClass::Distillation => self.distillation_timeout,
         }

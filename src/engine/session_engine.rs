@@ -888,6 +888,84 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SleepyModelRunner {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl ModelRunner for SleepyModelRunner {
+        async fn run(&self, _input: ModelInput) -> Result<ModelOutput> {
+            sleep(self.delay).await;
+            Ok(ModelOutput {
+                assistant_message: Some("slept and answered".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    // C1 regression: a completion that takes longer than the (small) Standard
+    // `node_timeout` but well under `model_timeout` must still succeed, because
+    // the model node runs under `NodeRuntimeClass::Model`, not `Standard`.
+    #[tokio::test]
+    async fn model_node_completes_when_slower_than_node_timeout() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(SleepyModelRunner {
+            delay: Duration::from_millis(300),
+        });
+        let response = run_turn_with_options(
+            &EngineConfig::default(),
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "answer slowly".to_string(),
+                plan: None,
+            },
+            RunOptions {
+                // Every Standard node must finish inside this tiny budget; the
+                // model node must NOT inherit it.
+                node_timeout: Some(Duration::from_millis(80)),
+                model_timeout: Some(Duration::from_secs(3)),
+                ..RunOptions::default()
+            },
+        )
+        .await?;
+        assert_eq!(response.status, LoopStatus::Finished);
+        assert_eq!(
+            response.assistant_message.as_deref(),
+            Some("slept and answered")
+        );
+        Ok(())
+    }
+
+    // Conversely, the model node IS bounded by `model_timeout` (not the large
+    // `node_timeout`): a tiny `model_timeout` aborts a slow completion.
+    #[tokio::test]
+    async fn model_node_is_bounded_by_model_timeout() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(SleepyModelRunner {
+            delay: Duration::from_millis(300),
+        });
+        let response = run_turn_with_options(
+            &EngineConfig::default(),
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "answer slowly".to_string(),
+                plan: None,
+            },
+            RunOptions {
+                node_timeout: Some(Duration::from_secs(3)),
+                model_timeout: Some(Duration::from_millis(20)),
+                ..RunOptions::default()
+            },
+        )
+        .await?;
+        assert_eq!(response.status, LoopStatus::TimedOut);
+        Ok(())
+    }
+
     // Locks the builder to the expected execution-graph topology: the opening
     // pass, the post-tool re-activation pass, persist, and the overflow/distill
     // tail must register exactly these node and edge counts.

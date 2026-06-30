@@ -236,6 +236,13 @@ impl GraphNode for ModelNode {
         self.id
     }
 
+    fn runtime_class(&self) -> NodeRuntimeClass {
+        // Model nodes await the LLM; budget them with `model_timeout` (default
+        // 60s, >= the model HTTP client timeout) rather than the small
+        // `node_timeout`, which would force-abort any completion >10s.
+        NodeRuntimeClass::Model
+    }
+
     async fn run(
         &self,
         state: &mut ExecutionState,

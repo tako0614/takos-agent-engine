@@ -88,6 +88,11 @@ impl EngineConfig {
                 "tools.max_timeline_search_limit must be greater than 0".to_string(),
             ));
         }
+        if self.runtime.model_timeout_ms == 0 {
+            return Err(EngineError::Configuration(
+                "runtime.model_timeout_ms must be greater than 0".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -246,6 +251,16 @@ pub struct RuntimeConfig {
     pub max_graph_steps: u32,
     pub max_tool_rounds: u32,
     pub node_timeout_ms: u64,
+    /// Per-node budget for the model-inference graph nodes. Model completions
+    /// routinely take far longer than a `Standard` node (the outbound LLM HTTP
+    /// client itself is budgeted ~60s), so model nodes get their own runtime
+    /// class with this dedicated budget instead of the much smaller
+    /// `node_timeout_ms`. It MUST be `>=` the model HTTP client timeout,
+    /// otherwise the engine aborts in-flight completions before the transport
+    /// does. `#[serde(default)]` keeps older configs (written before this field
+    /// existed) deserializing cleanly onto the 60s default.
+    #[serde(default = "default_model_timeout_ms")]
+    pub model_timeout_ms: u64,
     pub tool_timeout_ms: u64,
     pub distillation_timeout_ms: u64,
     pub maintenance_batch_size: usize,
@@ -257,6 +272,7 @@ impl Default for RuntimeConfig {
             max_graph_steps: 64,
             max_tool_rounds: 8,
             node_timeout_ms: 10_000,
+            model_timeout_ms: default_model_timeout_ms(),
             tool_timeout_ms: 30_000,
             distillation_timeout_ms: 15_000,
             maintenance_batch_size: 32,
@@ -264,10 +280,19 @@ impl Default for RuntimeConfig {
     }
 }
 
+pub(crate) const fn default_model_timeout_ms() -> u64 {
+    60_000
+}
+
 impl RuntimeConfig {
     #[must_use]
     pub const fn node_timeout(&self) -> Duration {
         Duration::from_millis(self.node_timeout_ms)
+    }
+
+    #[must_use]
+    pub const fn model_timeout(&self) -> Duration {
+        Duration::from_millis(self.model_timeout_ms)
     }
 
     #[must_use]
