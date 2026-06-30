@@ -150,7 +150,15 @@ impl NodeRepository for InMemoryNodeRepository {
             let upper_ok = to.is_none_or(|value| node.timestamp <= value);
             lower_ok && upper_ok
         });
-        nodes.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+        // Match the production object store's deterministic tiebreak (timestamp
+        // DESC, then id ASC) so the test double cannot diverge on equal
+        // timestamps (HashMap iteration order is otherwise nondeterministic). [Q4]
+        nodes.sort_by(|left, right| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         nodes.truncate(limit);
         Ok(nodes)
     }

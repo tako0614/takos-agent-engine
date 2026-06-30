@@ -114,8 +114,9 @@ impl VectorIndex for InMemoryVectorIndex {
             })
             .collect();
         scored.sort_by(|left, right| {
-            cmp_score_desc(left.score, right.score)
-                .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
+            // Match the production object store's native-id tiebreak (not a
+            // stringified comparison) so the doubles cannot diverge. [Q4]
+            cmp_score_desc(left.score, right.score).then_with(|| left.id.cmp(&right.id))
         });
         scored.truncate(top_k);
         Ok(scored)
@@ -139,8 +140,9 @@ impl VectorIndex for InMemoryVectorIndex {
             })
             .collect();
         scored.sort_by(|left, right| {
-            cmp_score_desc(left.score, right.score)
-                .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
+            // Match the production object store's native-id tiebreak (not a
+            // stringified comparison) so the doubles cannot diverge. [Q4]
+            cmp_score_desc(left.score, right.score).then_with(|| left.id.cmp(&right.id))
         });
         scored.truncate(top_k);
         Ok(scored)
