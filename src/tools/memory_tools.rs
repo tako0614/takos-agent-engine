@@ -27,6 +27,15 @@ pub struct MemorySearchParams {
     #[serde(default = "default_memory_search_top_k")]
     pub top_k: usize,
     pub threshold: Option<f32>,
+    /// Session scope for the search. The engine forces this to the running
+    /// session in `prepare_tool_call_for_config`, overriding any model-supplied
+    /// value, so a tool call cannot read another session's memory and so the
+    /// search actually matches the engine's session-tagged embeddings (passing
+    /// `None` matches only legacy/None-tagged entries and returns nothing in
+    /// production). `None` = session-less, used only off the engine tool path
+    /// (e.g. unit tests). [S2, C8]
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 const fn default_memory_search_target() -> MemorySearchTarget {
@@ -194,6 +203,12 @@ impl MemoryTools {
     /// or the underlying vector / node repositories return an error.
     pub async fn semantic_search(&self, params: MemorySearchParams) -> Result<MemorySearchResult> {
         let top_k = self.bounds.clamp_memory_search_top_k(params.top_k);
+        let session_id = params
+            .session_id
+            .as_deref()
+            .map(SessionId::from_str)
+            .transpose()
+            .map_err(|err| EngineError::Tool(format!("invalid session id: {err}")))?;
         let query_embedding = self.embedder.embed_text(&params.query).await?;
         let threshold = params.threshold.unwrap_or(0.0);
 
@@ -201,7 +216,8 @@ impl MemoryTools {
             params.target,
             MemorySearchTarget::Raw | MemorySearchTarget::Both
         ) {
-            self.search_raw(&query_embedding, top_k, threshold).await?
+            self.search_raw(&query_embedding, top_k, threshold, session_id.as_ref())
+                .await?
         } else {
             Vec::new()
         };
@@ -210,7 +226,7 @@ impl MemoryTools {
             params.target,
             MemorySearchTarget::Abstract | MemorySearchTarget::Both
         ) {
-            self.search_abstract(&query_embedding, top_k, threshold)
+            self.search_abstract(&query_embedding, top_k, threshold, session_id.as_ref())
                 .await?
         } else {
             Vec::new()
@@ -314,14 +330,15 @@ impl MemoryTools {
         query_embedding: &Embedding,
         top_k: usize,
         threshold: f32,
+        session_id: Option<&SessionId>,
     ) -> Result<Vec<ScoredRawHit>> {
-        // Memory tool searches are session-less (the search is global across
-        // memory). The `None` session filter therefore matches legacy /
-        // non-session-tagged entries; per-session retrieval is the
-        // `ActivationService::activate` path, not this tool.
+        // Scope the search to the requested session. The engine forces this to
+        // the running session (so it matches the engine's session-tagged
+        // embeddings and never leaks across sessions); `None` matches only
+        // legacy/None-tagged entries (off-engine callers / tests).
         let refs = self
             .vector_index
-            .search_raw(query_embedding, top_k, None)
+            .search_raw(query_embedding, top_k, session_id)
             .await?;
         let mut hits = Vec::new();
         for candidate in refs {
@@ -343,10 +360,11 @@ impl MemoryTools {
         query_embedding: &Embedding,
         top_k: usize,
         threshold: f32,
+        session_id: Option<&SessionId>,
     ) -> Result<Vec<ScoredAbstractHit>> {
         let refs = self
             .vector_index
-            .search_abstract(query_embedding, top_k, None)
+            .search_abstract(query_embedding, top_k, session_id)
             .await?;
         let mut hits = Vec::new();
         for candidate in refs {
@@ -417,6 +435,7 @@ mod tests {
             target: MemorySearchTarget::Both,
             top_k: 5,
             threshold: None,
+            session_id: None,
         };
         let result = h.tools.semantic_search(params).await.unwrap();
         assert!(result.raw_hits.is_empty());
@@ -446,11 +465,69 @@ mod tests {
             target: MemorySearchTarget::Raw,
             top_k: 5,
             threshold: None,
+            session_id: None,
         };
         let result = h.tools.semantic_search(params).await.unwrap();
         assert!(!result.raw_hits.is_empty());
         assert_eq!(result.raw_hits[0].node.id, node_id);
         assert!(result.abstract_hits.is_empty());
+    }
+
+    // C8 regression: session-tagged embeddings (what the engine actually
+    // persists) must be returned by a session-scoped semantic search, and never
+    // leak to a different session.
+    #[tokio::test]
+    async fn semantic_search_returns_session_tagged_hits() {
+        let h = setup();
+        let session = SessionId::new();
+        let other = SessionId::new();
+
+        let node = RawNode::text(
+            RawNodeKind::UserUtterance,
+            Some(session),
+            None,
+            "user",
+            "hello world",
+            0.5,
+            Vec::new(),
+        );
+        let node_id = node.id;
+        let emb = h.embedder.embed_text("hello world").await.unwrap();
+        h.repo.insert_raw(node).await.unwrap();
+        h.vector
+            .index_raw_with_session(node_id, emb, Some(session))
+            .await
+            .unwrap();
+
+        let scoped = h
+            .tools
+            .semantic_search(MemorySearchParams {
+                query: "hello world".to_string(),
+                target: MemorySearchTarget::Raw,
+                top_k: 5,
+                threshold: None,
+                session_id: Some(session.to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(scoped.raw_hits.len(), 1);
+        assert_eq!(scoped.raw_hits[0].node.id, node_id);
+
+        let foreign = h
+            .tools
+            .semantic_search(MemorySearchParams {
+                query: "hello world".to_string(),
+                target: MemorySearchTarget::Raw,
+                top_k: 5,
+                threshold: None,
+                session_id: Some(other.to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            foreign.raw_hits.is_empty(),
+            "a session-scoped search must not return another session's memory"
+        );
     }
 
     #[tokio::test]
@@ -478,6 +555,7 @@ mod tests {
             target: MemorySearchTarget::Abstract,
             top_k: 5,
             threshold: None,
+            session_id: None,
         };
         let result = h.tools.semantic_search(params).await.unwrap();
         assert!(result.raw_hits.is_empty());
@@ -524,6 +602,7 @@ mod tests {
             target: MemorySearchTarget::Both,
             top_k: 5,
             threshold: None,
+            session_id: None,
         };
         let result = h.tools.semantic_search(params).await.unwrap();
         assert!(!result.raw_hits.is_empty());
@@ -553,6 +632,7 @@ mod tests {
             target: MemorySearchTarget::Raw,
             top_k: 5,
             threshold: Some(0.99),
+            session_id: None,
         };
         let result = h.tools.semantic_search(params).await.unwrap();
         assert!(result.raw_hits.is_empty());
@@ -589,6 +669,7 @@ mod tests {
                 target: MemorySearchTarget::Raw,
                 top_k: 100,
                 threshold: None,
+                session_id: None,
             })
             .await
             .unwrap();
