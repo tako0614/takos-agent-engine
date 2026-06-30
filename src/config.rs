@@ -93,6 +93,11 @@ impl EngineConfig {
                 "runtime.model_timeout_ms must be greater than 0".to_string(),
             ));
         }
+        if self.runtime.max_tool_calls_per_round == 0 {
+            return Err(EngineError::Configuration(
+                "runtime.max_tool_calls_per_round must be greater than 0".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -264,6 +269,14 @@ pub struct RuntimeConfig {
     pub tool_timeout_ms: u64,
     pub distillation_timeout_ms: u64,
     pub maintenance_batch_size: usize,
+    /// Hard cap on the number of tool calls processed in a single model round.
+    /// The model's tool-call list is influenced by injectable content (memory,
+    /// prior tool results, the user message), so an unbounded list could fan out
+    /// thousands of concurrent tasks / control-plane RPCs. Excess calls beyond
+    /// this cap are dropped for the round. `#[serde(default)]` keeps older
+    /// configs deserializing onto the default.
+    #[serde(default = "default_max_tool_calls_per_round")]
+    pub max_tool_calls_per_round: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -276,12 +289,17 @@ impl Default for RuntimeConfig {
             tool_timeout_ms: 30_000,
             distillation_timeout_ms: 15_000,
             maintenance_batch_size: 32,
+            max_tool_calls_per_round: default_max_tool_calls_per_round(),
         }
     }
 }
 
 pub(crate) const fn default_model_timeout_ms() -> u64 {
     60_000
+}
+
+pub(crate) const fn default_max_tool_calls_per_round() -> usize {
+    16
 }
 
 impl RuntimeConfig {

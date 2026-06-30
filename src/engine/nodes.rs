@@ -305,8 +305,24 @@ impl GraphNode for ExecuteToolsNode {
         deps: &EngineDeps,
         options: &ResolvedRunOptions,
     ) -> Result<NodeOutcome> {
-        let calls = std::mem::take(&mut state.pending_tool_calls);
+        let mut calls = std::mem::take(&mut state.pending_tool_calls);
         let round = state.tool_rounds_completed.saturating_add(1);
+
+        // Cap the per-round fan-out. The model's tool-call list is influenced by
+        // injectable content (memory, prior tool results, the user message), so
+        // an unbounded list could spawn thousands of concurrent tasks /
+        // control-plane RPCs. Drop the excess for this round. [S3]
+        let max_calls = config.runtime.max_tool_calls_per_round.max(1);
+        if calls.len() > max_calls {
+            tracing::warn!(
+                session_id = %state.session_id,
+                loop_id = %state.loop_id,
+                requested = calls.len(),
+                cap = max_calls,
+                "tool round exceeded max_tool_calls_per_round; dropping excess calls"
+            );
+            calls.truncate(max_calls);
+        }
 
         // Prepare every pending call up front (validation, arg clamping,
         // operation_key derivation). This stays sequential because it is
@@ -335,19 +351,23 @@ impl GraphNode for ExecuteToolsNode {
 
         // Fan out: every prepared call that does not have a cached raw node
         // is spawned with its own `tool_timeout` so a single slow tool can
-        // not consume the entire node budget. `tokio::spawn` ensures the
-        // tasks make progress in parallel on the multi-thread scheduler.
-        let mut handles: Vec<(usize, tokio::task::JoinHandle<TimedToolOutcome>)> = Vec::new();
+        // not consume the entire node budget. A `JoinSet` (not detached
+        // `tokio::spawn`) is used so that when the node-level timeout drops this
+        // future, the JoinSet drop ABORTS every still-running tool task —
+        // otherwise the node timeout could never reclaim model-driven work. [S3]
+        let mut join_set: tokio::task::JoinSet<(usize, TimedToolOutcome)> =
+            tokio::task::JoinSet::new();
         for prep in &prepared {
             if prep.cached.is_some() {
                 continue;
             }
+            let index = prep.index;
             let executor = deps.tool_executor.clone();
             let cancellation = options.cancellation_token.clone();
             let timeout = options.tool_timeout;
             let call = prep.call.clone();
             let tool_name = call.name.clone();
-            let handle = tokio::spawn(async move {
+            join_set.spawn(async move {
                 // Per-task cancellation race: if the run-wide token fires we
                 // surface `Cancelled` immediately instead of waiting for the
                 // tool to honor cancellation.
@@ -365,20 +385,20 @@ impl GraphNode for ExecuteToolsNode {
                 } else {
                     Box::pin(exec_future)
                 };
-                match tokio::time::timeout(timeout, cancel_aware).await {
+                let outcome = match tokio::time::timeout(timeout, cancel_aware).await {
                     Ok(result) => TimedToolOutcome::Completed(result),
                     Err(_) => TimedToolOutcome::TimedOut { tool_name },
-                }
+                };
+                (index, outcome)
             });
-            handles.push((prep.index, handle));
         }
 
         // Collect results into a sparse vector keyed by the prepared index so
         // we can recombine deterministically with the cached entries below.
         let mut completed: std::collections::HashMap<usize, Result<ToolCallResult>> =
             std::collections::HashMap::new();
-        for (index, handle) in handles {
-            let outcome = match handle.await {
+        while let Some(joined) = join_set.join_next().await {
+            let (index, outcome) = match joined {
                 Ok(value) => value,
                 Err(join_err) => {
                     // A panic / cancellation of the spawn task itself is a

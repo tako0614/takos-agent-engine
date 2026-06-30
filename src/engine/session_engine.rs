@@ -1004,6 +1004,64 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct BurstToolModelRunner {
+        calls: usize,
+    }
+
+    #[async_trait]
+    impl ModelRunner for BurstToolModelRunner {
+        async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
+            if input.tool_context.is_empty() {
+                // Opening pass: emit a burst of tool calls in one round.
+                let tool_calls = (0..self.calls)
+                    .map(|_| crate::model::runner::ToolCallRequest {
+                        name: "timeline_search".to_string(),
+                        arguments: serde_json::json!({ "limit": 1 }),
+                    })
+                    .collect();
+                Ok(ModelOutput {
+                    assistant_message: None,
+                    tool_calls,
+                    usage: None,
+                })
+            } else {
+                // After tools ran: finish with a plain answer.
+                Ok(ModelOutput {
+                    assistant_message: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                })
+            }
+        }
+    }
+
+    // S3 regression: a single model round emitting more tool calls than the
+    // configured cap must only execute `max_tool_calls_per_round` of them.
+    #[tokio::test]
+    async fn execute_tools_caps_calls_per_round() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(BurstToolModelRunner { calls: 10 });
+        let mut config = EngineConfig::default();
+        config.runtime.max_tool_calls_per_round = 3;
+        let response = run_turn(
+            &config,
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "burst".to_string(),
+                plan: None,
+            },
+        )
+        .await?;
+        assert_eq!(response.status, LoopStatus::Finished);
+        assert_eq!(
+            response.tool_results_count, 3,
+            "only the capped number of tool calls should execute in a round"
+        );
+        Ok(())
+    }
+
+    #[derive(Debug)]
     struct SleepyModelRunner {
         delay: Duration,
     }
