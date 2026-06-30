@@ -41,7 +41,6 @@ pub fn build_default_execution_graph() -> ExecutionGraph {
     }));
     graph.add_node(Arc::new(AssembleContextNode {
         id: "assemble_context",
-        reload_session: false,
     }));
     graph.add_node(Arc::new(ModelNode { id: "run_model" }));
 
@@ -67,7 +66,6 @@ pub fn build_default_execution_graph() -> ExecutionGraph {
     }));
     graph.add_node(Arc::new(AssembleContextNode {
         id: "reassemble_context",
-        reload_session: true,
     }));
     graph.add_node(Arc::new(ModelNode {
         id: "run_model_after_tools",

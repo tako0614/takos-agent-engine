@@ -189,7 +189,6 @@ impl GraphNode for ActivateMemoryNode {
 
 pub(crate) struct AssembleContextNode {
     pub(crate) id: &'static str,
-    pub(crate) reload_session: bool,
 }
 
 #[async_trait]
@@ -205,9 +204,11 @@ impl GraphNode for AssembleContextNode {
         deps: &EngineDeps,
         _options: &ResolvedRunOptions,
     ) -> Result<NodeOutcome> {
-        if self.reload_session {
-            state.recent_session = deps.repository.session_raw(&state.session_id).await?;
-        }
+        // No session reload here. `recent_session` is loaded once by
+        // `LoadSessionViewNode` and kept current in memory by
+        // `push_raw_node_into_state` as the user/tool/assistant nodes are
+        // persisted, so the post-tool re-assembly already sees them. Reloading
+        // the whole session from disk on every pass was redundant N+ reads. [C4]
         let context = deps.context_assembler().assemble(
             &config.context_budget,
             &config.system_prompt,
@@ -606,7 +607,9 @@ impl GraphNode for MarkSessionOverflowNode {
                 .await?;
         }
 
-        state.recent_session = deps.repository.session_raw(&state.session_id).await?;
+        // No session reload: nothing after this node reads `recent_session`
+        // (DistillCurrentLoopNode reads `raw_for_loop`, build_response does not
+        // touch it), so the end-of-turn full reload was pure overhead. [C4]
         Ok(NodeOutcome::Continue)
     }
 }
@@ -763,10 +766,14 @@ fn push_raw_node_into_state(state: &mut ExecutionState, node: RawNode) {
         state.tool_result_ids.push(node.id);
     }
     if !state.recent_session.iter().any(|entry| entry.id == node.id) {
-        state.recent_session.push(node);
-        state
+        // `recent_session` is maintained sorted by timestamp; insert at the
+        // correct position instead of re-sorting the whole (growing) vector on
+        // every push. Using `<=` keeps equal-timestamp ties in insertion order,
+        // matching the previous stable full sort. [C4]
+        let position = state
             .recent_session
-            .sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+            .partition_point(|entry| entry.timestamp <= node.timestamp);
+        state.recent_session.insert(position, node);
     }
 }
 
