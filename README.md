@@ -358,4 +358,4 @@ cargo run --example object_demo
 
 ## License
 
-AGPL-3.0-only
+MIT
