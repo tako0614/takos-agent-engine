@@ -403,6 +403,11 @@ impl GraphRunner {
         deps: &EngineDeps,
         options: &ResolvedRunOptions,
     ) -> Result<GraphRunResult> {
+        // `GraphRunner` is public and callers are not required to construct
+        // state through `run_turn_with_options`. Persist the selected profile
+        // before the first checkpoint so a direct external-context run can be
+        // resumed under the same graph semantics.
+        state.execution_profile = options.execution_profile;
         self.run_from_node(
             self.graph.start_node().to_string(),
             state,
@@ -478,7 +483,8 @@ impl GraphRunner {
         options: &ResolvedRunOptions,
     ) -> Result<GraphRunResult> {
         enum NodeExecutionResult {
-            Completed(std::result::Result<Result<NodeOutcome>, tokio::time::error::Elapsed>),
+            Completed(Result<NodeOutcome>),
+            TimedOut,
             Cancelled,
         }
 
@@ -521,33 +527,54 @@ impl GraphRunner {
                 "running execution node"
             );
 
-            let run_node = timeout(
-                options.timeout_for_class(node.runtime_class()),
-                node.run(state, config, deps, options),
-            );
-            let execution = if let Some(token) = &options.cancellation_token {
-                tokio::select! {
-                    () = token.cancelled() => NodeExecutionResult::Cancelled,
-                    result = run_node => NodeExecutionResult::Completed(result),
+            let runtime_class = node.runtime_class();
+            let node_future = node.run(state, config, deps, options);
+            let execution = if runtime_class == NodeRuntimeClass::ToolExecution {
+                // ExecuteToolsNode applies `tool_timeout` to every individual
+                // call. A second outer timeout with the same duration cuts a
+                // serial side-effect phase off part-way through and loses the
+                // completed results. The per-call timeouts, fan-out cap, graph
+                // step budget, and cancellation token keep this node bounded.
+                if let Some(token) = &options.cancellation_token {
+                    tokio::select! {
+                        () = token.cancelled() => NodeExecutionResult::Cancelled,
+                        result = node_future => NodeExecutionResult::Completed(result),
+                    }
+                } else {
+                    NodeExecutionResult::Completed(node_future.await)
                 }
             } else {
-                NodeExecutionResult::Completed(run_node.await)
+                let run_node = timeout(options.timeout_for_class(runtime_class), node_future);
+                if let Some(token) = &options.cancellation_token {
+                    tokio::select! {
+                        () = token.cancelled() => NodeExecutionResult::Cancelled,
+                        result = run_node => match result {
+                            Ok(outcome) => NodeExecutionResult::Completed(outcome),
+                            Err(_) => NodeExecutionResult::TimedOut,
+                        },
+                    }
+                } else {
+                    match run_node.await {
+                        Ok(outcome) => NodeExecutionResult::Completed(outcome),
+                        Err(_) => NodeExecutionResult::TimedOut,
+                    }
+                }
             };
 
             let outcome = match execution {
                 NodeExecutionResult::Cancelled
-                | NodeExecutionResult::Completed(Ok(Err(EngineError::Cancelled))) => {
+                | NodeExecutionResult::Completed(Err(EngineError::Cancelled)) => {
                     return self
                         .save_cancelled_checkpoint(&current_node, state, deps)
                         .await;
                 }
-                NodeExecutionResult::Completed(Ok(Ok(outcome))) => outcome,
-                NodeExecutionResult::Completed(Ok(Err(error))) => {
+                NodeExecutionResult::Completed(Ok(outcome)) => outcome,
+                NodeExecutionResult::Completed(Err(error)) => {
                     let failed = state.checkpoint(current_node.clone(), LoopStatus::Failed)?;
                     deps.loop_state_repository.save_checkpoint(failed).await?;
                     return Err(error);
                 }
-                NodeExecutionResult::Completed(Err(_)) => {
+                NodeExecutionResult::TimedOut => {
                     warn!(
                         session_id = %state.session_id,
                         loop_id = %state.loop_id,

@@ -255,14 +255,10 @@ pub struct RuntimeConfig {
     pub max_graph_steps: u32,
     pub max_tool_rounds: u32,
     pub node_timeout_ms: u64,
-    /// Per-node budget for the model-inference graph nodes. Model completions
-    /// routinely take far longer than a `Standard` node (the Takos wrapper's
-    /// outbound LLM HTTP client is budgeted 120s), so model nodes get their own runtime
-    /// class with this dedicated budget instead of the much smaller
-    /// `node_timeout_ms`. It MUST be `>=` the model HTTP client timeout,
-    /// otherwise the engine aborts in-flight completions before the transport
-    /// does. `#[serde(default)]` keeps older configs (written before this field
-    /// existed) deserializing cleanly onto the current default.
+    /// Per-node budget for model inference. Model completions routinely take
+    /// longer than a `Standard` node, so embedders can align this dedicated
+    /// timeout with their provider transport. `#[serde(default)]` keeps older
+    /// serialized configs compatible with the library default.
     #[serde(default = "default_model_timeout_ms")]
     pub model_timeout_ms: u64,
     pub tool_timeout_ms: u64,
@@ -285,11 +281,7 @@ impl Default for RuntimeConfig {
             max_tool_rounds: 8,
             node_timeout_ms: 10_000,
             model_timeout_ms: default_model_timeout_ms(),
-            // The Takos Worker tool contract allows long-running computer,
-            // MCP and sub-agent waits up to five minutes. Keep the engine just
-            // above that upstream budget so the Worker returns the canonical
-            // timeout/result instead of being pre-empted by the graph node.
-            tool_timeout_ms: 310_000,
+            tool_timeout_ms: 30_000,
             distillation_timeout_ms: 15_000,
             maintenance_batch_size: 32,
             max_tool_calls_per_round: default_max_tool_calls_per_round(),
@@ -298,9 +290,7 @@ impl Default for RuntimeConfig {
 }
 
 pub(crate) const fn default_model_timeout_ms() -> u64 {
-    // The wrapper transport uses 120s; leave a small outer margin for decode
-    // and cancellation propagation.
-    125_000
+    60_000
 }
 
 pub(crate) const fn default_max_tool_calls_per_round() -> usize {

@@ -210,9 +210,16 @@ impl GraphNode for AssembleExternalContextNode {
         &self,
         state: &mut ExecutionState,
         config: &EngineConfig,
-        _deps: &EngineDeps,
+        deps: &EngineDeps,
         _options: &ResolvedRunOptions,
     ) -> Result<NodeOutcome> {
+        state.conversation_history = trim_external_conversation_history(
+            &state.conversation_history,
+            config,
+            deps.token_estimator.as_ref(),
+            &state.user_message,
+            state.plan.as_deref(),
+        )?;
         state.assembled_context = Some(crate::engine::context_assembler::AssembledContext {
             system_prompt: config.system_prompt.clone(),
             ..crate::engine::context_assembler::AssembledContext::default()
@@ -239,12 +246,30 @@ impl GraphNode for AssembleContextNode {
         // `push_raw_node_into_state` as the user/tool/assistant nodes are
         // persisted, so the post-tool re-assembly already sees them. Reloading
         // the whole session from disk on every pass was redundant N+ reads. [C4]
+        // Current-loop tool exchanges are represented by native structured
+        // `turn_messages`. Do not flatten the same result through the legacy
+        // raw/session and summary buckets a second time.
+        let current_session_view = state
+            .recent_session
+            .iter()
+            .filter(|node| {
+                state.turn_messages.is_empty()
+                    || node.loop_id != Some(state.loop_id)
+                    || node.kind != RawNodeKind::ToolResult
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let model_tool_results = if state.turn_messages.is_empty() {
+            state.tool_results.as_slice()
+        } else {
+            &[]
+        };
         let context = deps.context_assembler().assemble(
             &config.context_budget,
             &config.system_prompt,
-            &state.recent_session,
+            &current_session_view,
             &state.activated_memory,
-            &state.tool_results,
+            model_tool_results,
         );
         state
             .session_window_ids
@@ -268,9 +293,8 @@ impl GraphNode for ModelNode {
     }
 
     fn runtime_class(&self) -> NodeRuntimeClass {
-        // Model nodes await the LLM; budget them with `model_timeout` (default
-        // 125s, above the Takos wrapper transport timeout) rather than the small
-        // `node_timeout`, which would force-abort any completion >10s.
+        // Model nodes await the LLM; budget them with the embedder-configured
+        // `model_timeout` rather than the much smaller standard-node timeout.
         NodeRuntimeClass::Model
     }
 
@@ -366,6 +390,12 @@ impl GraphNode for ExecuteToolsNode {
         // here so already-persisted tool results skip the tool invocation
         // entirely and parallel execution only fans out the real work.
         let mut prepared: Vec<PreparedToolCall> = Vec::with_capacity(calls.len());
+        let mut call_ids = state
+            .turn_messages
+            .iter()
+            .flat_map(|message| message.tool_calls.iter())
+            .filter_map(|call| call.id.clone())
+            .collect::<std::collections::HashSet<_>>();
         for (index, mut call) in calls.into_iter().enumerate() {
             if options.is_cancelled() {
                 return Err(EngineError::Cancelled);
@@ -381,6 +411,26 @@ impl GraphNode for ExecuteToolsNode {
             } else {
                 call
             };
+            let call_id = call.id.as_deref().ok_or_else(|| {
+                EngineError::Tool(format!("tool call {} has no correlation id", call.name))
+            })?;
+            if call_id.trim().is_empty() {
+                return Err(EngineError::Tool(format!(
+                    "tool call {} has an empty correlation id",
+                    call.name
+                )));
+            }
+            if !call_ids.insert(call_id.to_string()) {
+                return Err(EngineError::Tool(format!(
+                    "tool call {} reused correlation id {call_id}",
+                    call.name
+                )));
+            }
+            if call.name.trim().is_empty() {
+                return Err(EngineError::Tool(
+                    "tool call name must not be empty".to_string(),
+                ));
+            }
             let operation_key = tool_result_operation_key(state.loop_id, round, index, &call.name);
             let cached = if options.execution_profile.uses_local_memory() {
                 deps.repository
@@ -396,6 +446,89 @@ impl GraphNode for ExecuteToolsNode {
                 operation_key,
                 cached,
             });
+        }
+
+        // Reserve a coherent native transcript before invoking any tool. If
+        // the configured context cannot hold the call/result envelopes, a
+        // side-effecting tool must not run and leave an unreportable result.
+        let estimator = deps.token_estimator.as_ref();
+        let round_calls = prepared
+            .iter()
+            .map(|prep| prep.call.clone())
+            .collect::<Vec<_>>();
+        let used_turn_tokens = state
+            .turn_messages
+            .iter()
+            .map(|message| estimate_conversation_message(estimator, message))
+            .sum::<usize>();
+        let available_round_tokens = config
+            .context_budget
+            .reserve_tools
+            .checked_sub(used_turn_tokens)
+            .ok_or_else(|| {
+                EngineError::Configuration(
+                    "current tool transcript already exceeds context_budget.reserve_tools"
+                        .to_string(),
+                )
+            })?;
+        let minimum_result_tokens = round_calls
+            .iter()
+            .map(|call| minimum_tool_result_message_tokens(call, estimator))
+            .collect::<Result<Vec<_>>>()?;
+        let minimum_results_total = minimum_result_tokens.iter().sum::<usize>();
+        let minimum_assistant_turn = ConversationMessage {
+            role: ConversationRole::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            tool_calls: round_calls
+                .iter()
+                .cloned()
+                .map(|mut call| {
+                    call.arguments = serde_json::json!({});
+                    call
+                })
+                .collect(),
+        };
+        let minimum_assistant_tokens =
+            estimate_conversation_message(estimator, &minimum_assistant_turn);
+        let minimum_round_tokens = minimum_assistant_tokens.saturating_add(minimum_results_total);
+        if minimum_round_tokens > available_round_tokens {
+            return Err(EngineError::Configuration(format!(
+                "tool transcript needs at least {minimum_round_tokens} tokens but only \
+                 {available_round_tokens} remain in context_budget.reserve_tools"
+            )));
+        }
+
+        let variable_round_tokens = available_round_tokens - minimum_round_tokens;
+        let assistant_variable_tokens = variable_round_tokens / 3;
+        let assistant_call_budget =
+            minimum_assistant_tokens.saturating_add(assistant_variable_tokens / 2);
+        let model_round_calls =
+            bound_tool_calls_for_model(&round_calls, estimator, assistant_call_budget)?;
+        let mut assistant_turn = ConversationMessage {
+            role: ConversationRole::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            tool_calls: model_round_calls,
+        };
+        let assistant_content_budget = minimum_assistant_tokens
+            .saturating_add(assistant_variable_tokens)
+            .saturating_sub(estimate_conversation_message(estimator, &assistant_turn));
+        assistant_turn.content = truncate_text_to_token_budget(
+            state
+                .latest_model_output
+                .as_ref()
+                .and_then(|output| output.assistant_message.as_deref())
+                .unwrap_or_default(),
+            estimator,
+            assistant_content_budget,
+        );
+        let assistant_turn_tokens = estimate_conversation_message(estimator, &assistant_turn);
+        let available_result_tokens = available_round_tokens.saturating_sub(assistant_turn_tokens);
+        if available_result_tokens < minimum_results_total {
+            return Err(EngineError::Configuration(
+                "bounded assistant tool call left insufficient room for tool results".to_string(),
+            ));
         }
 
         // Adjacent read-only calls may overlap. Side-effecting/destructive
@@ -436,27 +569,11 @@ impl GraphNode for ExecuteToolsNode {
         // model rounds see them deterministically. Persistence still happens
         // sequentially because the raw-node insert path is not designed for
         // concurrent writers (operation_key uniqueness, sync_raw_indexes).
-        let round_calls = prepared
-            .iter()
-            .map(|prep| prep.call.clone())
-            .collect::<Vec<_>>();
         let mut round_results = Vec::with_capacity(prepared.len());
-        // `reserve_tools` bounds the model-visible result payload across the
-        // whole current turn, not just each individual RPC. Tool protocol
-        // envelopes and call arguments are outside this content budget.
-        let already_used_tool_tokens = state
-            .turn_messages
-            .iter()
-            .filter(|message| message.role == ConversationRole::Tool)
-            .map(|message| deps.token_estimator.estimate_text(&message.content))
-            .sum::<usize>();
-        let mut remaining_tool_tokens = config
-            .context_budget
-            .reserve_tools
-            .saturating_sub(already_used_tool_tokens);
+        let mut result_extra_tokens = available_result_tokens - minimum_results_total;
         let prepared_count = prepared.len();
         for (position, prep) in prepared.into_iter().enumerate() {
-            let (tool_result, existing_raw) = if let Some(existing) = prep.cached {
+            let (mut full_tool_result, existing_raw) = if let Some(existing) = prep.cached {
                 let tool_result = decode_tool_result_from_raw(&existing)?;
                 (tool_result, Some(existing))
             } else {
@@ -478,36 +595,49 @@ impl GraphNode for ExecuteToolsNode {
                 };
                 (result, None)
             };
+            // The request id/name are the engine's correlation authority. A
+            // third-party executor or a legacy cached payload must not inject
+            // a missing or mismatched id into the provider transcript.
+            full_tool_result.tool_call_id.clone_from(&prep.call.id);
+            full_tool_result.name.clone_from(&prep.call.name);
             let remaining_results = prepared_count.saturating_sub(position).max(1);
-            let mut result_allowance = remaining_tool_tokens / remaining_results;
-            let allowance_before = result_allowance;
-            let tool_result = clamp_tool_result_for_model(
-                tool_result,
-                deps.token_estimator.as_ref(),
+            let extra_allowance = result_extra_tokens / remaining_results;
+            let result_metadata_tokens =
+                minimum_result_tokens[position].saturating_sub(estimator.estimate_text("{}"));
+            let mut result_allowance = estimator
+                .estimate_text("{}")
+                .saturating_add(extra_allowance);
+            let bounded_tool_result = clamp_tool_result_for_model(
+                full_tool_result.clone(),
+                estimator,
                 &mut result_allowance,
             );
-            let used = allowance_before.saturating_sub(result_allowance);
-            remaining_tool_tokens = remaining_tool_tokens.saturating_sub(used);
-            let tool_result = if let Some(existing) = existing_raw {
+            let bounded_content_tokens =
+                estimator.estimate_text(&bounded_tool_result.content.to_string());
+            let used_extra = result_metadata_tokens
+                .saturating_add(bounded_content_tokens)
+                .saturating_sub(minimum_result_tokens[position]);
+            result_extra_tokens = result_extra_tokens.saturating_sub(used_extra);
+            if let Some(existing) = existing_raw {
                 // A pre-upgrade checkpoint may contain a larger cached raw
                 // result. Keep the persisted evidence intact but only expose
                 // the bounded representation to the model/transcript.
                 let mut state_raw = existing;
-                state_raw.content =
-                    RawContent::Json(serde_json::to_value(&tool_result).map_err(|err| {
+                state_raw.content = RawContent::Json(
+                    serde_json::to_value(&bounded_tool_result).map_err(|err| {
                         EngineError::Tool(format!(
                             "failed to encode bounded cached tool result: {err}"
                         ))
-                    })?);
+                    })?,
+                );
                 push_raw_node_into_state(state, state_raw);
-                tool_result
             } else if options.execution_profile.uses_local_memory() {
                 let raw = RawNode::json(
                     RawNodeKind::ToolResult,
                     Some(state.session_id),
                     Some(state.loop_id),
-                    format!("tool:{}", tool_result.name),
-                    serde_json::to_value(&tool_result).map_err(|err| {
+                    format!("tool:{}", full_tool_result.name),
+                    serde_json::to_value(&full_tool_result).map_err(|err| {
                         EngineError::Tool(format!("failed to encode tool result payload: {err}"))
                     })?,
                     TOOL_RESULT_IMPORTANCE,
@@ -515,38 +645,41 @@ impl GraphNode for ExecuteToolsNode {
                 )
                 .with_operation_key(prep.operation_key.clone());
                 let raw = persist_raw_node(deps, raw).await?;
-                let tool_result = decode_tool_result_from_raw(&raw)?;
-                push_raw_node_into_state(state, raw);
-                tool_result
-            } else {
-                tool_result
-            };
-            round_results.push(tool_result.clone());
-            state.tool_results.push(tool_result);
+                // The repository retains the complete result for retrieval and
+                // distillation. Only the in-flight model view is bounded.
+                let mut state_raw = raw;
+                state_raw.content = RawContent::Json(
+                    serde_json::to_value(&bounded_tool_result).map_err(|err| {
+                        EngineError::Tool(format!("failed to encode bounded tool result: {err}"))
+                    })?,
+                );
+                push_raw_node_into_state(state, state_raw);
+            }
+            round_results.push(bounded_tool_result.clone());
+            state.tool_results.push(bounded_tool_result);
         }
 
-        state.turn_messages.push(ConversationMessage {
-            role: ConversationRole::Assistant,
-            content: state
-                .latest_model_output
-                .as_ref()
-                .and_then(|output| output.assistant_message.clone())
-                .unwrap_or_default(),
-            tool_call_id: None,
-            tool_calls: round_calls,
-        });
+        state.turn_messages.push(assistant_turn);
         state
             .turn_messages
             .extend(round_results.into_iter().map(|result| ConversationMessage {
                 role: ConversationRole::Tool,
-                content: if result.content.as_str() == Some("") {
-                    String::new()
-                } else {
-                    result.content.to_string()
-                },
+                content: result.content.to_string(),
                 tool_call_id: result.tool_call_id,
                 tool_calls: Vec::new(),
             }));
+
+        let transcript_tokens = state
+            .turn_messages
+            .iter()
+            .map(|message| estimate_conversation_message(estimator, message))
+            .sum::<usize>();
+        if transcript_tokens > config.context_budget.reserve_tools {
+            return Err(EngineError::Configuration(format!(
+                "bounded tool transcript used {transcript_tokens} tokens, exceeding reserve_tools={} ",
+                config.context_budget.reserve_tools
+            )));
+        }
 
         state.tool_rounds_completed = round;
         Ok(NodeOutcome::Continue)
@@ -847,6 +980,217 @@ pub(crate) fn build_response(state: ExecutionState, result: GraphRunResult) -> S
     }
 }
 
+fn trim_external_conversation_history(
+    history: &[ConversationMessage],
+    config: &EngineConfig,
+    estimator: &dyn crate::engine::context_assembler::TokenEstimator,
+    user_message: &str,
+    plan: Option<&str>,
+) -> Result<Vec<ConversationMessage>> {
+    let system_tokens = estimator.estimate_text(&config.system_prompt);
+    let working_tokens = estimator
+        .estimate_text(user_message)
+        .saturating_add(plan.map_or(0, |value| estimator.estimate_text(value)));
+    let fixed_session_tokens = working_tokens
+        .saturating_sub(config.context_budget.reserve_working)
+        .saturating_add(system_tokens.saturating_sub(config.context_budget.reserve_system));
+    let available = config.context_budget.remaining_tokens();
+    if fixed_session_tokens > available {
+        return Err(EngineError::Configuration(
+            "external context fixed prompt exceeds the configured context budget".to_string(),
+        ));
+    }
+
+    let mut remaining = available.saturating_sub(fixed_session_tokens);
+    let groups = coherent_conversation_groups(history);
+    let mut selected = Vec::new();
+    for group in groups.into_iter().rev() {
+        let tokens = group
+            .iter()
+            .map(|message| estimate_conversation_message(estimator, message))
+            .sum::<usize>();
+        if tokens > remaining {
+            break;
+        }
+        remaining = remaining.saturating_sub(tokens);
+        selected.push(group);
+    }
+    selected.reverse();
+    Ok(selected.into_iter().flatten().collect())
+}
+
+fn coherent_conversation_groups(history: &[ConversationMessage]) -> Vec<Vec<ConversationMessage>> {
+    let mut groups = Vec::new();
+    let mut index = 0;
+    while index < history.len() {
+        let message = &history[index];
+        if message.role == ConversationRole::Tool {
+            index += 1;
+            continue;
+        }
+        if message.role != ConversationRole::Assistant || message.tool_calls.is_empty() {
+            groups.push(vec![message.clone()]);
+            index += 1;
+            continue;
+        }
+
+        let expected = message
+            .tool_calls
+            .iter()
+            .filter_map(|call| call.id.as_deref())
+            .filter(|id| !id.trim().is_empty())
+            .collect::<std::collections::HashSet<_>>();
+        let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut next = index + 1;
+        while next < history.len() && history[next].role == ConversationRole::Tool {
+            if let Some(id) = history[next].tool_call_id.as_deref() {
+                if expected.contains(id) && seen.insert(id) {
+                    results.push(history[next].clone());
+                }
+            }
+            next += 1;
+        }
+        let complete = expected.len() == message.tool_calls.len() && seen.len() == expected.len();
+        if complete {
+            let mut group = Vec::with_capacity(1 + results.len());
+            group.push(message.clone());
+            group.extend(results);
+            groups.push(group);
+        } else if !message.content.trim().is_empty() {
+            let mut plain = message.clone();
+            plain.tool_calls.clear();
+            groups.push(vec![plain]);
+        }
+        index = next;
+    }
+    groups
+}
+
+fn estimate_conversation_message(
+    estimator: &dyn crate::engine::context_assembler::TokenEstimator,
+    message: &ConversationMessage,
+) -> usize {
+    let mut tokens = estimator.estimate_text(&message.content);
+    if let Some(tool_call_id) = &message.tool_call_id {
+        tokens = tokens.saturating_add(estimator.estimate_text(tool_call_id));
+    }
+    for call in &message.tool_calls {
+        if let Some(id) = &call.id {
+            tokens = tokens.saturating_add(estimator.estimate_text(id));
+        }
+        tokens = tokens
+            .saturating_add(estimator.estimate_text(&call.name))
+            .saturating_add(estimator.estimate_text(&call.arguments.to_string()));
+    }
+    tokens.saturating_add(1)
+}
+
+fn bound_tool_calls_for_model(
+    calls: &[ToolCallRequest],
+    estimator: &dyn crate::engine::context_assembler::TokenEstimator,
+    budget: usize,
+) -> Result<Vec<ToolCallRequest>> {
+    let empty_arguments = serde_json::json!({});
+    let empty_argument_tokens = estimator.estimate_text(&empty_arguments.to_string());
+    let minimum_calls = calls
+        .iter()
+        .cloned()
+        .map(|mut call| {
+            call.arguments = empty_arguments.clone();
+            call
+        })
+        .collect::<Vec<_>>();
+    let minimum_message = ConversationMessage {
+        role: ConversationRole::Assistant,
+        content: String::new(),
+        tool_call_id: None,
+        tool_calls: minimum_calls,
+    };
+    let minimum_tokens = estimate_conversation_message(estimator, &minimum_message);
+    if minimum_tokens > budget {
+        return Err(EngineError::Configuration(format!(
+            "tool-call transcript needs at least {minimum_tokens} tokens but only {budget} were allocated"
+        )));
+    }
+
+    let mut extra_tokens = budget - minimum_tokens;
+    let mut bounded = Vec::with_capacity(calls.len());
+    for (index, mut call) in calls.iter().cloned().enumerate() {
+        let remaining_calls = calls.len().saturating_sub(index).max(1);
+        let extra_allowance = extra_tokens / remaining_calls;
+        let original_tokens = estimator.estimate_text(&call.arguments.to_string());
+        if original_tokens.saturating_sub(empty_argument_tokens) > extra_allowance {
+            let marker = serde_json::json!({ "truncated": true });
+            let marker_tokens = estimator.estimate_text(&marker.to_string());
+            call.arguments =
+                if marker_tokens.saturating_sub(empty_argument_tokens) <= extra_allowance {
+                    marker
+                } else {
+                    empty_arguments.clone()
+                };
+        }
+        let used_extra = estimator
+            .estimate_text(&call.arguments.to_string())
+            .saturating_sub(empty_argument_tokens);
+        extra_tokens = extra_tokens.saturating_sub(used_extra);
+        bounded.push(call);
+    }
+    Ok(bounded)
+}
+
+fn minimum_tool_result_message_tokens(
+    call: &ToolCallRequest,
+    estimator: &dyn crate::engine::context_assembler::TokenEstimator,
+) -> Result<usize> {
+    let call_id = call.id.clone().ok_or_else(|| {
+        EngineError::Tool(format!("tool call {} has no correlation id", call.name))
+    })?;
+    Ok(estimate_conversation_message(
+        estimator,
+        &ConversationMessage {
+            role: ConversationRole::Tool,
+            content: "{}".to_string(),
+            tool_call_id: Some(call_id),
+            tool_calls: Vec::new(),
+        },
+    ))
+}
+
+fn truncate_text_to_token_budget(
+    text: &str,
+    estimator: &dyn crate::engine::context_assembler::TokenEstimator,
+    budget: usize,
+) -> String {
+    if text.is_empty() || budget == 0 {
+        return String::new();
+    }
+    if estimator.estimate_text(text) <= budget {
+        return text.to_string();
+    }
+    let boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+        .collect::<Vec<_>>();
+    let mut low = 0;
+    let mut high = boundaries.len().saturating_sub(1);
+    let mut best = String::new();
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        let candidate = &text[..boundaries[middle]];
+        if estimator.estimate_text(candidate) <= budget {
+            best = candidate.to_string();
+            low = middle.saturating_add(1);
+        } else if middle == 0 {
+            break;
+        } else {
+            high = middle - 1;
+        }
+    }
+    best
+}
+
 fn to_model_input(
     session_id: SessionId,
     loop_id: LoopId,
@@ -971,17 +1315,26 @@ fn clamp_tool_result_for_model(
         return result;
     }
 
+    let minimum_payload = serde_json::json!({});
+    let minimum_payload_estimate = estimator.estimate_text(&minimum_payload.to_string());
+    if minimum_payload_estimate > *remaining_tokens {
+        // Callers reserve the minimum protocol envelope before executing the
+        // tool. Reaching this branch indicates an internal budgeting bug, but
+        // keep the provider transcript syntactically valid rather than
+        // emitting an empty non-JSON message.
+        result.content = minimum_payload;
+        *remaining_tokens = 0;
+        return result;
+    }
+
     let empty_marker = serde_json::json!({
         "truncated": true,
         "preview": "",
     });
     let empty_marker_estimate = estimator.estimate_text(&empty_marker.to_string());
     if empty_marker_estimate > *remaining_tokens {
-        // The protocol still needs one tool-result message for correlation.
-        // An empty string is the smallest valid payload when even the marker
-        // cannot fit (for example a caller configured reserve_tools = 0).
-        result.content = serde_json::Value::String(String::new());
-        *remaining_tokens = 0;
+        result.content = minimum_payload;
+        *remaining_tokens = remaining_tokens.saturating_sub(minimum_payload_estimate);
         return result;
     }
 
