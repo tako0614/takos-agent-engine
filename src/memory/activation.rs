@@ -491,7 +491,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            result.raw_nodes.iter().any(|ranked| ranked.node.id == active_id),
+            result
+                .raw_nodes
+                .iter()
+                .any(|ranked| ranked.node.id == active_id),
             "a within-deadline pushed-out node should pass the relaxed threshold"
         );
 

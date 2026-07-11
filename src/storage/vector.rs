@@ -16,7 +16,6 @@ use crate::storage::traits::{ScoredAbstractRef, ScoredRawRef, VectorIndex};
 ///   without a session id stay eligible. This keeps backfill-free data
 ///   reachable without leaking it across sessions when a session-scoped
 ///   search is requested.
-#[cfg(test)]
 fn entry_matches_session_filter(entry: Option<&SessionId>, query: Option<&SessionId>) -> bool {
     match (entry, query) {
         (None, None) => true,
@@ -26,21 +25,18 @@ fn entry_matches_session_filter(entry: Option<&SessionId>, query: Option<&Sessio
 }
 
 #[derive(Debug)]
-#[cfg(test)]
 struct InMemoryEmbeddingEntry {
     embedding: Embedding,
     session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Default)]
-#[cfg(test)]
 pub struct InMemoryVectorIndex {
     raw_embeddings: RwLock<HashMap<RawNodeId, InMemoryEmbeddingEntry>>,
     abstract_embeddings: RwLock<HashMap<AbstractNodeId, InMemoryEmbeddingEntry>>,
 }
 
 #[async_trait]
-#[cfg(test)]
 impl VectorIndex for InMemoryVectorIndex {
     async fn index_raw(&self, id: RawNodeId, embedding: Embedding) -> Result<()> {
         self.raw_embeddings.write().await.insert(

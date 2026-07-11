@@ -521,7 +521,9 @@ mod tests {
             .collect();
         for shard_path in shard_paths {
             let payload = std::fs::read_to_string(&shard_path).map_err(|err| {
-                crate::EngineError::Storage(format!("failed to read timeline shard for test: {err}"))
+                crate::EngineError::Storage(format!(
+                    "failed to read timeline shard for test: {err}"
+                ))
             })?;
             let mut shard: Value = serde_json::from_str(&payload).map_err(|err| {
                 crate::EngineError::Storage(format!(

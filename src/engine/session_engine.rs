@@ -15,7 +15,9 @@ use tracing::{info_span, instrument};
 use crate::config::EngineConfig;
 use crate::domain::{DistillationState, LoopStatus, RawNode};
 use crate::engine::context_assembler::{ContextAssembler, TokenEstimator};
-use crate::engine::execution_graph::{ExecutionState, GraphRunner, ResolvedRunOptions, RunOptions};
+use crate::engine::execution_graph::{
+    ExecutionProfile, ExecutionState, GraphRunner, ResolvedRunOptions, RunOptions,
+};
 use crate::engine::nodes::{build_response, persist_abstract_node};
 use crate::error::{EngineError, Result};
 use crate::ids::{LoopId, SessionId};
@@ -26,7 +28,16 @@ use crate::tools::executor::ToolExecutor;
 
 // Re-export the graph builder so the crate-facing API keeps serving it from
 // `crate::engine::session_engine::*` (lib.rs and engine/mod.rs re-export it).
-pub use crate::engine::graph_spec::build_default_execution_graph;
+pub use crate::engine::graph_spec::{
+    build_default_execution_graph, build_external_context_execution_graph,
+};
+
+fn graph_for_profile(profile: ExecutionProfile) -> crate::engine::execution_graph::ExecutionGraph {
+    match profile {
+        ExecutionProfile::MemoryAware => build_default_execution_graph(),
+        ExecutionProfile::ExternalContext => build_external_context_execution_graph(),
+    }
+}
 
 #[derive(Clone)]
 pub struct EngineDeps {
@@ -69,6 +80,10 @@ pub struct SessionResponse {
     pub loop_id: LoopId,
     pub status: LoopStatus,
     pub assistant_message: Option<String>,
+    /// Structured assistant tool-call/tool-result transcript produced during
+    /// this turn. Product wrappers can commit it with the terminal outcome;
+    /// the engine itself does not claim durable conversation authority.
+    pub turn_messages: Vec<crate::model::ConversationMessage>,
     pub activated_raw_count: usize,
     pub activated_abstract_count: usize,
     pub tool_results_count: usize,
@@ -115,10 +130,13 @@ pub async fn run_turn_with_options(
     tracing::Span::current().record("session_id", tracing::field::display(session_id));
     tracing::Span::current().record("loop_id", tracing::field::display(loop_id));
 
+    let conversation_history = options.conversation_history.clone();
     let resolved_options = ResolvedRunOptions::from_config(config, options);
-    let graph = Arc::new(build_default_execution_graph());
+    let graph = Arc::new(graph_for_profile(resolved_options.execution_profile));
     let runner = GraphRunner::new(graph);
     let mut state = ExecutionState::from_request(request, session_id, loop_id);
+    state.conversation_history = conversation_history;
+    state.execution_profile = resolved_options.execution_profile;
     let result = runner
         .run(&mut state, config, deps, &resolved_options)
         .await?;
@@ -154,7 +172,7 @@ pub async fn resume_loop(
         })?;
 
     let resolved_options = ResolvedRunOptions::from_config(config, options);
-    let graph = Arc::new(build_default_execution_graph());
+    let graph = Arc::new(graph_for_profile(resolved_options.execution_profile));
     let runner = GraphRunner::new(graph);
     let (state, result) = runner
         .resume(checkpoint, config, deps, &resolved_options)
@@ -254,32 +272,37 @@ pub async fn run_maintenance_pass(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use tokio::sync::Notify;
+    use tokio::sync::{Barrier, Notify};
     use tokio::time::sleep;
     use tokio_util::sync::CancellationToken;
 
     use crate::config::{EngineConfig, ToolsConfig};
     use crate::domain::{DistillationState, LoopStatus, RawNode, RawNodeKind};
     use crate::engine::execution_graph::{
-        ExecutionGraph, ExecutionState, GraphNode, GraphRunner, NodeOutcome, ResolvedRunOptions,
-        RunOptions, DEFAULT_EDGE,
+        ExecutionGraph, ExecutionProfile, ExecutionState, GraphNode, GraphRunner, NodeOutcome,
+        ResolvedRunOptions, RunOptions, DEFAULT_EDGE,
     };
     use crate::engine::nodes::{
         assistant_output_operation_key, prepare_tool_call_for_config, tool_result_operation_key,
         user_input_operation_key,
     };
     use crate::engine::session_engine::{
-        build_default_execution_graph, run_maintenance_pass, run_turn, run_turn_with_options,
-        EngineDeps, SessionRequest,
+        build_default_execution_graph, build_external_context_execution_graph,
+        run_maintenance_pass, run_turn, run_turn_with_options, EngineDeps, SessionRequest,
     };
     use crate::error::{EngineError, Result};
     use crate::ids::{AbstractNodeId, LoopId, SessionId};
     use crate::memory::scoring::DefaultScoringPolicy;
-    use crate::model::{ModelInput, ModelOutput, ModelRunner, ToolCallRequest};
+    use crate::memory::{DistillationInput, DistillationOutput, Distiller};
+    use crate::model::{
+        ConversationMessage, ConversationRole, Embedder, Embedding, ModelInput, ModelOutput,
+        ModelRunner, ToolCallRequest,
+    };
     use crate::storage::object_store::{
         FileObjectStore, ObjectGraphRepository, ObjectLoopStateRepository, ObjectNodeRepository,
         ObjectVectorIndex,
@@ -292,7 +315,9 @@ mod tests {
         TestHashEmbedder, TestRuleBasedModelRunner, TestSimpleDistiller,
         TestWhitespaceTokenEstimator,
     };
-    use crate::tools::executor::{DefaultToolExecutor, ToolCallResult, ToolExecutor};
+    use crate::tools::executor::{
+        DefaultToolExecutor, ToolCallResult, ToolExecutionKind, ToolExecutor,
+    };
     use crate::tools::memory_tools::{
         GraphSearchParams, MemorySearchParams, MemoryTools, TimelineSearchParams,
     };
@@ -536,6 +561,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_runner_rejects_resume_under_a_different_execution_profile() -> Result<()> {
+        let deps = build_demo_deps();
+        let graph = ExecutionGraph::new("pause");
+        let runner = GraphRunner::new(Arc::new(graph));
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let request = SessionRequest {
+            session_id: Some(session_id),
+            user_message: "paused external run".to_string(),
+            plan: None,
+        };
+        let mut state = ExecutionState::from_request(request, session_id, loop_id);
+        state.execution_profile = ExecutionProfile::ExternalContext;
+        let checkpoint = state.checkpoint("pause".to_string(), LoopStatus::Paused)?;
+
+        let err = runner
+            .resume(
+                checkpoint,
+                &EngineConfig::default(),
+                &deps,
+                &ResolvedRunOptions::from_config(&EngineConfig::default(), RunOptions::default()),
+            )
+            .await
+            .expect_err("a checkpoint cannot switch execution profiles");
+
+        assert!(
+            matches!(err, EngineError::Configuration(message) if message.contains("execution profile"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn graph_runner_respects_cancellation() -> Result<()> {
         let deps = build_demo_deps();
         let token = CancellationToken::new();
@@ -674,6 +731,7 @@ mod tests {
 
         let semantic = prepare_tool_call_for_config(
             ToolCallRequest {
+                id: None,
                 name: "semantic_search_memory".to_string(),
                 arguments: serde_json::json!({
                     "query": "topic",
@@ -695,6 +753,7 @@ mod tests {
 
         let graph = prepare_tool_call_for_config(
             ToolCallRequest {
+                id: None,
                 name: "graph_search_memory".to_string(),
                 arguments: serde_json::json!({
                     "start_node_id": AbstractNodeId::new().to_string(),
@@ -710,6 +769,7 @@ mod tests {
 
         let timeline = prepare_tool_call_for_config(
             ToolCallRequest {
+                id: None,
                 name: "timeline_search".to_string(),
                 arguments: serde_json::json!({
                     "limit": 100
@@ -741,6 +801,7 @@ mod tests {
 
         let timeline = prepare_tool_call_for_config(
             ToolCallRequest {
+                id: None,
                 name: "timeline_search".to_string(),
                 arguments: serde_json::json!({
                     "session_id": attacker_session.to_string(),
@@ -752,7 +813,10 @@ mod tests {
         )?;
         let params: TimelineSearchParams =
             serde_json::from_value(timeline.arguments).expect("timeline args should deserialize");
-        assert_eq!(params.session_id.as_deref(), Some(run_session.to_string().as_str()));
+        assert_eq!(
+            params.session_id.as_deref(),
+            Some(run_session.to_string().as_str())
+        );
         assert_ne!(
             params.session_id.as_deref(),
             Some(attacker_session.to_string().as_str())
@@ -883,7 +947,10 @@ mod tests {
             node.distillation_state = DistillationState::Undistilled;
             deps.repository.insert_raw(node.clone()).await?;
             deps.vector_index
-                .index_raw(node.id, deps.embedder.embed_text(&node.content_text()).await?)
+                .index_raw(
+                    node.id,
+                    deps.embedder.embed_text(&node.content_text()).await?,
+                )
                 .await?;
         }
 
@@ -893,11 +960,7 @@ mod tests {
         assert_eq!(first.processed_loops, 1);
         assert_eq!(first.new_abstract_nodes, 1);
         // Every raw of the loop is now distilled -> no pushed-out backlog left.
-        assert!(deps
-            .repository
-            .undistilled_raw(100, true)
-            .await?
-            .is_empty());
+        assert!(deps.repository.undistilled_raw(100, true).await?.is_empty());
 
         // A second pass finds nothing to do and is counted as neither created
         // nor skipped (no loops in the backlog at all).
@@ -995,6 +1058,7 @@ mod tests {
             Ok(ModelOutput {
                 assistant_message: None,
                 tool_calls: vec![crate::model::runner::ToolCallRequest {
+                    id: None,
                     name: "timeline_search".to_string(),
                     arguments: serde_json::json!({ "limit": 1 }),
                 }],
@@ -1008,6 +1072,118 @@ mod tests {
         calls: usize,
     }
 
+    #[derive(Debug, Default)]
+    struct TranscriptCheckingModelRunner {
+        calls: AtomicUsize,
+    }
+
+    #[derive(Debug, Default)]
+    struct MixedResultModelRunner {
+        calls: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct MixedResultToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for MixedResultToolExecutor {
+        fn execution_kind(&self, _call: &ToolCallRequest) -> ToolExecutionKind {
+            ToolExecutionKind::ReadOnly
+        }
+
+        async fn execute(&self, call: ToolCallRequest) -> Result<ToolCallResult> {
+            if call.name == "fails" {
+                return Err(EngineError::Tool("intentional failure".to_string()));
+            }
+            Ok(ToolCallResult {
+                tool_call_id: call.id,
+                name: call.name,
+                content: serde_json::json!({ "ok": true }),
+                summary: "succeeds output=ok".to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelRunner for MixedResultModelRunner {
+        async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(ModelOutput {
+                    assistant_message: None,
+                    tool_calls: vec![
+                        ToolCallRequest {
+                            id: Some("call-fail".to_string()),
+                            name: "fails".to_string(),
+                            arguments: serde_json::json!({}),
+                        },
+                        ToolCallRequest {
+                            id: Some("call-success".to_string()),
+                            name: "succeeds".to_string(),
+                            arguments: serde_json::json!({}),
+                        },
+                    ],
+                    usage: None,
+                });
+            }
+            let tool_messages = input
+                .turn_messages
+                .iter()
+                .filter(|message| message.role == ConversationRole::Tool)
+                .collect::<Vec<_>>();
+            assert_eq!(tool_messages.len(), 2);
+            assert!(tool_messages
+                .iter()
+                .any(|message| message.content.contains("intentional failure")));
+            assert!(tool_messages
+                .iter()
+                .any(|message| message.content.contains("\"ok\":true")));
+            Ok(ModelOutput {
+                assistant_message: Some("reconciled".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelRunner for TranscriptCheckingModelRunner {
+        async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert!(input.turn_messages.is_empty());
+                return Ok(ModelOutput {
+                    assistant_message: Some("I will inspect the timeline.".to_string()),
+                    tool_calls: vec![ToolCallRequest {
+                        id: Some("provider-call-1".to_string()),
+                        name: "timeline_search".to_string(),
+                        arguments: serde_json::json!({ "limit": 1 }),
+                    }],
+                    usage: None,
+                });
+            }
+
+            assert_eq!(input.turn_messages.len(), 2);
+            assert_eq!(input.turn_messages[0].role, ConversationRole::Assistant);
+            assert_eq!(
+                input.turn_messages[0].content,
+                "I will inspect the timeline."
+            );
+            assert_eq!(
+                input.turn_messages[0].tool_calls[0].id.as_deref(),
+                Some("provider-call-1")
+            );
+            assert_eq!(input.turn_messages[1].role, ConversationRole::Tool);
+            assert_eq!(
+                input.turn_messages[1].tool_call_id.as_deref(),
+                Some("provider-call-1")
+            );
+            Ok(ModelOutput {
+                assistant_message: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
     #[async_trait]
     impl ModelRunner for BurstToolModelRunner {
         async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
@@ -1015,6 +1191,7 @@ mod tests {
                 // Opening pass: emit a burst of tool calls in one round.
                 let tool_calls = (0..self.calls)
                     .map(|_| crate::model::runner::ToolCallRequest {
+                        id: None,
                         name: "timeline_search".to_string(),
                         arguments: serde_json::json!({ "limit": 1 }),
                     })
@@ -1058,6 +1235,579 @@ mod tests {
             response.tool_results_count, 3,
             "only the capped number of tool calls should execute in a round"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn engine_preserves_native_tool_call_correlation_for_followup_model() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(TranscriptCheckingModelRunner::default());
+        let response = run_turn(
+            &EngineConfig::default(),
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "inspect the timeline".to_string(),
+                plan: None,
+            },
+        )
+        .await?;
+
+        assert_eq!(response.status, LoopStatus::Finished);
+        assert_eq!(response.tool_results_count, 1);
+        assert_eq!(response.assistant_message.as_deref(), Some("done"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_parallel_tool_results_are_all_recorded_before_followup() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(MixedResultModelRunner::default());
+        deps.tool_executor = Arc::new(MixedResultToolExecutor);
+        let response = run_turn(
+            &EngineConfig::default(),
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "run both tools".to_string(),
+                plan: None,
+            },
+        )
+        .await?;
+
+        assert_eq!(response.status, LoopStatus::Finished);
+        assert_eq!(response.tool_results_count, 2);
+        assert_eq!(response.assistant_message.as_deref(), Some("reconciled"));
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct PolicyOrderModelRunner {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelRunner for PolicyOrderModelRunner {
+        async fn run(&self, _input: ModelInput) -> Result<ModelOutput> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(ModelOutput {
+                    assistant_message: None,
+                    tool_calls: ["read-1", "read-2", "write-1", "write-2"]
+                        .into_iter()
+                        .map(|name| ToolCallRequest {
+                            id: Some(format!("call-{name}")),
+                            name: name.to_string(),
+                            arguments: serde_json::json!({}),
+                        })
+                        .collect(),
+                    usage: None,
+                });
+            }
+            Ok(ModelOutput {
+                assistant_message: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PolicyOrderToolExecutor {
+        read_barrier: Arc<Barrier>,
+        active_reads: AtomicUsize,
+        write_order: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for PolicyOrderToolExecutor {
+        fn execution_kind(&self, call: &ToolCallRequest) -> ToolExecutionKind {
+            if call.name.starts_with("read-") {
+                ToolExecutionKind::ReadOnly
+            } else {
+                ToolExecutionKind::SideEffecting
+            }
+        }
+
+        async fn execute(&self, call: ToolCallRequest) -> Result<ToolCallResult> {
+            if call.name.starts_with("read-") {
+                self.active_reads.fetch_add(1, Ordering::SeqCst);
+                self.read_barrier.wait().await;
+                sleep(Duration::from_millis(10)).await;
+                self.active_reads.fetch_sub(1, Ordering::SeqCst);
+            } else {
+                assert_eq!(
+                    self.active_reads.load(Ordering::SeqCst),
+                    0,
+                    "a side-effecting call must not overlap a read-only phase",
+                );
+                self.write_order
+                    .lock()
+                    .expect("write order lock")
+                    .push(call.name.clone());
+            }
+            Ok(ToolCallResult {
+                tool_call_id: call.id,
+                name: call.name,
+                content: serde_json::json!({ "ok": true }),
+                summary: "ok".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_tools_overlap_but_side_effects_run_in_provider_order() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(PolicyOrderModelRunner::default());
+        let executor = Arc::new(PolicyOrderToolExecutor {
+            read_barrier: Arc::new(Barrier::new(2)),
+            active_reads: AtomicUsize::new(0),
+            write_order: Mutex::new(Vec::new()),
+        });
+        deps.tool_executor = executor.clone();
+
+        let response = run_turn(
+            &EngineConfig::default(),
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "read and then write".to_string(),
+                plan: None,
+            },
+        )
+        .await?;
+
+        assert_eq!(response.status, LoopStatus::Finished);
+        assert_eq!(response.tool_results_count, 4);
+        assert_eq!(
+            *executor.write_order.lock().expect("write order lock"),
+            vec!["write-1".to_string(), "write-2".to_string()],
+        );
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct ForbiddenExternalContextEmbedder;
+
+    #[async_trait]
+    impl Embedder for ForbiddenExternalContextEmbedder {
+        async fn embed_text(&self, _text: &str) -> Result<Embedding> {
+            panic!("external-context execution must not invoke the local embedder")
+        }
+    }
+
+    #[derive(Debug)]
+    struct ForbiddenExternalContextDistiller;
+
+    #[async_trait]
+    impl Distiller for ForbiddenExternalContextDistiller {
+        async fn distill(&self, _input: DistillationInput) -> Result<DistillationOutput> {
+            panic!("external-context execution must not invoke local distillation")
+        }
+    }
+
+    #[derive(Debug)]
+    struct ExternalContextToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for ExternalContextToolExecutor {
+        fn execution_kind(&self, _call: &ToolCallRequest) -> ToolExecutionKind {
+            ToolExecutionKind::ReadOnly
+        }
+
+        async fn execute(&self, call: ToolCallRequest) -> Result<ToolCallResult> {
+            assert_eq!(call.id.as_deref(), Some("provider-external-call"));
+            assert_eq!(call.name, "worker_tool");
+            Ok(ToolCallResult {
+                tool_call_id: call.id,
+                name: call.name,
+                content: serde_json::json!({ "source": "worker", "ok": true }),
+                summary: "worker tool result".to_string(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ExternalContextModelRunner {
+        calls: AtomicUsize,
+        expected_history: Vec<ConversationMessage>,
+    }
+
+    #[async_trait]
+    impl ModelRunner for ExternalContextModelRunner {
+        async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
+            assert_eq!(input.system_prompt, "worker-owned system prompt");
+            assert_eq!(input.conversation_history, self.expected_history);
+            assert_eq!(input.user_message, "current worker user message");
+            assert!(input.session_context.is_empty());
+            assert!(input.memory_context.is_empty());
+            assert!(input.tool_context.is_empty());
+
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert!(input.turn_messages.is_empty());
+                return Ok(ModelOutput {
+                    assistant_message: None,
+                    tool_calls: vec![ToolCallRequest {
+                        id: Some("provider-external-call".to_string()),
+                        name: "worker_tool".to_string(),
+                        arguments: serde_json::json!({ "query": "current" }),
+                    }],
+                    usage: None,
+                });
+            }
+
+            assert_eq!(input.turn_messages.len(), 2);
+            assert_eq!(input.turn_messages[0].role, ConversationRole::Assistant);
+            assert_eq!(input.turn_messages[0].tool_calls.len(), 1);
+            assert_eq!(
+                input.turn_messages[0].tool_calls[0].id.as_deref(),
+                Some("provider-external-call")
+            );
+            assert_eq!(input.turn_messages[1].role, ConversationRole::Tool);
+            assert_eq!(
+                input.turn_messages[1].tool_call_id.as_deref(),
+                Some("provider-external-call")
+            );
+            assert!(input.turn_messages[1]
+                .content
+                .contains("\"source\":\"worker\""));
+            Ok(ModelOutput {
+                assistant_message: Some("external context complete".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn external_context_profile_runs_only_the_bounded_model_tool_loop() -> Result<()> {
+        let history = vec![
+            ConversationMessage {
+                role: ConversationRole::User,
+                content: "durable history user".to_string(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+            ConversationMessage {
+                role: ConversationRole::Assistant,
+                content: "durable history assistant".to_string(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+        ];
+        let mut deps = build_demo_deps();
+        deps.embedder = Arc::new(ForbiddenExternalContextEmbedder);
+        deps.distiller = Arc::new(ForbiddenExternalContextDistiller);
+        deps.model_runner = Arc::new(ExternalContextModelRunner {
+            calls: AtomicUsize::new(0),
+            expected_history: history.clone(),
+        });
+        deps.tool_executor = Arc::new(ExternalContextToolExecutor);
+
+        let config = EngineConfig {
+            system_prompt: "worker-owned system prompt".to_string(),
+            ..EngineConfig::default()
+        };
+        let response = run_turn_with_options(
+            &config,
+            &deps,
+            SessionRequest {
+                session_id: Some(SessionId::new()),
+                user_message: "current worker user message".to_string(),
+                plan: None,
+            },
+            RunOptions {
+                execution_profile: ExecutionProfile::ExternalContext,
+                conversation_history: history,
+                ..RunOptions::default()
+            },
+        )
+        .await?;
+
+        assert_eq!(response.status, LoopStatus::Finished);
+        assert_eq!(
+            response.assistant_message.as_deref(),
+            Some("external context complete")
+        );
+        assert_eq!(response.activated_raw_count, 0);
+        assert_eq!(response.activated_abstract_count, 0);
+        assert_eq!(response.tool_results_count, 1);
+        assert_eq!(response.tool_rounds_completed, 1);
+        assert_eq!(response.turn_messages.len(), 2);
+        assert!(deps
+            .repository
+            .raw_for_loop(&response.loop_id)
+            .await?
+            .is_empty());
+        assert!(deps
+            .repository
+            .session_raw(&response.session_id)
+            .await?
+            .is_empty());
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct IntermediateOnlyModelRunner {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelRunner for IntermediateOnlyModelRunner {
+        async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(ModelOutput {
+                    assistant_message: Some("I will inspect before answering.".to_string()),
+                    tool_calls: vec![ToolCallRequest {
+                        id: Some("provider-external-call".to_string()),
+                        name: "worker_tool".to_string(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: None,
+                });
+            }
+            assert_eq!(
+                input.turn_messages[0].content,
+                "I will inspect before answering."
+            );
+            Ok(ModelOutput {
+                assistant_message: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn intermediate_assistant_tool_content_is_not_reused_as_the_final_answer() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(IntermediateOnlyModelRunner::default());
+        deps.tool_executor = Arc::new(ExternalContextToolExecutor);
+        let response = run_turn_with_options(
+            &EngineConfig::default(),
+            &deps,
+            SessionRequest {
+                session_id: Some(SessionId::new()),
+                user_message: "inspect".to_string(),
+                plan: None,
+            },
+            RunOptions {
+                execution_profile: ExecutionProfile::ExternalContext,
+                ..RunOptions::default()
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            response.turn_messages[0].content,
+            "I will inspect before answering."
+        );
+        assert_eq!(
+            response.assistant_message.as_deref(),
+            Some("No assistant message generated.")
+        );
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct ExternalMemoryNameCollisionModelRunner {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelRunner for ExternalMemoryNameCollisionModelRunner {
+        async fn run(&self, _input: ModelInput) -> Result<ModelOutput> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(ModelOutput {
+                    assistant_message: None,
+                    tool_calls: vec![ToolCallRequest {
+                        id: Some("remote-timeline-call".to_string()),
+                        name: "timeline_search".to_string(),
+                        arguments: serde_json::json!({
+                            "session_id": "remote-schema-session",
+                            "limit": 999,
+                            "custom": true,
+                        }),
+                    }],
+                    usage: None,
+                });
+            }
+            Ok(ModelOutput {
+                assistant_message: Some("remote collision preserved".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ExternalMemoryNameCollisionExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for ExternalMemoryNameCollisionExecutor {
+        async fn execute(&self, call: ToolCallRequest) -> Result<ToolCallResult> {
+            assert_eq!(call.id.as_deref(), Some("remote-timeline-call"));
+            assert_eq!(call.name, "timeline_search");
+            assert_eq!(
+                call.arguments,
+                serde_json::json!({
+                    "session_id": "remote-schema-session",
+                    "limit": 999,
+                    "custom": true,
+                })
+            );
+            Ok(ToolCallResult {
+                tool_call_id: call.id,
+                name: call.name,
+                content: serde_json::json!({ "ok": true }),
+                summary: "remote timeline".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn external_context_does_not_rewrite_remote_memory_tool_name_collisions() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(ExternalMemoryNameCollisionModelRunner::default());
+        deps.tool_executor = Arc::new(ExternalMemoryNameCollisionExecutor);
+        deps.embedder = Arc::new(ForbiddenExternalContextEmbedder);
+        deps.distiller = Arc::new(ForbiddenExternalContextDistiller);
+        let response = run_turn_with_options(
+            &EngineConfig::default(),
+            &deps,
+            SessionRequest {
+                session_id: Some(SessionId::new()),
+                user_message: "use remote timeline".to_string(),
+                plan: None,
+            },
+            RunOptions {
+                execution_profile: ExecutionProfile::ExternalContext,
+                ..RunOptions::default()
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            response.assistant_message.as_deref(),
+            Some("remote collision preserved")
+        );
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct CharacterTokenEstimator;
+
+    impl crate::engine::context_assembler::TokenEstimator for CharacterTokenEstimator {
+        fn estimate_text(&self, text: &str) -> usize {
+            text.chars().count()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct LargeMultiOutputModelRunner {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelRunner for LargeMultiOutputModelRunner {
+        async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(ModelOutput {
+                    assistant_message: None,
+                    tool_calls: ["large-a", "large-b"]
+                        .into_iter()
+                        .map(|name| ToolCallRequest {
+                            id: Some(format!("call-{name}")),
+                            name: name.to_string(),
+                            arguments: serde_json::json!({}),
+                        })
+                        .collect(),
+                    usage: None,
+                });
+            }
+
+            let results = input
+                .turn_messages
+                .iter()
+                .filter(|message| message.role == ConversationRole::Tool)
+                .collect::<Vec<_>>();
+            assert_eq!(results.len(), 2);
+            assert!(
+                results
+                    .iter()
+                    .map(|message| message.content.len())
+                    .sum::<usize>()
+                    <= 160
+            );
+            for result in results {
+                let content: serde_json::Value =
+                    serde_json::from_str(&result.content).expect("bounded result JSON");
+                assert_eq!(content["truncated"], true);
+                assert!(content["preview"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()));
+            }
+            Ok(ModelOutput {
+                assistant_message: Some("bounded".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct LargeMultiOutputToolExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for LargeMultiOutputToolExecutor {
+        fn execution_kind(&self, _call: &ToolCallRequest) -> ToolExecutionKind {
+            ToolExecutionKind::ReadOnly
+        }
+
+        async fn execute(&self, call: ToolCallRequest) -> Result<ToolCallResult> {
+            Ok(ToolCallResult {
+                tool_call_id: call.id,
+                name: call.name,
+                content: serde_json::json!({ "payload": "x".repeat(2_000) }),
+                summary: "large result".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_transcript_is_aggregate_bounded_in_both_profiles() -> Result<()> {
+        for execution_profile in [
+            ExecutionProfile::MemoryAware,
+            ExecutionProfile::ExternalContext,
+        ] {
+            let mut deps = build_demo_deps();
+            deps.model_runner = Arc::new(LargeMultiOutputModelRunner::default());
+            deps.tool_executor = Arc::new(LargeMultiOutputToolExecutor);
+            deps.token_estimator = Arc::new(CharacterTokenEstimator);
+            let mut config = EngineConfig::default();
+            config.context_budget.reserve_tools = 160;
+            let response = run_turn_with_options(
+                &config,
+                &deps,
+                SessionRequest {
+                    session_id: Some(SessionId::new()),
+                    user_message: "large tools".to_string(),
+                    plan: None,
+                },
+                RunOptions {
+                    execution_profile,
+                    ..RunOptions::default()
+                },
+            )
+            .await?;
+
+            let tool_payload_bytes = response
+                .turn_messages
+                .iter()
+                .filter(|message| message.role == ConversationRole::Tool)
+                .map(|message| message.content.len())
+                .sum::<usize>();
+            assert!(tool_payload_bytes <= config.context_budget.reserve_tools);
+        }
         Ok(())
     }
 
@@ -1147,6 +1897,13 @@ mod tests {
         let default = build_default_execution_graph();
         assert_eq!(default.node_count(), 14);
         assert_eq!(default.edge_count(), 15);
+    }
+
+    #[test]
+    fn external_context_graph_is_the_minimal_model_tool_loop() {
+        let graph = build_external_context_execution_graph();
+        assert_eq!(graph.node_count(), 5);
+        assert_eq!(graph.edge_count(), 6);
     }
 
     #[tokio::test]

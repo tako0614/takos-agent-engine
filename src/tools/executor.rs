@@ -11,13 +11,29 @@ use super::memory_tools::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub name: String,
     pub content: serde_json::Value,
     pub summary: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecutionKind {
+    /// Safe to overlap with adjacent read-only calls from the same model turn.
+    ReadOnly,
+    /// Must run alone and in provider order.
+    SideEffecting,
+}
+
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
+    /// Fail closed: executors must explicitly classify calls as read-only
+    /// before the engine will overlap them.
+    fn execution_kind(&self, _call: &ToolCallRequest) -> ToolExecutionKind {
+        ToolExecutionKind::SideEffecting
+    }
+
     async fn execute(&self, call: ToolCallRequest) -> Result<ToolCallResult>;
 }
 
@@ -34,7 +50,12 @@ impl DefaultToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for DefaultToolExecutor {
+    fn execution_kind(&self, _call: &ToolCallRequest) -> ToolExecutionKind {
+        ToolExecutionKind::ReadOnly
+    }
+
     async fn execute(&self, call: ToolCallRequest) -> Result<ToolCallResult> {
+        let tool_call_id = call.id.clone();
         match call.name.as_str() {
             "semantic_search_memory" => {
                 let params: MemorySearchParams =
@@ -48,6 +69,7 @@ impl ToolExecutor for DefaultToolExecutor {
                     result.abstract_hits.len()
                 );
                 Ok(ToolCallResult {
+                    tool_call_id,
                     name: call.name,
                     content: serde_json::to_value(&result).map_err(|err| {
                         EngineError::Tool(format!("failed to serialize result: {err}"))
@@ -63,6 +85,7 @@ impl ToolExecutor for DefaultToolExecutor {
                 let result = self.memory_tools.graph_search(params).await?;
                 let summary = format!("graph_search_memory hits={}", result.hits.len());
                 Ok(ToolCallResult {
+                    tool_call_id,
                     name: call.name,
                     content: serde_json::to_value(&result).map_err(|err| {
                         EngineError::Tool(format!("failed to serialize result: {err}"))
@@ -76,6 +99,7 @@ impl ToolExecutor for DefaultToolExecutor {
                 let result = self.memory_tools.provenance_lookup(params).await?;
                 let summary = format!("provenance_lookup raw_nodes={}", result.raw_nodes.len());
                 Ok(ToolCallResult {
+                    tool_call_id,
                     name: call.name,
                     content: serde_json::to_value(&result).map_err(|err| {
                         EngineError::Tool(format!("failed to serialize result: {err}"))
@@ -89,6 +113,7 @@ impl ToolExecutor for DefaultToolExecutor {
                 let result = self.memory_tools.timeline_search(params).await?;
                 let summary = format!("timeline_search raw_nodes={}", result.raw_nodes.len());
                 Ok(ToolCallResult {
+                    tool_call_id,
                     name: call.name,
                     content: serde_json::to_value(&result).map_err(|err| {
                         EngineError::Tool(format!("failed to serialize result: {err}"))
