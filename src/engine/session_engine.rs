@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tracing::{info_span, instrument};
 
 use crate::config::EngineConfig;
-use crate::domain::{DistillationState, LoopStatus, RawNode};
+use crate::domain::{DistillationState, LoopState, LoopStatus, RawNode};
 use crate::engine::context_assembler::{ContextAssembler, TokenEstimator};
 use crate::engine::execution_graph::{
     ExecutionProfile, ExecutionState, GraphRunner, ResolvedRunOptions, RunOptions,
@@ -181,6 +181,41 @@ pub async fn resume_loop(
     Ok(build_response(state, result))
 }
 
+/// Recover a `Running` checkpoint left by an interrupted process.
+///
+/// Model requests do not have a provider-neutral idempotency contract. A
+/// checkpoint written immediately before a model node therefore has an
+/// ambiguous billing/outcome boundary and is rejected instead of silently
+/// issuing a second completion. Tool nodes may be recovered when the embedding
+/// product supplies idempotent/fenced tool execution through `ToolExecutor`.
+///
+/// # Errors
+///
+/// Returns [`EngineError::RecoveryUnsafe`] for an interrupted model node,
+/// [`EngineError::LoopTerminated`] for a non-running checkpoint, and otherwise
+/// the same errors as [`GraphRunner::recover_running`].
+pub async fn recover_interrupted_loop_with_options(
+    config: &EngineConfig,
+    deps: &EngineDeps,
+    checkpoint: LoopState,
+    options: RunOptions,
+) -> Result<SessionResponse> {
+    config.validate()?;
+    if checkpoint.current_node.starts_with("run_model") {
+        return Err(EngineError::RecoveryUnsafe(format!(
+            "model node {} may already have produced a billable completion",
+            checkpoint.current_node
+        )));
+    }
+    let resolved_options = ResolvedRunOptions::from_config(config, options);
+    let graph = Arc::new(graph_for_profile(resolved_options.execution_profile));
+    let runner = GraphRunner::new(graph);
+    let (state, result) = runner
+        .recover_running(checkpoint, config, deps, &resolved_options)
+        .await?;
+    Ok(build_response(state, result))
+}
+
 /// # Errors
 ///
 /// Returns [`EngineError::Configuration`] when the config does not validate,
@@ -293,7 +328,8 @@ mod tests {
     };
     use crate::engine::session_engine::{
         build_default_execution_graph, build_external_context_execution_graph,
-        run_maintenance_pass, run_turn, run_turn_with_options, EngineDeps, SessionRequest,
+        recover_interrupted_loop_with_options, run_maintenance_pass, run_turn,
+        run_turn_with_options, EngineDeps, SessionRequest,
     };
     use crate::error::{EngineError, Result};
     use crate::ids::{AbstractNodeId, LoopId, SessionId};
@@ -1648,6 +1684,112 @@ mod tests {
 
         assert!(matches!(error, EngineError::Configuration(_)));
         assert_eq!(executor.completed.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Debug)]
+    struct RecoveredAfterToolModelRunner;
+
+    #[async_trait]
+    impl ModelRunner for RecoveredAfterToolModelRunner {
+        async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
+            assert_eq!(input.turn_messages.len(), 2);
+            assert_eq!(input.turn_messages[0].role, ConversationRole::Assistant);
+            assert_eq!(input.turn_messages[1].role, ConversationRole::Tool);
+            assert_eq!(
+                input.turn_messages[1].tool_call_id.as_deref(),
+                Some("recover-call")
+            );
+            Ok(ModelOutput {
+                assistant_message: Some("recovered safely".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_tool_node_recovers_from_its_pre_node_checkpoint() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(RecoveredAfterToolModelRunner);
+        let executor = Arc::new(CountingRemoteToolExecutor::default());
+        deps.tool_executor = executor.clone();
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let request = SessionRequest {
+            session_id: Some(session_id),
+            user_message: "recover the tool round".to_string(),
+            plan: None,
+        };
+        let tool_call = ToolCallRequest {
+            id: Some("recover-call".to_string()),
+            name: "remote-recover".to_string(),
+            arguments: serde_json::json!({ "value": 1 }),
+        };
+        let mut state = ExecutionState::from_request(request, session_id, loop_id);
+        state.execution_profile = ExecutionProfile::ExternalContext;
+        state.assembled_context = Some(crate::engine::context_assembler::AssembledContext {
+            system_prompt: EngineConfig::default().system_prompt,
+            ..crate::engine::context_assembler::AssembledContext::default()
+        });
+        state.pending_tool_calls = vec![tool_call.clone()];
+        state.latest_model_output = Some(ModelOutput {
+            assistant_message: Some("running a tool".to_string()),
+            tool_calls: vec![tool_call],
+            usage: None,
+        });
+        let checkpoint = state.checkpoint("execute_tools".to_string(), LoopStatus::Running)?;
+
+        let response = recover_interrupted_loop_with_options(
+            &EngineConfig::default(),
+            &deps,
+            checkpoint,
+            RunOptions {
+                execution_profile: ExecutionProfile::ExternalContext,
+                ..RunOptions::default()
+            },
+        )
+        .await?;
+
+        assert_eq!(response.status, LoopStatus::Finished);
+        assert_eq!(
+            response.assistant_message.as_deref(),
+            Some("recovered safely")
+        );
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupted_model_node_is_not_automatically_reissued() -> Result<()> {
+        let deps = build_demo_deps();
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let request = SessionRequest {
+            session_id: Some(session_id),
+            user_message: "do not double bill".to_string(),
+            plan: None,
+        };
+        let mut state = ExecutionState::from_request(request, session_id, loop_id);
+        state.execution_profile = ExecutionProfile::ExternalContext;
+        let checkpoint = state.checkpoint(
+            "run_model_external_context".to_string(),
+            LoopStatus::Running,
+        )?;
+
+        let error = recover_interrupted_loop_with_options(
+            &EngineConfig::default(),
+            &deps,
+            checkpoint,
+            RunOptions {
+                execution_profile: ExecutionProfile::ExternalContext,
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("ambiguous model completions must not be reissued");
+
+        assert!(matches!(error, EngineError::RecoveryUnsafe(_)));
+        Ok(())
     }
 
     #[derive(Debug)]

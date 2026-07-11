@@ -18,6 +18,8 @@ pub enum EngineError {
     Cancelled,
     #[error("loop checkpoint not found for session={session_id} loop={loop_id}")]
     CheckpointNotFound { session_id: String, loop_id: String },
+    #[error("interrupted loop cannot be recovered safely: {0}")]
+    RecoveryUnsafe(String),
     #[error("loop terminated with status {0:?}")]
     LoopTerminated(LoopStatus),
 }
@@ -72,6 +74,15 @@ mod tests {
     fn loop_terminated_display() {
         let err = EngineError::LoopTerminated(LoopStatus::Failed);
         assert_eq!(err.to_string(), "loop terminated with status Failed");
+    }
+
+    #[test]
+    fn recovery_unsafe_display() {
+        let err = EngineError::RecoveryUnsafe("model outcome is ambiguous".to_string());
+        assert_eq!(
+            err.to_string(),
+            "interrupted loop cannot be recovered safely: model outcome is ambiguous"
+        );
     }
 
     #[test]
