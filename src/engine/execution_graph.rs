@@ -446,6 +446,39 @@ impl GraphRunner {
         Ok((state, result))
     }
 
+    /// Recover a checkpoint left in `Running` state by an interrupted process.
+    /// The checkpoint is written immediately before its `current_node`, so the
+    /// node is intentionally executed again. Callers must only use this path
+    /// when that node's external effects are idempotent or otherwise fenced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::LoopTerminated`] unless the checkpoint is
+    /// `Running`, plus the same profile/configuration/runtime errors as
+    /// [`Self::resume`].
+    pub async fn recover_running(
+        &self,
+        checkpoint: LoopState,
+        config: &EngineConfig,
+        deps: &EngineDeps,
+        options: &ResolvedRunOptions,
+    ) -> Result<(ExecutionState, GraphRunResult)> {
+        if checkpoint.status != LoopStatus::Running {
+            return Err(EngineError::LoopTerminated(checkpoint.status));
+        }
+        let (mut state, current_node, _status) = ExecutionState::from_checkpoint(checkpoint)?;
+        if state.execution_profile != options.execution_profile {
+            return Err(EngineError::Configuration(format!(
+                "checkpoint execution profile {:?} does not match requested profile {:?}",
+                state.execution_profile, options.execution_profile
+            )));
+        }
+        let result = self
+            .run_from_node(current_node, &mut state, config, deps, options)
+            .await?;
+        Ok((state, result))
+    }
+
     async fn save_cancelled_checkpoint(
         &self,
         current_node: &str,
