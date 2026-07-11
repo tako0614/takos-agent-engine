@@ -8,4 +8,7 @@ pub mod runner;
 pub use embedding::{cosine_similarity, Embedder, Embedding, EmbeddingRef};
 #[cfg(feature = "openai-embeddings")]
 pub use openai_embedding::{OpenAiCompatibleEmbedder, OpenAiEmbeddingConfig};
-pub use runner::{ModelInput, ModelOutput, ModelRunner, ModelUsage, ToolCallRequest};
+pub use runner::{
+    ConversationMessage, ConversationRole, ModelInput, ModelOutput, ModelRunner, ModelUsage,
+    ToolCallRequest,
+};

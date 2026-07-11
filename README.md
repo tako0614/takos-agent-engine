@@ -8,6 +8,9 @@ trait 経由で注入する。 LLM agent を embed したい Rust service の中
 この repository が engine library の正本であり、 service wrapper は ecosystem checkout の `takos/containers/agent/` が持つ。 agent
 runtime の境界は [Agent Runtime](docs/agent-runtime.md) を参照。
 
+`run_turn` の既定値は後方互換な memory-aware graph です。durable history / memory / current-turn transcriptを外部productが
+正本として渡す場合は、`RunOptions.execution_profile = ExecutionProfile::ExternalContext`を明示してlean model/tool loopを使います。
+
 ## Install / Quickstart
 
 crate は `publish = false` で crates.io には公開していない。 consumer は git revision を pin して依存する。
@@ -54,6 +57,28 @@ cargo run --example object_demo
 │Activation│ │Assembly │ │Runner  │ │Executor │ │  Layer    │
 └─────────┘ └─────────┘ └────────┘ └─────────┘ └───────────┘
 ```
+
+## Execution profiles
+
+- `ExecutionProfile::MemoryAware` (default) — user/tool/assistantをRawNodeとしてingestし、session load、activation、context
+  assembly、overflow marking、distillationを行う。既存consumer向けの14-node graph。
+- `ExecutionProfile::ExternalContext` — durable history / memory selectionをproduct側が所有する場合の5-node lean graph。
+  engine-local ingest、session reload、embedding/activation、tool-result persistence、overflow、distillationを実行せず、system prompt、
+  `conversation_history`、current `user_message`、correlated `turn_messages`だけをmodelへ一度ずつ渡す。
+
+```rust
+use takos_agent_engine::{ExecutionProfile, RunOptions};
+
+let options = RunOptions {
+    execution_profile: ExecutionProfile::ExternalContext,
+    conversation_history: product_owned_history,
+    ..RunOptions::default()
+};
+```
+
+どちらのprofileも`GraphRunner`のgraph-step budget、tool-round budget、node/model/tool timeout、cancellation、checkpoint、
+native tool-call ID相関、`SessionResponse.turn_messages`を共有します。profileはcheckpointにも記録され、異なるprofileでresume
+できません。
 
 ## 二層記憶モデル
 
@@ -114,9 +139,12 @@ GraphRunner は side effect 境界の前後で checkpoint を取る。process re
 cancellation は状態を失わないために checkpoint へ残すが、現在の public resume API はそれらを自動再開しない。tool
 実行の途中で落ちても operation_key による idempotent persistence が二重書き込みを防ぐ。
 
+これはdurable `LoopStateRepository` をinjectしたlibrary consumer向けのprimitiveです。Takos product wrapperはcontainer-local
+checkpointをcrash recoveryの正本にせず、runごとにTakos Workerのcanonical historyからstatelessに再構築します。
+
 ## 実行フロー
 
-標準 agent は 14 node の bounded multi-step graph として実装されている。
+memory-aware標準 agent は 14 node の bounded multi-step graph として実装されている。
 
 ```
 ingest_user_input
@@ -225,9 +253,9 @@ LLM / embedding / distillation など vendor 依存の実装は crate 本体に�
 
 | Trait                 | 責務                                                                                     |
 | --------------------- | ---------------------------------------------------------------------------------------- |
-| `ModelRunner`         | LLM 呼び出し。input (system/session/memory/tool context) → output (message + tool calls) |
+| `ModelRunner`         | LLM 呼び出し。structured conversation/tool transcript + context → output (message + correlated tool calls) |
 | `Embedder`            | テキスト → embedding vector                                                              |
-| `ToolExecutor`        | tool call → result (name + content + summary)                                            |
+| `ToolExecutor`        | tool call → correlated result + read-only / side-effecting execution policy               |
 | `Distiller`           | raw nodes → AbstractNode + lifecycle updates                                             |
 | `ScoringPolicy`       | similarity / importance / decay / overflow → final score                                 |
 | `TokenEstimator`      | テキスト → token 数推定                                                                  |
@@ -273,11 +301,15 @@ open 時に canonical object から index を再整列し、不整合を自動�
 | `max_graph_steps`         | 64         | graph node の最大実行数         |
 | `max_tool_rounds`         | 8          | tool loop の最大往復数          |
 | `node_timeout_ms`         | 10,000     | 通常 node のタイムアウト        |
-| `tool_timeout_ms`         | 30,000     | tool 実行のタイムアウト         |
+| `model_timeout_ms`        | 125,000    | model node のタイムアウト       |
+| `tool_timeout_ms`         | 310,000    | tool 実行のタイムアウト         |
 | `distillation_timeout_ms` | 15,000     | 蒸留のタイムアウト              |
 | `maintenance_batch_size`  | 32         | maintenance pass のバッチサイズ |
 
-`RunOptions` で per-run の override と `CancellationToken` を渡せる。
+`RunOptions` で per-run の override、`CancellationToken`、product-owned `conversation_history`、`ExecutionProfile` を渡せる。
+model-visible tool-result contentはcurrent turn全体で`context_budget.reserve_tools`以内にaggregate clampされます。大きい結果は
+`{"truncated":true,"preview":"..."}`へ縮退し、tool-call IDとtool-result message自体は保持します。大きな完全出力を残すconsumerはtool側で
+artifact/object referenceを返してください。
 
 ## 設定
 
@@ -323,7 +355,8 @@ max_timeline_search_limit = 100
 max_graph_steps = 64
 max_tool_rounds = 8
 node_timeout_ms = 10000
-tool_timeout_ms = 30000
+model_timeout_ms = 125000
+tool_timeout_ms = 310000
 distillation_timeout_ms = 15000
 maintenance_batch_size = 32
 ```

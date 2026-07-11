@@ -1,113 +1,107 @@
 # Agent Runtime
 
-> このページでわかること: Takos agent runtime の実装境界と Rust container の役割。
+> Takos agent runtime の current 実装境界と Rust executor の役割。
 
-::: tip Status このページは current implementation の agent runtime 境界を説明します。Takos は control plane 全体を Rust
-に寄せる方針ではなく、container 内の agent 本体を Rust の正本にする方針です。 :::
+## Authority
 
-## 方針
+Takos Worker が product state の唯一の durable authority です。
 
-Takos の agent 系で `all Rust` と呼ぶ対象は、`takos-agent` container の内側です。
+- Thread message、summary、explicit memory、retrieval indexes
+- Run lifecycle、cancel、lease、usage、event
+- managed/custom skill catalog
+- static tool policy、installed Capsule / external MCP discovery、tool execution
 
-Rust runtime が持つもの:
+`takos-agent` container は run-scoped executor です。
 
-- agent loop orchestration
-- memory substrate
-- context assembly
-- managed skill runtime copy
-- skill catalog 合成と activation
-- prompt construction
-- local memory tools
-- model runner contract
+- bounded graph loop と cancellation
+- product から渡された structured history の model context 化
+- provider adapter と native tool-call / tool-result correlation
+- remote tool bridge
+- run-scoped checkpoint (product recovery authorityではない)
 
-Workers / control plane 側に残すもの:
+container の disk、pool slot、process lifetime は product state の正本ではありません。sleep / restart / 別 slotでも、次の
+run は Takos Worker の canonical history から再構築します。`takos-agent-engine` の file-backed repository と
+`resume_loop` は library consumer が durable backendをinjectする場合のprimitiveであり、Takos wrapperのcrash recoveryを
+意味しません。
 
-- run queue と run lifecycle 管理
-- auth / billing / space / thread / run state
-- remote tool catalog と tool 実行実体
-- custom skill の CRUD と永続化
-- executor-host の host process
+Takos wrapperは`ExecutionProfile::ExternalContext`を明示します。このprofileはengineのmemory-aware defaultを他consumer向けに
+残したまま、ingest / session reload / local embedding・activation / tool-result persistence / overflow / distillation nodeを通らない
+5-node model/tool loopを選びます。Worker history、current user、current-turn tool transcriptはそれぞれ専用のstructured fieldでmodelへ
+一度だけ渡し、engineのsession/memory string contextへ複製しません。graph/tool budget、timeout、cancellation、checkpoint、native
+tool-call ID、`SessionResponse.turn_messages`はmemory-aware profileと共通です。
 
-この分離が current canonical architecture です。
-
-`takos-agent-engine/` 単体の tool surface は `executor` と `memory_tools` です。\
-`skill_list` / `skill_get` / `skill_context` / `skill_catalog` / `skill_describe` の local intercept は `takos/containers/agent/`
-側の wrapper が担い、managed skill と custom skill の合成結果を返します。
-
-## 実行構成
+## Runtime flow
 
 ```text
-control-web / control-worker
-  -> executor-host
-     -> takos-agent container
-        -> takos-agent-engine (engine core / memory tools)
-        -> wrapper-side skill intercept
-        -> local memory tools
-        -> remote tool bridge
-             -> control RPC
-             -> Workers / platform tools
+Takos Worker
+  ├─ queue / Run state / lease / cancellation
+  ├─ canonical Thread history + retrieved context
+  └─ tool catalog + authorization + execution
+           │ run-scoped agent-control RPC
+           ▼
+takos-agent container
+  ├─ provider-neutral structured transcript
+  ├─ model adapter
+  ├─ bounded takos-agent-engine graph
+  └─ remote tool bridge
+           │ correlated tool_call_id
+           └──────────────► Takos Worker
 ```
 
-`takos-agent` は container の inside loop を責務として持ち、Takos product control state は control plane に委譲します。
+Takosumi は Capsule / ContainerService のdeploy、credential、Run / StateVersion / Output / audit boundaryを管理します。
+Takos固有のconversation、memory、skill、tool-control RPCはTakos Workerが所有します。
 
-## なぜこの分離か
+## Tool boundary
 
-- agent の思考ループは Rust で型安全に固定したい
-- tool backend と Takos product control state は Takos 本体の Workers/DB と密結合している
-- custom skill や remote tool を全部 Rust に移すと、product control plane の変更速度を落とす
-- 一方で container 内の loop を Rust にすれば、agent 自体の信頼性と再現性は高められる
+Model-visible catalogの正本はTakos Workerです。
 
-つまり、Takos における Rust 化の目的は「product control plane を全部書き換えること」ではなく、「agent container の本体を Rust
-の正本にすること」です。
+- Takos core toolは小さいstatic catalogとしてWorkerに残す
+- computer / Git / general file / storage / Web searchはinstalled Capsuleまたはexternal MCPからdiscoverする
+- `toolbox`が選択的catalogの入口になる
+- authorization、side-effect classification、idempotencyはWorkerで強制する
 
-## Local と Remote の境界
+engineの`semantic_search_memory` / `graph_search_memory` / `provenance_lookup` / `timeline_search`はmemory-aware library
+consumer向けprimitiveです。Takos production wrapperはexternal-context profileを使うため、これらをlocal product memory authorityや
+turn-local duplicate memoryとして実行しません。
 
-`takos-agent` は local tool と remote tool を明示的に分けます。
+## History and model protocol
 
-engine core local:
+Workerのconversation-history responseは`system` / `user` / `assistant` / `tool` role、`tool_calls`、`tool_call_id`を保持した
+provider-neutral transcriptへnormalizeします。current user messageは`SessionRequest`、過去履歴は`RunOptions`でengineへ渡し、
+重複させません。
 
-- `semantic_search_memory`
-- `graph_search_memory`
-- `provenance_lookup`
-- `timeline_search`
+Takosのcanonical `tool_calls` wire shapeはflatな`{ id, name, arguments }`です。OpenAIのnested `function` shapeはprovider
+adapterの内側だけで扱い、Rust history readerは保存済み移行データを読む期間に限ってlegacy nested shapeも受理します。
+history trimはassistant callと対応する全tool resultを不可分単位にし、orphan/incomplete exchangeをproviderへ送りません。
 
-wrapper-side local skill intercept:
+model adapterはassistant tool call IDを保存し、同じIDをtool execution、event、tool-result messageへ通します。parallel callを
+nameや配列順だけで相関しません。
 
-- `skill_list`
-- `skill_get`
-- `skill_context`
-- `skill_catalog`
-- `skill_describe`
+`ToolExecutor::execution_kind` は各callを read-only / side-effecting に分類します。engineは隣接するread-only callだけを
+parallel実行し、side-effecting callをprovider順のbarrierとして直列実行します。未分類はside-effecting扱いでfail-closedに
+します。
 
-`skill_*` 系は `takos-agent-engine` の公開 tool surface ではなく、`takos/containers/agent/` の wrapper が local intercept します。
+tool-result contentはmemory-aware / external-contextの両profileでcurrent turn合計`reserve_tools`以内にclampします。correlation
+messageは落とさず、超過内容をstructured previewへ変換します。完全なlarge outputはtool実装がartifact/objectへ保存し、modelには
+bounded preview/referenceを返す責務です。
 
-remote:
+## Source owners
 
-- repo / file / deploy / runtime / MCP / space などの platform tool
+- engine library: `takos-agent-engine/`
+- Takos executor wrapper: `takos/containers/agent/`
+- product agent-control RPC / durable state / tools: `takos/src/worker/`
+- Capsule / ContainerService deployment and OpenTofu Run ledger: `takosumi/`
 
-同名の tool がある場合は Rust container の local 実装が優先です。\
-remote tool の実体は control plane が持ち、Rust 側は catalog と execution を RPC で扱います。
+## Checks
 
-## Skill の正本
+```bash
+cd takos-agent-engine
+cargo test --features test-support
+cargo fmt --check
+cargo clippy --all-targets --features test-support -- -D warnings
 
-managed skill:
-
-- Rust 側は runtime copy を保持
-- TS control-plane 側も skill API / source 定義を持つため、完全な単一正本ではない
-
-custom skill:
-
-- control plane DB が正本
-- Rust 側は runtime ごとに catalog に取り込み、selection と prompt 化を行う
-
-このため、「agent core の振る舞い」は Rust 側に寄せつつ、space 管理データと custom skill 永続化は control plane
-正本のままです。
-
-## 実装上の source of truth
-
-- agent core: standalone `takos-agent-engine/` の `Cargo.toml` と `src/`
-- service wrapper: `takos/containers/agent/` は bootstrap / control RPC / prompt / skill wiring を担う wrapper
-- control RPC contract: Takos control plane 側の container-hosts / executor 間 RPC 定義
-
-Takos-agent の Rust 実装は、engine core を standalone `takos-agent-engine/` に置き、ecosystem checkout 側では
-`takos/containers/agent/` service wrapper から path dependency として参照する。
+cd ../takos/containers/agent
+cargo test --features mock-llm
+cargo fmt --check
+cargo clippy --all-targets --features mock-llm -- -D warnings
+```

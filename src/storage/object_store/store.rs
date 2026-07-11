@@ -707,7 +707,10 @@ impl FileObjectStore {
     }
 
     /// List the embedding shard files in `shard_dir` (`*.json`, sorted).
-    pub(super) async fn list_embedding_shard_paths(&self, shard_dir: &Path) -> Result<Vec<PathBuf>> {
+    pub(super) async fn list_embedding_shard_paths(
+        &self,
+        shard_dir: &Path,
+    ) -> Result<Vec<PathBuf>> {
         self.list_paths(shard_dir).await
     }
 

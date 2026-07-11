@@ -78,7 +78,9 @@ impl VectorIndex for ObjectVectorIndex {
             .await?;
         self.store
             .upsert_manifest_id_unlocked(
-                &self.store.abstract_embedding_shard_path(session_id.as_ref()),
+                &self
+                    .store
+                    .abstract_embedding_shard_path(session_id.as_ref()),
                 id,
             )
             .await?;

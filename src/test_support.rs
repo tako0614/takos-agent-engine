@@ -69,6 +69,7 @@ impl ModelRunner for TestRuleBasedModelRunner {
                 return Ok(ModelOutput {
                     assistant_message: None,
                     tool_calls: vec![ToolCallRequest {
+                        id: None,
                         name: "semantic_search_memory".to_string(),
                         arguments: json!({
                             "query": query.trim(),
@@ -84,6 +85,7 @@ impl ModelRunner for TestRuleBasedModelRunner {
                 return Ok(ModelOutput {
                     assistant_message: None,
                     tool_calls: vec![ToolCallRequest {
+                        id: None,
                         name: "timeline_search".to_string(),
                         arguments: json!({
                             "limit": 8

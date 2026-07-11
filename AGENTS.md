@@ -4,6 +4,11 @@
 扱い、 RawNode / AbstractNode の二層記憶を activation しながら checkpoint 可能な graph runtime で長期継続実行する。
 agent runtime の正本 library であり、 service wrapper は `takos/containers/agent/` が持つ。
 
+Takos product wrapperではTakos WorkerのThread / memoryをdurable authorityとし、engine repository/checkpointは1 run内の
+in-memory scratchとしてinjectするが、`ExecutionProfile::ExternalContext`によりnode/vector/graph memory pathは実行しない。
+checkpoint repositoryだけがbounded loopに使われる。file backend / `resume_loop`はdurable backendを選ぶ別consumer向けlibrary primitiveであり、
+Cloudflare Container diskをproduct recoveryの正本にしない。
+
 ## 責務
 
 ### 持つ

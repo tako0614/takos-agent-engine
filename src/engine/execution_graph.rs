@@ -13,7 +13,7 @@ use crate::domain::{LoopState, LoopStatus, RawNode};
 use crate::error::{EngineError, Result};
 use crate::ids::{AbstractNodeId, LoopId, RawNodeId, SessionId};
 use crate::memory::{ActivatedMemory, ActivationQuery};
-use crate::model::{Embedding, ModelOutput, ToolCallRequest};
+use crate::model::{ConversationMessage, Embedding, ModelOutput, ToolCallRequest};
 use crate::tools::executor::ToolCallResult;
 
 use super::context_assembler::AssembledContext;
@@ -21,12 +21,39 @@ use super::session_engine::{EngineDeps, SessionRequest};
 
 pub const DEFAULT_EDGE: &str = "__default__";
 
+/// Selects which execution topology and local-state behaviour the engine uses.
+///
+/// [`Self::MemoryAware`] preserves the original engine behaviour: the graph
+/// ingests the turn into the injected repositories, activates memory, manages
+/// the session window, and distills the completed loop. [`Self::ExternalContext`]
+/// is for product wrappers that already own durable history, memory selection,
+/// and the current-turn transcript. It runs only the bounded model/tool loop and
+/// never writes turn data into the engine's node/vector/graph repositories.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionProfile {
+    #[default]
+    MemoryAware,
+    ExternalContext,
+}
+
+impl ExecutionProfile {
+    #[must_use]
+    pub const fn uses_local_memory(self) -> bool {
+        matches!(self, Self::MemoryAware)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionState {
     pub session_id: SessionId,
     pub loop_id: LoopId,
     pub user_message: String,
     pub plan: Option<String>,
+    #[serde(default)]
+    pub conversation_history: Vec<ConversationMessage>,
+    #[serde(default)]
+    pub turn_messages: Vec<ConversationMessage>,
     pub recent_session: Vec<RawNode>,
     pub activation_query: Option<ActivationQuery>,
     pub query_embedding: Option<Embedding>,
@@ -45,6 +72,48 @@ pub struct ExecutionState {
     pub tool_rounds_completed: u32,
     pub model_invocations: u32,
     pub last_completed_node: Option<String>,
+    /// Stored in checkpoints so a paused loop cannot accidentally resume under
+    /// a graph with different local-memory semantics. Older checkpoints omit
+    /// this field and therefore retain the memory-aware default.
+    #[serde(default)]
+    pub execution_profile: ExecutionProfile,
+}
+
+#[cfg(test)]
+mod checkpoint_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn pre_external_context_checkpoint_defaults_new_transcript_fields() -> Result<()> {
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let state = ExecutionState::from_request(
+            SessionRequest {
+                session_id: Some(session_id),
+                user_message: "legacy turn".to_string(),
+                plan: None,
+            },
+            session_id,
+            loop_id,
+        );
+        let mut checkpoint = state.checkpoint("run_model".to_string(), LoopStatus::Paused)?;
+        let object = checkpoint
+            .state_json
+            .as_object_mut()
+            .expect("execution state checkpoint must be an object");
+        object.remove("conversation_history");
+        object.remove("turn_messages");
+        object.remove("execution_profile");
+
+        let (restored, current_node, status) = ExecutionState::from_checkpoint(checkpoint)?;
+
+        assert!(restored.conversation_history.is_empty());
+        assert!(restored.turn_messages.is_empty());
+        assert_eq!(restored.execution_profile, ExecutionProfile::MemoryAware);
+        assert_eq!(current_node, "run_model");
+        assert_eq!(status, LoopStatus::Paused);
+        Ok(())
+    }
 }
 
 impl ExecutionState {
@@ -55,6 +124,8 @@ impl ExecutionState {
             loop_id,
             user_message: request.user_message,
             plan: request.plan,
+            conversation_history: Vec::new(),
+            turn_messages: Vec::new(),
             recent_session: Vec::new(),
             activation_query: None,
             query_embedding: None,
@@ -73,6 +144,7 @@ impl ExecutionState {
             tool_rounds_completed: 0,
             model_invocations: 0,
             last_completed_node: None,
+            execution_profile: ExecutionProfile::default(),
         }
     }
 
@@ -144,6 +216,13 @@ pub struct RunOptions {
     pub distillation_timeout: Option<Duration>,
     pub maintenance_batch_size: Option<usize>,
     pub cancellation_token: Option<CancellationToken>,
+    /// Product-owned durable history transported into the model context. It
+    /// is deliberately an execution option so the stable `SessionRequest`
+    /// surface remains a single-turn request and existing embedders can opt in.
+    pub conversation_history: Vec<ConversationMessage>,
+    /// The memory-aware graph remains the library default. Product runtimes
+    /// that supply canonical external context must opt into the lean profile.
+    pub execution_profile: ExecutionProfile,
 }
 
 #[derive(Clone)]
@@ -156,6 +235,7 @@ pub struct ResolvedRunOptions {
     pub distillation_timeout: Duration,
     pub maintenance_batch_size: usize,
     pub cancellation_token: Option<CancellationToken>,
+    pub execution_profile: ExecutionProfile,
 }
 
 impl ResolvedRunOptions {
@@ -184,6 +264,7 @@ impl ResolvedRunOptions {
                 .maintenance_batch_size
                 .unwrap_or(config.runtime.maintenance_batch_size),
             cancellation_token: options.cancellation_token,
+            execution_profile: options.execution_profile,
         }
     }
 
@@ -348,6 +429,12 @@ impl GraphRunner {
             return Err(EngineError::LoopTerminated(checkpoint.status));
         }
         let (mut state, current_node, _status) = ExecutionState::from_checkpoint(checkpoint)?;
+        if state.execution_profile != options.execution_profile {
+            return Err(EngineError::Configuration(format!(
+                "checkpoint execution profile {:?} does not match requested profile {:?}",
+                state.execution_profile, options.execution_profile
+            )));
+        }
         let result = self
             .run_from_node(current_node, &mut state, config, deps, options)
             .await?;

@@ -1,22 +1,22 @@
 //! Construction of the agent's execution graph.
 //!
-//! The engine runs a single linear pipeline: ingest the user input, load the
-//! session view, build an activation query, activate memory, assemble context,
-//! and call the model. When the model emits tool calls the graph branches into
-//! `execute_tools` and runs a second build/activate/assemble/model pass before
-//! persisting. The tail marks session overflow and distills the loop. The node
-//! implementations these builders register live in
+//! The memory-aware default ingests the user input, activates local memory,
+//! assembles context, and distills the completed loop. The external-context
+//! profile skips those local-memory nodes and runs a minimal model/tool loop for
+//! wrappers that supply canonical durable context. The node implementations
+//! these builders register live in
 //! [`nodes`](crate::engine::nodes).
 
 use std::sync::Arc;
 
 use crate::engine::execution_graph::{ExecutionGraph, DEFAULT_EDGE};
 use crate::engine::nodes::{
-    ActivateMemoryNode, AssembleContextNode, BuildActivationQueryNode, DistillCurrentLoopNode,
-    ExecuteToolsNode, IngestUserInputNode, LoadSessionViewNode, MarkSessionOverflowNode, ModelNode,
-    PersistAssistantOutputNode, DISTILL_CURRENT_LOOP_NODE, EXECUTE_TOOLS_NODE,
-    INGEST_USER_INPUT_NODE, LOAD_SESSION_VIEW_NODE, MARK_SESSION_OVERFLOW_NODE,
-    PERSIST_ASSISTANT_OUTPUT_NODE,
+    ActivateMemoryNode, AssembleContextNode, AssembleExternalContextNode, BuildActivationQueryNode,
+    DistillCurrentLoopNode, ExecuteToolsNode, FinalizeExternalResponseNode, IngestUserInputNode,
+    LoadSessionViewNode, MarkSessionOverflowNode, ModelNode, PersistAssistantOutputNode,
+    ASSEMBLE_EXTERNAL_CONTEXT_NODE, DISTILL_CURRENT_LOOP_NODE, EXECUTE_TOOLS_NODE,
+    FINALIZE_EXTERNAL_RESPONSE_NODE, INGEST_USER_INPUT_NODE, LOAD_SESSION_VIEW_NODE,
+    MARK_SESSION_OVERFLOW_NODE, PERSIST_ASSISTANT_OUTPUT_NODE,
 };
 
 /// Build the agent's execution graph.
@@ -108,6 +108,40 @@ pub fn build_default_execution_graph() -> ExecutionGraph {
         MARK_SESSION_OVERFLOW_NODE,
         DEFAULT_EDGE,
         DISTILL_CURRENT_LOOP_NODE,
+    );
+
+    graph
+}
+
+/// Build the lean graph for wrappers that own canonical history and memory.
+///
+/// This topology intentionally contains no ingest, local session load, memory
+/// activation, context-window overflow, assistant persistence, or distillation
+/// nodes. It only prepares the external-context model input, runs the bounded
+/// model/tool loop, and returns the structured current-turn transcript.
+#[must_use]
+pub fn build_external_context_execution_graph() -> ExecutionGraph {
+    const RUN_MODEL: &str = "run_model_external_context";
+    const RUN_MODEL_AFTER_TOOLS: &str = "run_model_external_context_after_tools";
+
+    let mut graph = ExecutionGraph::new(ASSEMBLE_EXTERNAL_CONTEXT_NODE);
+    graph.add_node(Arc::new(AssembleExternalContextNode));
+    graph.add_node(Arc::new(ModelNode { id: RUN_MODEL }));
+    graph.add_node(Arc::new(ExecuteToolsNode));
+    graph.add_node(Arc::new(ModelNode {
+        id: RUN_MODEL_AFTER_TOOLS,
+    }));
+    graph.add_node(Arc::new(FinalizeExternalResponseNode));
+
+    graph.add_edge(ASSEMBLE_EXTERNAL_CONTEXT_NODE, DEFAULT_EDGE, RUN_MODEL);
+    graph.add_edge(RUN_MODEL, "needs_tools", EXECUTE_TOOLS_NODE);
+    graph.add_edge(RUN_MODEL, DEFAULT_EDGE, FINALIZE_EXTERNAL_RESPONSE_NODE);
+    graph.add_edge(EXECUTE_TOOLS_NODE, DEFAULT_EDGE, RUN_MODEL_AFTER_TOOLS);
+    graph.add_edge(RUN_MODEL_AFTER_TOOLS, "needs_tools", EXECUTE_TOOLS_NODE);
+    graph.add_edge(
+        RUN_MODEL_AFTER_TOOLS,
+        DEFAULT_EDGE,
+        FINALIZE_EXTERNAL_RESPONSE_NODE,
     );
 
     graph

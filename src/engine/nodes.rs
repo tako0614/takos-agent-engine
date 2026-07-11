@@ -21,9 +21,9 @@ use crate::engine::session_engine::{EngineDeps, SessionResponse};
 use crate::error::{EngineError, Result};
 use crate::ids::{LoopId, SessionId};
 use crate::memory::{ActivationQuery, DistillationInput};
-use crate::model::{ModelInput, ToolCallRequest};
+use crate::model::{ConversationMessage, ConversationRole, ModelInput, ToolCallRequest};
 use crate::storage::RawLifecyclePatch;
-use crate::tools::executor::ToolCallResult;
+use crate::tools::executor::{ToolCallResult, ToolExecutionKind};
 use crate::tools::memory_tools::{
     GraphSearchParams, MemorySearchParams, MemoryToolBounds, TimelineSearchParams,
 };
@@ -39,6 +39,8 @@ pub(crate) const EXECUTE_TOOLS_NODE: &str = "execute_tools";
 pub(crate) const PERSIST_ASSISTANT_OUTPUT_NODE: &str = "persist_assistant_output";
 pub(crate) const MARK_SESSION_OVERFLOW_NODE: &str = "mark_session_overflow";
 pub(crate) const DISTILL_CURRENT_LOOP_NODE: &str = "distill_current_loop";
+pub(crate) const ASSEMBLE_EXTERNAL_CONTEXT_NODE: &str = "assemble_external_context";
+pub(crate) const FINALIZE_EXTERNAL_RESPONSE_NODE: &str = "finalize_external_response";
 
 // Per-kind importance priors assigned to raw nodes at creation time.
 //
@@ -191,6 +193,34 @@ pub(crate) struct AssembleContextNode {
     pub(crate) id: &'static str,
 }
 
+/// Builds the deliberately empty engine-owned context used by wrappers that
+/// transport canonical durable history themselves. The model still receives
+/// the configured system prompt, product-owned `conversation_history`, current
+/// `user_message`, and the exact structured `turn_messages`; none of those are
+/// copied through the legacy session/memory string buckets.
+pub(crate) struct AssembleExternalContextNode;
+
+#[async_trait]
+impl GraphNode for AssembleExternalContextNode {
+    fn id(&self) -> &'static str {
+        ASSEMBLE_EXTERNAL_CONTEXT_NODE
+    }
+
+    async fn run(
+        &self,
+        state: &mut ExecutionState,
+        config: &EngineConfig,
+        _deps: &EngineDeps,
+        _options: &ResolvedRunOptions,
+    ) -> Result<NodeOutcome> {
+        state.assembled_context = Some(crate::engine::context_assembler::AssembledContext {
+            system_prompt: config.system_prompt.clone(),
+            ..crate::engine::context_assembler::AssembledContext::default()
+        });
+        Ok(NodeOutcome::Continue)
+    }
+}
+
 #[async_trait]
 impl GraphNode for AssembleContextNode {
     fn id(&self) -> &'static str {
@@ -239,7 +269,7 @@ impl GraphNode for ModelNode {
 
     fn runtime_class(&self) -> NodeRuntimeClass {
         // Model nodes await the LLM; budget them with `model_timeout` (default
-        // 60s, >= the model HTTP client timeout) rather than the small
+        // 125s, above the Takos wrapper transport timeout) rather than the small
         // `node_timeout`, which would force-abort any completion >10s.
         NodeRuntimeClass::Model
     }
@@ -262,13 +292,12 @@ impl GraphNode for ModelNode {
                 &state.user_message,
                 state.plan.clone(),
                 context,
+                &state.conversation_history,
+                &state.turn_messages,
             ))
             .await?;
         state.model_invocations = state.model_invocations.saturating_add(1);
         state.pending_tool_calls.clone_from(&output.tool_calls);
-        if let Some(message) = &output.assistant_message {
-            state.assistant_message = Some(message.clone());
-        }
         state.latest_model_output = Some(output);
 
         if !state.pending_tool_calls.is_empty()
@@ -277,11 +306,16 @@ impl GraphNode for ModelNode {
             return Ok(NodeOutcome::Branch("needs_tools".to_string()));
         }
 
-        if !state.pending_tool_calls.is_empty() && state.assistant_message.is_none() {
+        if !state.pending_tool_calls.is_empty() {
             state.assistant_message = Some(format!(
                 "Tool round limit reached after {} rounds without a final assistant message.",
                 options.max_tool_rounds
             ));
+        } else {
+            state.assistant_message = state
+                .latest_model_output
+                .as_ref()
+                .and_then(|output| output.assistant_message.clone());
         }
         Ok(NodeOutcome::Continue)
     }
@@ -332,97 +366,66 @@ impl GraphNode for ExecuteToolsNode {
         // here so already-persisted tool results skip the tool invocation
         // entirely and parallel execution only fans out the real work.
         let mut prepared: Vec<PreparedToolCall> = Vec::with_capacity(calls.len());
-        for (index, call) in calls.into_iter().enumerate() {
+        for (index, mut call) in calls.into_iter().enumerate() {
             if options.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
-            let call = prepare_tool_call_for_config(call, &config.tools, state.session_id)?;
+            if call.id.is_none() {
+                call.id = Some(format!("call-{}-{round}-{index}", state.loop_id));
+            }
+            // External-context wrappers own the remote tool catalog and its
+            // schemas. Never reinterpret an external MCP tool merely because
+            // its name collides with an engine-local memory primitive.
+            let call = if options.execution_profile.uses_local_memory() {
+                prepare_tool_call_for_config(call, &config.tools, state.session_id)?
+            } else {
+                call
+            };
             let operation_key = tool_result_operation_key(state.loop_id, round, index, &call.name);
-            let cached = deps
-                .repository
-                .get_raw_by_operation_key(&operation_key)
-                .await?;
+            let cached = if options.execution_profile.uses_local_memory() {
+                deps.repository
+                    .get_raw_by_operation_key(&operation_key)
+                    .await?
+            } else {
+                None
+            };
             prepared.push(PreparedToolCall {
                 index,
+                execution_kind: deps.tool_executor.execution_kind(&call),
                 call,
                 operation_key,
                 cached,
             });
         }
 
-        // Fan out: every prepared call that does not have a cached raw node
-        // is spawned with its own `tool_timeout` so a single slow tool can
-        // not consume the entire node budget. A `JoinSet` (not detached
-        // `tokio::spawn`) is used so that when the node-level timeout drops this
-        // future, the JoinSet drop ABORTS every still-running tool task —
-        // otherwise the node timeout could never reclaim model-driven work. [S3]
-        let mut join_set: tokio::task::JoinSet<(usize, TimedToolOutcome)> =
-            tokio::task::JoinSet::new();
+        // Adjacent read-only calls may overlap. Side-effecting/destructive
+        // calls are barriers and run one at a time in the provider's order, so
+        // writes cannot race each other or an adjacent read.
+        let mut phases: Vec<Vec<&PreparedToolCall>> = Vec::new();
+        let mut read_only_phase = Vec::new();
         for prep in &prepared {
             if prep.cached.is_some() {
                 continue;
             }
-            let index = prep.index;
-            let executor = deps.tool_executor.clone();
-            let cancellation = options.cancellation_token.clone();
-            let timeout = options.tool_timeout;
-            let call = prep.call.clone();
-            let tool_name = call.name.clone();
-            join_set.spawn(async move {
-                // Per-task cancellation race: if the run-wide token fires we
-                // surface `Cancelled` immediately instead of waiting for the
-                // tool to honor cancellation.
-                let exec_future = executor.execute(call);
-                let cancel_aware: std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Result<ToolCallResult>> + Send>,
-                > = if let Some(token) = cancellation {
-                    Box::pin(async move {
-                        tokio::select! {
-                            biased;
-                            () = token.cancelled() => Err(EngineError::Cancelled),
-                            result = exec_future => result,
-                        }
-                    })
-                } else {
-                    Box::pin(exec_future)
-                };
-                let outcome = match tokio::time::timeout(timeout, cancel_aware).await {
-                    Ok(result) => TimedToolOutcome::Completed(result),
-                    Err(_) => TimedToolOutcome::TimedOut { tool_name },
-                };
-                (index, outcome)
-            });
+            if prep.execution_kind == ToolExecutionKind::ReadOnly {
+                read_only_phase.push(prep);
+            } else {
+                if !read_only_phase.is_empty() {
+                    phases.push(std::mem::take(&mut read_only_phase));
+                }
+                phases.push(vec![prep]);
+            }
+        }
+        if !read_only_phase.is_empty() {
+            phases.push(read_only_phase);
         }
 
-        // Collect results into a sparse vector keyed by the prepared index so
-        // we can recombine deterministically with the cached entries below.
+        // Collect results into a sparse map keyed by the prepared index so we
+        // can recombine deterministically with cached entries below.
         let mut completed: std::collections::HashMap<usize, Result<ToolCallResult>> =
             std::collections::HashMap::new();
-        while let Some(joined) = join_set.join_next().await {
-            let (index, outcome) = match joined {
-                Ok(value) => value,
-                Err(join_err) => {
-                    // A panic / cancellation of the spawn task itself is a
-                    // hard tool error rather than a silent skip.
-                    return Err(EngineError::Tool(format!(
-                        "tool task join failed: {join_err}"
-                    )));
-                }
-            };
-            match outcome {
-                TimedToolOutcome::Completed(result) => {
-                    completed.insert(index, result);
-                }
-                TimedToolOutcome::TimedOut { tool_name } => {
-                    completed.insert(
-                        index,
-                        Err(EngineError::Tool(format!(
-                            "tool {tool_name} exceeded the configured tool_timeout of {:?}",
-                            options.tool_timeout
-                        ))),
-                    );
-                }
-            }
+        for phase in phases {
+            completed.extend(execute_tool_phase(&phase, deps, options).await?);
         }
 
         if options.is_cancelled() {
@@ -433,9 +436,29 @@ impl GraphNode for ExecuteToolsNode {
         // model rounds see them deterministically. Persistence still happens
         // sequentially because the raw-node insert path is not designed for
         // concurrent writers (operation_key uniqueness, sync_raw_indexes).
-        for prep in prepared {
-            let raw_node = if let Some(existing) = prep.cached {
-                existing
+        let round_calls = prepared
+            .iter()
+            .map(|prep| prep.call.clone())
+            .collect::<Vec<_>>();
+        let mut round_results = Vec::with_capacity(prepared.len());
+        // `reserve_tools` bounds the model-visible result payload across the
+        // whole current turn, not just each individual RPC. Tool protocol
+        // envelopes and call arguments are outside this content budget.
+        let already_used_tool_tokens = state
+            .turn_messages
+            .iter()
+            .filter(|message| message.role == ConversationRole::Tool)
+            .map(|message| deps.token_estimator.estimate_text(&message.content))
+            .sum::<usize>();
+        let mut remaining_tool_tokens = config
+            .context_budget
+            .reserve_tools
+            .saturating_sub(already_used_tool_tokens);
+        let prepared_count = prepared.len();
+        for (position, prep) in prepared.into_iter().enumerate() {
+            let (tool_result, existing_raw) = if let Some(existing) = prep.cached {
+                let tool_result = decode_tool_result_from_raw(&existing)?;
+                (tool_result, Some(existing))
             } else {
                 let result_value = completed.remove(&prep.index).ok_or_else(|| {
                     EngineError::Tool(format!(
@@ -443,26 +466,87 @@ impl GraphNode for ExecuteToolsNode {
                         prep.index, prep.call.name
                     ))
                 })?;
-                let result = result_value?;
+                let result = match result_value {
+                    Ok(result) => result,
+                    Err(EngineError::Cancelled) => return Err(EngineError::Cancelled),
+                    Err(error) => ToolCallResult {
+                        tool_call_id: prep.call.id.clone(),
+                        name: prep.call.name.clone(),
+                        content: serde_json::json!({ "error": error.to_string() }),
+                        summary: format!("{} error={error}", prep.call.name),
+                    },
+                };
+                (result, None)
+            };
+            let remaining_results = prepared_count.saturating_sub(position).max(1);
+            let mut result_allowance = remaining_tool_tokens / remaining_results;
+            let allowance_before = result_allowance;
+            let tool_result = clamp_tool_result_for_model(
+                tool_result,
+                deps.token_estimator.as_ref(),
+                &mut result_allowance,
+            );
+            let used = allowance_before.saturating_sub(result_allowance);
+            remaining_tool_tokens = remaining_tool_tokens.saturating_sub(used);
+            let tool_result = if let Some(existing) = existing_raw {
+                // A pre-upgrade checkpoint may contain a larger cached raw
+                // result. Keep the persisted evidence intact but only expose
+                // the bounded representation to the model/transcript.
+                let mut state_raw = existing;
+                state_raw.content =
+                    RawContent::Json(serde_json::to_value(&tool_result).map_err(|err| {
+                        EngineError::Tool(format!(
+                            "failed to encode bounded cached tool result: {err}"
+                        ))
+                    })?);
+                push_raw_node_into_state(state, state_raw);
+                tool_result
+            } else if options.execution_profile.uses_local_memory() {
                 let raw = RawNode::json(
                     RawNodeKind::ToolResult,
                     Some(state.session_id),
                     Some(state.loop_id),
-                    format!("tool:{}", result.name),
-                    serde_json::to_value(&result).map_err(|err| {
+                    format!("tool:{}", tool_result.name),
+                    serde_json::to_value(&tool_result).map_err(|err| {
                         EngineError::Tool(format!("failed to encode tool result payload: {err}"))
                     })?,
                     TOOL_RESULT_IMPORTANCE,
                     vec!["tool".to_string()],
                 )
                 .with_operation_key(prep.operation_key.clone());
-                persist_raw_node(deps, raw).await?
+                let raw = persist_raw_node(deps, raw).await?;
+                let tool_result = decode_tool_result_from_raw(&raw)?;
+                push_raw_node_into_state(state, raw);
+                tool_result
+            } else {
+                tool_result
             };
-
-            let tool_result = decode_tool_result_from_raw(&raw_node)?;
-            push_raw_node_into_state(state, raw_node);
+            round_results.push(tool_result.clone());
             state.tool_results.push(tool_result);
         }
+
+        state.turn_messages.push(ConversationMessage {
+            role: ConversationRole::Assistant,
+            content: state
+                .latest_model_output
+                .as_ref()
+                .and_then(|output| output.assistant_message.clone())
+                .unwrap_or_default(),
+            tool_call_id: None,
+            tool_calls: round_calls,
+        });
+        state
+            .turn_messages
+            .extend(round_results.into_iter().map(|result| ConversationMessage {
+                role: ConversationRole::Tool,
+                content: if result.content.as_str() == Some("") {
+                    String::new()
+                } else {
+                    result.content.to_string()
+                },
+                tool_call_id: result.tool_call_id,
+                tool_calls: Vec::new(),
+            }));
 
         state.tool_rounds_completed = round;
         Ok(NodeOutcome::Continue)
@@ -476,6 +560,7 @@ struct PreparedToolCall {
     /// downstream ordering deterministic regardless of which task finishes
     /// first.
     index: usize,
+    execution_kind: ToolExecutionKind,
     call: ToolCallRequest,
     operation_key: String,
     /// `Some(existing)` when an earlier persisted raw node already covers
@@ -491,7 +576,93 @@ enum TimedToolOutcome {
     TimedOut { tool_name: String },
 }
 
+async fn execute_tool_phase(
+    phase: &[&PreparedToolCall],
+    deps: &EngineDeps,
+    options: &ResolvedRunOptions,
+) -> Result<std::collections::HashMap<usize, Result<ToolCallResult>>> {
+    // A JoinSet is scoped to one read-only phase (or one side-effecting call).
+    // Dropping the node future aborts every still-running task in this phase.
+    let mut join_set: tokio::task::JoinSet<(usize, TimedToolOutcome)> = tokio::task::JoinSet::new();
+    for prep in phase {
+        let index = prep.index;
+        let executor = deps.tool_executor.clone();
+        let cancellation = options.cancellation_token.clone();
+        let timeout = options.tool_timeout;
+        let call = prep.call.clone();
+        let tool_name = call.name.clone();
+        join_set.spawn(async move {
+            let exec_future = executor.execute(call);
+            let cancel_aware: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ToolCallResult>> + Send>,
+            > = if let Some(token) = cancellation {
+                Box::pin(async move {
+                    tokio::select! {
+                        biased;
+                        () = token.cancelled() => Err(EngineError::Cancelled),
+                        result = exec_future => result,
+                    }
+                })
+            } else {
+                Box::pin(exec_future)
+            };
+            let outcome = match tokio::time::timeout(timeout, cancel_aware).await {
+                Ok(result) => TimedToolOutcome::Completed(result),
+                Err(_) => TimedToolOutcome::TimedOut { tool_name },
+            };
+            (index, outcome)
+        });
+    }
+
+    let mut completed = std::collections::HashMap::new();
+    while let Some(joined) = join_set.join_next().await {
+        let (index, outcome) = joined
+            .map_err(|join_err| EngineError::Tool(format!("tool task join failed: {join_err}")))?;
+        let result = match outcome {
+            TimedToolOutcome::Completed(result) => result,
+            TimedToolOutcome::TimedOut { tool_name } => Err(EngineError::Tool(format!(
+                "tool {tool_name} exceeded the configured tool_timeout of {:?}",
+                options.tool_timeout
+            ))),
+        };
+        completed.insert(index, result);
+    }
+    if options.is_cancelled() {
+        return Err(EngineError::Cancelled);
+    }
+    Ok(completed)
+}
+
 pub(crate) struct PersistAssistantOutputNode;
+
+/// Terminates an external-context run without persisting an engine-local copy
+/// of the assistant response. The product wrapper commits `assistant_message`
+/// and `turn_messages` atomically to its durable Thread authority.
+pub(crate) struct FinalizeExternalResponseNode;
+
+#[async_trait]
+impl GraphNode for FinalizeExternalResponseNode {
+    fn id(&self) -> &'static str {
+        FINALIZE_EXTERNAL_RESPONSE_NODE
+    }
+
+    async fn run(
+        &self,
+        state: &mut ExecutionState,
+        _config: &EngineConfig,
+        _deps: &EngineDeps,
+        _options: &ResolvedRunOptions,
+    ) -> Result<NodeOutcome> {
+        if state.assistant_message.is_none() {
+            state.assistant_message = state
+                .latest_model_output
+                .as_ref()
+                .and_then(|output| output.assistant_message.clone())
+                .or_else(|| Some("No assistant message generated.".to_string()));
+        }
+        Ok(NodeOutcome::Finish)
+    }
+}
 
 #[async_trait]
 impl GraphNode for PersistAssistantOutputNode {
@@ -667,6 +838,7 @@ pub(crate) fn build_response(state: ExecutionState, result: GraphRunResult) -> S
         loop_id: state.loop_id,
         status: result.status,
         assistant_message: state.assistant_message,
+        turn_messages: state.turn_messages,
         activated_raw_count: state.activated_memory.raw_nodes.len(),
         activated_abstract_count: state.activated_memory.abstract_nodes.len(),
         tool_results_count: state.tool_results.len(),
@@ -681,6 +853,8 @@ fn to_model_input(
     user_message: &str,
     plan: Option<String>,
     context: &crate::engine::context_assembler::AssembledContext,
+    conversation_history: &[ConversationMessage],
+    turn_messages: &[ConversationMessage],
 ) -> ModelInput {
     ModelInput {
         session_id,
@@ -689,6 +863,8 @@ fn to_model_input(
         session_context: context.session_context.clone(),
         memory_context: context.memory_context.clone(),
         tool_context: context.tool_context.clone(),
+        conversation_history: conversation_history.to_vec(),
+        turn_messages: turn_messages.to_vec(),
         user_message: user_message.to_string(),
         plan,
     }
@@ -781,6 +957,63 @@ fn decode_tool_result_from_raw(node: &RawNode) -> Result<ToolCallResult> {
             "tool result raw node must store a JSON payload".to_string(),
         )),
     }
+}
+
+fn clamp_tool_result_for_model(
+    mut result: ToolCallResult,
+    estimator: &dyn crate::engine::context_assembler::TokenEstimator,
+    remaining_tokens: &mut usize,
+) -> ToolCallResult {
+    let serialized = result.content.to_string();
+    let full_estimate = estimator.estimate_text(&serialized);
+    if full_estimate <= *remaining_tokens {
+        *remaining_tokens = remaining_tokens.saturating_sub(full_estimate);
+        return result;
+    }
+
+    let empty_marker = serde_json::json!({
+        "truncated": true,
+        "preview": "",
+    });
+    let empty_marker_estimate = estimator.estimate_text(&empty_marker.to_string());
+    if empty_marker_estimate > *remaining_tokens {
+        // The protocol still needs one tool-result message for correlation.
+        // An empty string is the smallest valid payload when even the marker
+        // cannot fit (for example a caller configured reserve_tools = 0).
+        result.content = serde_json::Value::String(String::new());
+        *remaining_tokens = 0;
+        return result;
+    }
+
+    let boundaries = serialized
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(serialized.len()))
+        .collect::<Vec<_>>();
+    let mut low = 0usize;
+    let mut high = boundaries.len().saturating_sub(1);
+    let mut best = empty_marker;
+    let mut best_estimate = empty_marker_estimate;
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        let candidate = serde_json::json!({
+            "truncated": true,
+            "preview": &serialized[..boundaries[middle]],
+        });
+        let estimate = estimator.estimate_text(&candidate.to_string());
+        if estimate <= *remaining_tokens {
+            best = candidate;
+            best_estimate = estimate;
+            low = middle.saturating_add(1);
+        } else if middle == 0 {
+            break;
+        } else {
+            high = middle - 1;
+        }
+    }
+    result.content = best;
+    *remaining_tokens = remaining_tokens.saturating_sub(best_estimate);
+    result
 }
 
 pub(crate) fn prepare_tool_call_for_config(
