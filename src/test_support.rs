@@ -64,7 +64,11 @@ pub struct TestRuleBasedModelRunner;
 #[async_trait]
 impl ModelRunner for TestRuleBasedModelRunner {
     async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
-        if input.tool_context.is_empty() {
+        let has_current_tool_result = input
+            .turn_messages
+            .iter()
+            .any(|message| message.role == crate::model::runner::ConversationRole::Tool);
+        if input.tool_context.is_empty() && !has_current_tool_result {
             if let Some(query) = input.user_message.strip_prefix("memory:") {
                 return Ok(ModelOutput {
                     assistant_message: None,

@@ -281,7 +281,7 @@ mod tests {
     use tokio::time::sleep;
     use tokio_util::sync::CancellationToken;
 
-    use crate::config::{EngineConfig, ToolsConfig};
+    use crate::config::{ContextBudgetConfig, EngineConfig, ToolsConfig};
     use crate::domain::{DistillationState, LoopStatus, RawNode, RawNodeKind};
     use crate::engine::execution_graph::{
         ExecutionGraph, ExecutionProfile, ExecutionState, GraphNode, GraphRunner, NodeOutcome,
@@ -525,6 +525,49 @@ mod tests {
             .await?;
         assert_eq!(resumed.status, LoopStatus::Finished);
         assert_eq!(resumed_state.assistant_message.as_deref(), Some("finished"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_runner_stamps_external_profile_before_first_checkpoint() -> Result<()> {
+        let deps = build_demo_deps();
+        let mut graph = ExecutionGraph::new("pause");
+        graph.add_node(Arc::new(PauseNode));
+        let runner = GraphRunner::new(Arc::new(graph));
+        let config = EngineConfig::default();
+        let resolved_options = ResolvedRunOptions::from_config(
+            &config,
+            RunOptions {
+                execution_profile: ExecutionProfile::ExternalContext,
+                ..RunOptions::default()
+            },
+        );
+
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let request = SessionRequest {
+            session_id: Some(session_id),
+            user_message: "pause external".to_string(),
+            plan: None,
+        };
+        let mut state = ExecutionState::from_request(request, session_id, loop_id);
+        assert_eq!(state.execution_profile, ExecutionProfile::MemoryAware);
+
+        let result = runner
+            .run(&mut state, &config, &deps, &resolved_options)
+            .await?;
+        assert_eq!(result.status, LoopStatus::Paused);
+        let checkpoint = deps
+            .loop_state_repository
+            .load_checkpoint(&session_id, &loop_id)
+            .await?
+            .expect("external checkpoint");
+        let checkpoint_state: ExecutionState =
+            serde_json::from_value(checkpoint.state_json).expect("checkpoint execution state");
+        assert_eq!(
+            checkpoint_state.execution_profile,
+            ExecutionProfile::ExternalContext
+        );
         Ok(())
     }
 
@@ -1187,7 +1230,11 @@ mod tests {
     #[async_trait]
     impl ModelRunner for BurstToolModelRunner {
         async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
-            if input.tool_context.is_empty() {
+            let has_current_tool_result = input
+                .turn_messages
+                .iter()
+                .any(|message| message.role == ConversationRole::Tool);
+            if input.tool_context.is_empty() && !has_current_tool_result {
                 // Opening pass: emit a burst of tool calls in one round.
                 let tool_calls = (0..self.calls)
                     .map(|_| crate::model::runner::ToolCallRequest {
@@ -1256,6 +1303,113 @@ mod tests {
         assert_eq!(response.status, LoopStatus::Finished);
         assert_eq!(response.tool_results_count, 1);
         assert_eq!(response.assistant_message.as_deref(), Some("done"));
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct ReusedToolIdModelRunner {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelRunner for ReusedToolIdModelRunner {
+        async fn run(&self, _input: ModelInput) -> Result<ModelOutput> {
+            let round = self.calls.fetch_add(1, Ordering::SeqCst);
+            if round < 2 {
+                return Ok(ModelOutput {
+                    assistant_message: None,
+                    tool_calls: vec![ToolCallRequest {
+                        id: Some("provider-reused-id".to_string()),
+                        name: format!("remote-{round}"),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: None,
+                });
+            }
+            Ok(ModelOutput {
+                assistant_message: Some("unexpected".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingRemoteToolExecutor {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CountingRemoteToolExecutor {
+        fn execution_kind(&self, _call: &ToolCallRequest) -> ToolExecutionKind {
+            ToolExecutionKind::ReadOnly
+        }
+
+        async fn execute(&self, _call: ToolCallRequest) -> Result<ToolCallResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolCallResult {
+                tool_call_id: Some("executor-wrong-id".to_string()),
+                name: "executor-wrong-name".to_string(),
+                content: serde_json::json!({ "ok": true }),
+                summary: "ok".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_ids_cannot_be_reused_across_rounds() {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(ReusedToolIdModelRunner::default());
+        let executor = Arc::new(CountingRemoteToolExecutor::default());
+        deps.tool_executor = executor.clone();
+
+        let error = run_turn_with_options(
+            &EngineConfig::default(),
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "reuse an id".to_string(),
+                plan: None,
+            },
+            RunOptions {
+                execution_profile: ExecutionProfile::ExternalContext,
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("a provider tool id must be unique for the entire turn");
+
+        assert!(
+            matches!(error, EngineError::Tool(message) if message.contains("reused correlation id"))
+        );
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn executor_cannot_replace_provider_tool_correlation() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(TranscriptCheckingModelRunner::default());
+        deps.tool_executor = Arc::new(CountingRemoteToolExecutor::default());
+        let response = run_turn_with_options(
+            &EngineConfig::default(),
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "inspect remote state".to_string(),
+                plan: None,
+            },
+            RunOptions {
+                execution_profile: ExecutionProfile::ExternalContext,
+                ..RunOptions::default()
+            },
+        )
+        .await?;
+
+        assert_eq!(response.status, LoopStatus::Finished);
+        assert_eq!(
+            response.turn_messages[1].tool_call_id.as_deref(),
+            Some("provider-call-1")
+        );
         Ok(())
     }
 
@@ -1383,6 +1537,117 @@ mod tests {
             vec!["write-1".to_string(), "write-2".to_string()],
         );
         Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct SequentialSideEffectModelRunner {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelRunner for SequentialSideEffectModelRunner {
+        async fn run(&self, _input: ModelInput) -> Result<ModelOutput> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(ModelOutput {
+                    assistant_message: None,
+                    tool_calls: ["write-a", "write-b"]
+                        .into_iter()
+                        .map(|name| ToolCallRequest {
+                            id: Some(format!("call-{name}")),
+                            name: name.to_string(),
+                            arguments: serde_json::json!({}),
+                        })
+                        .collect(),
+                    usage: None,
+                });
+            }
+            Ok(ModelOutput {
+                assistant_message: Some("both writes completed".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct SlowSideEffectToolExecutor {
+        completed: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for SlowSideEffectToolExecutor {
+        async fn execute(&self, call: ToolCallRequest) -> Result<ToolCallResult> {
+            sleep(Duration::from_millis(70)).await;
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolCallResult {
+                tool_call_id: call.id,
+                name: call.name,
+                content: serde_json::json!({ "ok": true }),
+                summary: "write completed".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn sequential_side_effects_each_receive_the_full_per_call_timeout() -> Result<()> {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(SequentialSideEffectModelRunner::default());
+        let executor = Arc::new(SlowSideEffectToolExecutor {
+            completed: AtomicUsize::new(0),
+        });
+        deps.tool_executor = executor.clone();
+
+        let response = run_turn_with_options(
+            &EngineConfig::default(),
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "perform both writes".to_string(),
+                plan: None,
+            },
+            RunOptions {
+                tool_timeout: Some(Duration::from_millis(100)),
+                ..RunOptions::default()
+            },
+        )
+        .await?;
+
+        assert_eq!(response.status, LoopStatus::Finished);
+        assert_eq!(response.tool_results_count, 2);
+        assert_eq!(executor.completed.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn insufficient_tool_transcript_budget_fails_before_side_effects() {
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(SequentialSideEffectModelRunner::default());
+        let executor = Arc::new(SlowSideEffectToolExecutor {
+            completed: AtomicUsize::new(0),
+        });
+        deps.tool_executor = executor.clone();
+        deps.token_estimator = Arc::new(CharacterTokenEstimator);
+        let mut config = EngineConfig::default();
+        config.context_budget.reserve_tools = 1;
+
+        let error = run_turn_with_options(
+            &config,
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "do not partially execute".to_string(),
+                plan: None,
+            },
+            RunOptions {
+                execution_profile: ExecutionProfile::ExternalContext,
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("unrecordable side effects must not execute");
+
+        assert!(matches!(error, EngineError::Configuration(_)));
+        assert_eq!(executor.completed.load(Ordering::SeqCst), 0);
     }
 
     #[derive(Debug)]
@@ -1543,6 +1808,103 @@ mod tests {
             .session_raw(&response.session_id)
             .await?
             .is_empty());
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct HistoryCaptureModelRunner {
+        observed: Arc<Mutex<Option<Vec<ConversationMessage>>>>,
+    }
+
+    #[async_trait]
+    impl ModelRunner for HistoryCaptureModelRunner {
+        async fn run(&self, input: ModelInput) -> Result<ModelOutput> {
+            *self.observed.lock().expect("history capture lock") = Some(input.conversation_history);
+            Ok(ModelOutput {
+                assistant_message: Some("trimmed".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn external_history_is_recent_bounded_and_keeps_tool_groups_coherent() -> Result<()> {
+        let recent_group = vec![
+            ConversationMessage {
+                role: ConversationRole::Assistant,
+                content: "checking".to_string(),
+                tool_call_id: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: Some("recent-call".to_string()),
+                    name: "lookup".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+            },
+            ConversationMessage {
+                role: ConversationRole::Tool,
+                content: serde_json::json!({ "ok": true }).to_string(),
+                tool_call_id: Some("recent-call".to_string()),
+                tool_calls: Vec::new(),
+            },
+            ConversationMessage {
+                role: ConversationRole::Assistant,
+                content: "recent answer".to_string(),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+        ];
+        let mut history = vec![ConversationMessage {
+            role: ConversationRole::User,
+            content: "o".repeat(120),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }];
+        history.extend(recent_group.clone());
+
+        let observed = Arc::new(Mutex::new(None));
+        let mut deps = build_demo_deps();
+        deps.model_runner = Arc::new(HistoryCaptureModelRunner {
+            observed: observed.clone(),
+        });
+        deps.token_estimator = Arc::new(CharacterTokenEstimator);
+        let config = EngineConfig {
+            system_prompt: "system".to_string(),
+            context_budget: ContextBudgetConfig {
+                total_tokens: 260,
+                reserve_system: 30,
+                reserve_tools: 120,
+                reserve_working: 20,
+                ..ContextBudgetConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+
+        let response = run_turn_with_options(
+            &config,
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "now".to_string(),
+                plan: None,
+            },
+            RunOptions {
+                execution_profile: ExecutionProfile::ExternalContext,
+                conversation_history: history,
+                ..RunOptions::default()
+            },
+        )
+        .await?;
+
+        assert_eq!(response.status, LoopStatus::Finished);
+        assert_eq!(
+            observed
+                .lock()
+                .expect("history capture lock")
+                .clone()
+                .expect("captured history"),
+            recent_group
+        );
         Ok(())
     }
 
@@ -1807,6 +2169,17 @@ mod tests {
                 .map(|message| message.content.len())
                 .sum::<usize>();
             assert!(tool_payload_bytes <= config.context_budget.reserve_tools);
+            if execution_profile == ExecutionProfile::MemoryAware {
+                let persisted = deps.repository.raw_for_loop(&response.loop_id).await?;
+                let tool_results = persisted
+                    .iter()
+                    .filter(|node| node.kind == RawNodeKind::ToolResult)
+                    .collect::<Vec<_>>();
+                assert_eq!(tool_results.len(), 2);
+                assert!(tool_results
+                    .iter()
+                    .all(|node| node.content_text().contains(&"x".repeat(2_000))));
+            }
         }
         Ok(())
     }

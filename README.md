@@ -301,8 +301,8 @@ open 時に canonical object から index を再整列し、不整合を自動�
 | `max_graph_steps`         | 64         | graph node の最大実行数         |
 | `max_tool_rounds`         | 8          | tool loop の最大往復数          |
 | `node_timeout_ms`         | 10,000     | 通常 node のタイムアウト        |
-| `model_timeout_ms`        | 125,000    | model node のタイムアウト       |
-| `tool_timeout_ms`         | 310,000    | tool 実行のタイムアウト         |
+| `model_timeout_ms`        | 60,000     | model node のタイムアウト       |
+| `tool_timeout_ms`         | 30,000     | tool 1 call ごとのタイムアウト  |
 | `distillation_timeout_ms` | 15,000     | 蒸留のタイムアウト              |
 | `maintenance_batch_size`  | 32         | maintenance pass のバッチサイズ |
 
@@ -355,8 +355,8 @@ max_timeline_search_limit = 100
 max_graph_steps = 64
 max_tool_rounds = 8
 node_timeout_ms = 10000
-model_timeout_ms = 125000
-tool_timeout_ms = 310000
+model_timeout_ms = 60000
+tool_timeout_ms = 30000
 distillation_timeout_ms = 15000
 maintenance_batch_size = 32
 ```
