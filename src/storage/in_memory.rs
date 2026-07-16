@@ -118,7 +118,7 @@ impl NodeRepository for InMemoryNodeRepository {
         };
         let guard = self.raw_nodes.read().await;
         let mut nodes: Vec<_> = ids.iter().filter_map(|id| guard.get(id).cloned()).collect();
-        nodes.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        nodes.sort_by_key(|node| node.timestamp);
         Ok(nodes)
     }
 
@@ -129,7 +129,7 @@ impl NodeRepository for InMemoryNodeRepository {
         };
         let guard = self.raw_nodes.read().await;
         let mut nodes: Vec<_> = ids.iter().filter_map(|id| guard.get(id).cloned()).collect();
-        nodes.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        nodes.sort_by_key(|node| node.timestamp);
         Ok(nodes)
     }
 
@@ -192,7 +192,7 @@ impl NodeRepository for InMemoryNodeRepository {
             .filter(|node| !only_pushed_out || node.overflow.was_pushed_out_of_session)
             .cloned()
             .collect();
-        nodes.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        nodes.sort_by_key(|node| node.timestamp);
         nodes.truncate(limit);
         Ok(nodes)
     }
