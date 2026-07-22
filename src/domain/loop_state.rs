@@ -24,7 +24,7 @@ pub enum LoopStatus {
 /// last_effect_key, ...) that nothing ever read; it was pure write amplification
 /// (re-serialized on every node step) and a drift risk against `state_json`, so
 /// it was dropped. Old on-disk checkpoints still deserialize (serde ignores the
-/// now-unknown fields). [Q3]
+/// now-unknown fields). \[Q3]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoopState {
     pub session_id: SessionId,
