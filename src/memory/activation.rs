@@ -83,13 +83,10 @@ impl ActivationService {
         now: DateTime<Utc>,
         session_id: Option<&SessionId>,
     ) -> Result<ActivatedMemory> {
-        let raw_ratio = config.memory.activation.target_ratio.raw.max(1);
-        let abstract_ratio = config.memory.activation.target_ratio.abstract_nodes.max(1);
-        let total_ratio = raw_ratio + abstract_ratio;
-        let top_k_total = config.memory.activation.top_k_total.max(2);
-        let raw_budget = ((top_k_total * raw_ratio) / total_ratio).max(1);
-        let abstract_budget = top_k_total.saturating_sub(raw_budget).max(1);
-        let search_window = top_k_total * 2;
+        let budgets = config.memory.activation.validated_budgets()?;
+        let raw_budget = budgets.raw;
+        let abstract_budget = budgets.abstract_nodes;
+        let search_window = budgets.search_window;
         let use_time_decay = config.memory.activation.use_time_decay;
 
         let raw_candidates = self
@@ -99,6 +96,9 @@ impl ActivationService {
         let mut raw_nodes = Vec::new();
         for candidate in raw_candidates {
             if let Some(node) = self.repository.get_raw(&candidate.id).await? {
+                if session_id.is_some_and(|scope| node.session_id.as_ref() != Some(scope)) {
+                    continue;
+                }
                 let threshold = if config.memory.activation.overflow_raw_threshold_relaxation
                     && overflow_relaxation_active(&node, now)
                 {
@@ -136,6 +136,9 @@ impl ActivationService {
         let mut abstract_nodes = Vec::new();
         for candidate in abstract_candidates {
             if let Some(node) = self.repository.get_abstract(&candidate.id).await? {
+                if session_id.is_some_and(|scope| node.session_id.as_ref() != Some(scope)) {
+                    continue;
+                }
                 if candidate.score < config.memory.retrieval.similarity_threshold.abstract_nodes {
                     continue;
                 }

@@ -6,22 +6,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::AbstractNode;
 use crate::error::Result;
-use crate::ids::AbstractNodeId;
+use crate::ids::{AbstractNodeId, SessionId};
 
 use crate::storage::traits::{GraphRepository, GraphTraversalHit};
 
 use super::store::FileObjectStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-struct GraphEdge {
-    to: AbstractNodeId,
-    predicate: String,
+pub(super) struct GraphEdge {
+    pub(super) to: AbstractNodeId,
+    pub(super) predicate: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredGraphEdges {
-    node_id: AbstractNodeId,
-    edges: Vec<GraphEdge>,
+pub(super) struct StoredGraphEdges {
+    pub(super) node_id: AbstractNodeId,
+    #[serde(default)]
+    pub(super) session_id: Option<SessionId>,
+    pub(super) edges: Vec<GraphEdge>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,7 +37,7 @@ impl ObjectGraphRepository {
         Self { store }
     }
 
-    fn edges_for_abstract(node: &AbstractNode) -> Vec<GraphEdge> {
+    pub(super) fn edges_for_abstract(node: &AbstractNode) -> Vec<GraphEdge> {
         let mut edges = HashSet::new();
         for abstract_id in &node.references.abstract_node_ids {
             edges.insert(GraphEdge {
@@ -64,12 +66,13 @@ impl ObjectGraphRepository {
 #[async_trait]
 impl GraphRepository for ObjectGraphRepository {
     async fn index_abstract(&self, node: &AbstractNode) -> Result<()> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         self.store
             .write_json(
                 &self.store.graph_path(&node.id),
                 &StoredGraphEdges {
                     node_id: node.id,
+                    session_id: node.session_id,
                     edges: Self::edges_for_abstract(node),
                 },
             )
@@ -82,8 +85,10 @@ impl GraphRepository for ObjectGraphRepository {
         start: &AbstractNodeId,
         max_depth: usize,
         relation_types: Option<&[String]>,
+        session_id: Option<&SessionId>,
+        max_hits: usize,
     ) -> Result<Vec<GraphTraversalHit>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         let filters = relation_types.map(|values| values.iter().cloned().collect::<HashSet<_>>());
         let mut visited = HashSet::new();
         let mut queue = VecDeque::from([(*start, 0usize, None::<String>)]);
@@ -93,22 +98,31 @@ impl GraphRepository for ObjectGraphRepository {
             if depth > max_depth || !visited.insert(current) {
                 continue;
             }
+            let Some(record) = self
+                .store
+                .try_read_json::<StoredGraphEdges>(&self.store.graph_path(&current))
+                .await?
+            else {
+                continue;
+            };
+            if session_id.is_some_and(|scope| record.session_id.as_ref() != Some(scope)) {
+                continue;
+            }
             output.push(GraphTraversalHit {
                 node_id: current,
                 depth,
                 via_predicate: via_predicate.clone(),
             });
-            if let Some(record) = self
-                .store
-                .try_read_json::<StoredGraphEdges>(&self.store.graph_path(&current))
-                .await?
-            {
-                for edge in record.edges {
-                    if let Some(filters) = &filters {
-                        if !filters.contains(&edge.predicate) {
-                            continue;
-                        }
+            if output.len() >= max_hits.max(1) {
+                break;
+            }
+            for edge in record.edges {
+                if let Some(filters) = &filters {
+                    if !filters.contains(&edge.predicate) {
+                        continue;
                     }
+                }
+                if output.len().saturating_add(queue.len()) < max_hits.max(1) {
                     queue.push_back((edge.to, depth + 1, Some(edge.predicate)));
                 }
             }

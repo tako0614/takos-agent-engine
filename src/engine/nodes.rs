@@ -19,11 +19,11 @@ use crate::engine::execution_graph::{
 };
 use crate::engine::session_engine::{EngineDeps, SessionResponse};
 use crate::error::{EngineError, Result};
-use crate::ids::{LoopId, SessionId};
+use crate::ids::{AbstractNodeId, LoopId, RawNodeId, SessionId};
 use crate::memory::{ActivationQuery, DistillationInput};
 use crate::model::{ConversationMessage, ConversationRole, ModelInput, ToolCallRequest};
 use crate::storage::RawLifecyclePatch;
-use crate::tools::executor::{ToolCallResult, ToolExecutionKind};
+use crate::tools::executor::{ToolCallResult, ToolExecutionContext, ToolExecutionKind};
 use crate::tools::memory_tools::{
     GraphSearchParams, MemorySearchParams, MemoryToolBounds, TimelineSearchParams,
 };
@@ -99,11 +99,14 @@ impl GraphNode for LoadSessionViewNode {
     async fn run(
         &self,
         state: &mut ExecutionState,
-        _config: &EngineConfig,
+        config: &EngineConfig,
         deps: &EngineDeps,
         _options: &ResolvedRunOptions,
     ) -> Result<NodeOutcome> {
-        state.recent_session = deps.repository.session_raw(&state.session_id).await?;
+        state.recent_session = deps
+            .repository
+            .recent_session_raw(&state.session_id, config.runtime.max_session_nodes)
+            .await?;
         Ok(NodeOutcome::Continue)
     }
 }
@@ -213,7 +216,7 @@ impl GraphNode for AssembleExternalContextNode {
         deps: &EngineDeps,
         _options: &ResolvedRunOptions,
     ) -> Result<NodeOutcome> {
-        state.conversation_history = trim_external_conversation_history(
+        state.conversation_history = trim_conversation_history(
             &state.conversation_history,
             config,
             deps.token_estimator.as_ref(),
@@ -320,6 +323,16 @@ impl GraphNode for ModelNode {
                 &state.turn_messages,
             ))
             .await?;
+        if output.tool_calls.len() > _config.runtime.max_tool_calls_per_round {
+            return Err(EngineError::Tool(format!(
+                "model returned {} tool calls, exceeding max_tool_calls_per_round={}",
+                output.tool_calls.len(),
+                _config.runtime.max_tool_calls_per_round
+            )));
+        }
+        for call in &output.tool_calls {
+            validate_tool_call_payload(call, &_config.tools)?;
+        }
         state.model_invocations = state.model_invocations.saturating_add(1);
         state.pending_tool_calls.clone_from(&output.tool_calls);
         state.latest_model_output = Some(output);
@@ -364,23 +377,21 @@ impl GraphNode for ExecuteToolsNode {
         deps: &EngineDeps,
         options: &ResolvedRunOptions,
     ) -> Result<NodeOutcome> {
-        let mut calls = std::mem::take(&mut state.pending_tool_calls);
+        // Keep the checkpoint replay input intact until every result has been
+        // durably handled. A timeout/cancellation after dispatch must retain
+        // the original calls so recovery derives the identical operation keys.
+        let calls = state.pending_tool_calls.clone();
         let round = state.tool_rounds_completed.saturating_add(1);
 
-        // Cap the per-round fan-out. The model's tool-call list is influenced by
-        // injectable content (memory, prior tool results, the user message), so
-        // an unbounded list could spawn thousands of concurrent tasks /
-        // control-plane RPCs. Drop the excess for this round. [S3]
+        // The model boundary normally rejects this before the checkpoint is
+        // written. Re-check recovered/legacy checkpoints and fail closed rather
+        // than silently dropping calls that may be semantically required.
         let max_calls = config.runtime.max_tool_calls_per_round.max(1);
         if calls.len() > max_calls {
-            tracing::warn!(
-                session_id = %state.session_id,
-                loop_id = %state.loop_id,
-                requested = calls.len(),
-                cap = max_calls,
-                "tool round exceeded max_tool_calls_per_round; dropping excess calls"
-            );
-            calls.truncate(max_calls);
+            return Err(EngineError::Tool(format!(
+                "checkpoint contains {} tool calls, exceeding max_tool_calls_per_round={max_calls}",
+                calls.len()
+            )));
         }
 
         // Prepare every pending call up front (validation, arg clamping,
@@ -557,12 +568,32 @@ impl GraphNode for ExecuteToolsNode {
         // can recombine deterministically with cached entries below.
         let mut completed: std::collections::HashMap<usize, Result<ToolCallResult>> =
             std::collections::HashMap::new();
+        let mut terminal_error = None;
         for phase in phases {
-            completed.extend(execute_tool_phase(&phase, deps, options).await?);
-        }
-
-        if options.is_cancelled() {
-            return Err(EngineError::Cancelled);
+            let phase_results = execute_tool_phase(
+                &phase,
+                deps,
+                options,
+                state.session_id,
+                state.loop_id,
+                config.tools.max_tool_result_bytes,
+            )
+            .await?;
+            terminal_error = phase_results.values().find_map(|result| match result {
+                Err(EngineError::Cancelled) => Some(EngineError::Cancelled),
+                Err(EngineError::ToolOutcomeIndeterminate {
+                    idempotency_key,
+                    reason,
+                }) => Some(EngineError::ToolOutcomeIndeterminate {
+                    idempotency_key: idempotency_key.clone(),
+                    reason: reason.clone(),
+                }),
+                _ => None,
+            });
+            completed.extend(phase_results);
+            if terminal_error.is_some() {
+                break;
+            }
         }
 
         // Reassemble results in the original tool-call order so downstream
@@ -577,15 +608,21 @@ impl GraphNode for ExecuteToolsNode {
                 let tool_result = decode_tool_result_from_raw(&existing)?;
                 (tool_result, Some(existing))
             } else {
-                let result_value = completed.remove(&prep.index).ok_or_else(|| {
-                    EngineError::Tool(format!(
+                let Some(result_value) = completed.remove(&prep.index) else {
+                    if let Some(error) = terminal_error.take() {
+                        return Err(error);
+                    }
+                    return Err(EngineError::Tool(format!(
                         "missing tool result for index {} (tool {})",
                         prep.index, prep.call.name
-                    ))
-                })?;
+                    )));
+                };
                 let result = match result_value {
                     Ok(result) => result,
                     Err(EngineError::Cancelled) => return Err(EngineError::Cancelled),
+                    Err(error @ EngineError::ToolOutcomeIndeterminate { .. }) => {
+                        return Err(error);
+                    }
                     Err(error) => ToolCallResult {
                         tool_call_id: prep.call.id.clone(),
                         name: prep.call.name.clone(),
@@ -600,6 +637,10 @@ impl GraphNode for ExecuteToolsNode {
             // a missing or mismatched id into the provider transcript.
             full_tool_result.tool_call_id.clone_from(&prep.call.id);
             full_tool_result.name.clone_from(&prep.call.name);
+            bound_tool_result_for_storage(
+                &mut full_tool_result,
+                config.tools.max_tool_result_bytes,
+            )?;
             let remaining_results = prepared_count.saturating_sub(position).max(1);
             let extra_allowance = result_extra_tokens / remaining_results;
             let result_metadata_tokens =
@@ -682,6 +723,7 @@ impl GraphNode for ExecuteToolsNode {
         }
 
         state.tool_rounds_completed = round;
+        state.pending_tool_calls.clear();
         Ok(NodeOutcome::Continue)
     }
 }
@@ -707,12 +749,16 @@ struct PreparedToolCall {
 enum TimedToolOutcome {
     Completed(Result<ToolCallResult>),
     TimedOut { tool_name: String },
+    Cancelled { tool_name: String },
 }
 
 async fn execute_tool_phase(
     phase: &[&PreparedToolCall],
     deps: &EngineDeps,
     options: &ResolvedRunOptions,
+    session_id: SessionId,
+    loop_id: LoopId,
+    max_result_bytes: usize,
 ) -> Result<std::collections::HashMap<usize, Result<ToolCallResult>>> {
     // A JoinSet is scoped to one read-only phase (or one side-effecting call).
     // Dropping the node future aborts every still-running task in this phase.
@@ -724,24 +770,30 @@ async fn execute_tool_phase(
         let timeout = options.tool_timeout;
         let call = prep.call.clone();
         let tool_name = call.name.clone();
+        let context = ToolExecutionContext {
+            session_id,
+            loop_id,
+            idempotency_key: prep.operation_key.clone(),
+            timeout,
+            max_result_bytes,
+            cancellation_token: cancellation.clone(),
+        };
         join_set.spawn(async move {
-            let exec_future = executor.execute(call);
-            let cancel_aware: std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<ToolCallResult>> + Send>,
-            > = if let Some(token) = cancellation {
-                Box::pin(async move {
-                    tokio::select! {
-                        biased;
-                        () = token.cancelled() => Err(EngineError::Cancelled),
-                        result = exec_future => result,
-                    }
-                })
+            let exec_future = executor.execute_with_context(context, call);
+            let outcome = if let Some(token) = cancellation {
+                tokio::select! {
+                    biased;
+                    () = token.cancelled() => TimedToolOutcome::Cancelled { tool_name },
+                    result = tokio::time::timeout(timeout, exec_future) => match result {
+                        Ok(result) => TimedToolOutcome::Completed(result),
+                        Err(_) => TimedToolOutcome::TimedOut { tool_name },
+                    },
+                }
             } else {
-                Box::pin(exec_future)
-            };
-            let outcome = match tokio::time::timeout(timeout, cancel_aware).await {
-                Ok(result) => TimedToolOutcome::Completed(result),
-                Err(_) => TimedToolOutcome::TimedOut { tool_name },
+                match tokio::time::timeout(timeout, exec_future).await {
+                    Ok(result) => TimedToolOutcome::Completed(result),
+                    Err(_) => TimedToolOutcome::TimedOut { tool_name },
+                }
             };
             (index, outcome)
         });
@@ -753,15 +805,42 @@ async fn execute_tool_phase(
             .map_err(|join_err| EngineError::Tool(format!("tool task join failed: {join_err}")))?;
         let result = match outcome {
             TimedToolOutcome::Completed(result) => result,
-            TimedToolOutcome::TimedOut { tool_name } => Err(EngineError::Tool(format!(
-                "tool {tool_name} exceeded the configured tool_timeout of {:?}",
-                options.tool_timeout
-            ))),
+            TimedToolOutcome::TimedOut { tool_name } => {
+                let prep = phase
+                    .iter()
+                    .find(|prep| prep.index == index)
+                    .expect("joined tool index must belong to the phase");
+                if prep.execution_kind == ToolExecutionKind::SideEffecting {
+                    Err(EngineError::ToolOutcomeIndeterminate {
+                        idempotency_key: prep.operation_key.clone(),
+                        reason: format!(
+                            "tool {tool_name} exceeded the configured timeout of {:?}",
+                            options.tool_timeout
+                        ),
+                    })
+                } else {
+                    Err(EngineError::Tool(format!(
+                        "tool {tool_name} exceeded the configured tool_timeout of {:?}",
+                        options.tool_timeout
+                    )))
+                }
+            }
+            TimedToolOutcome::Cancelled { tool_name } => {
+                let prep = phase
+                    .iter()
+                    .find(|prep| prep.index == index)
+                    .expect("joined tool index must belong to the phase");
+                if prep.execution_kind == ToolExecutionKind::SideEffecting {
+                    Err(EngineError::ToolOutcomeIndeterminate {
+                        idempotency_key: prep.operation_key.clone(),
+                        reason: format!("tool {tool_name} was cancelled after dispatch"),
+                    })
+                } else {
+                    Err(EngineError::Cancelled)
+                }
+            }
         };
         completed.insert(index, result);
-    }
-    if options.is_cancelled() {
-        return Err(EngineError::Cancelled);
     }
     Ok(completed)
 }
@@ -855,13 +934,23 @@ impl GraphNode for MarkSessionOverflowNode {
         // Clear the overflow mark on nodes that are back inside the window —
         // but only those that actually carry a mark, so we don't rewrite
         // never-overflowed nodes every turn.
+        let session_window_ids = state
+            .session_window_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let pushed_out_raw_ids = state
+            .pushed_out_raw_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
         let clear_ids: Vec<_> = state
             .recent_session
             .iter()
             .filter(|node| {
                 node.distillation_state != DistillationState::Distilled
                     && node.overflow.was_pushed_out_of_session
-                    && state.session_window_ids.contains(&node.id)
+                    && session_window_ids.contains(&node.id)
             })
             .map(|node| node.id)
             .collect();
@@ -889,7 +978,7 @@ impl GraphNode for MarkSessionOverflowNode {
             .iter()
             .filter(|node| {
                 node.distillation_state != DistillationState::Distilled
-                    && state.pushed_out_raw_ids.contains(&node.id)
+                    && pushed_out_raw_ids.contains(&node.id)
                     && node.overflow.relax_retrieval_until.is_none()
             })
             .map(|node| node.id)
@@ -918,6 +1007,155 @@ impl GraphNode for MarkSessionOverflowNode {
 
 pub(crate) struct DistillCurrentLoopNode;
 
+#[derive(Debug, Default)]
+pub(crate) struct DistillationBatchResult {
+    pub(crate) new_abstract_ids: Vec<AbstractNodeId>,
+    pub(crate) updated_raw_nodes: usize,
+}
+
+pub(crate) async fn distill_claimed_raw_nodes(
+    config: &EngineConfig,
+    deps: &EngineDeps,
+    options: &ResolvedRunOptions,
+    session_id: SessionId,
+    loop_id: LoopId,
+    raw_nodes: Vec<RawNode>,
+    activated_abstract_ids: Vec<AbstractNodeId>,
+) -> Result<Option<DistillationBatchResult>> {
+    if raw_nodes.is_empty() {
+        return Ok(Some(DistillationBatchResult::default()));
+    }
+    if raw_nodes.len() > config.runtime.max_loop_nodes {
+        return Err(EngineError::Configuration(format!(
+            "distillation batch contains {} raw nodes, exceeding max_loop_nodes={}",
+            raw_nodes.len(),
+            config.runtime.max_loop_nodes
+        )));
+    }
+    if raw_nodes
+        .iter()
+        .any(|node| node.session_id != Some(session_id) || node.loop_id != Some(loop_id))
+    {
+        return Err(EngineError::Storage(
+            "distillation batch contains a cross-session or cross-loop raw node".to_string(),
+        ));
+    }
+
+    let mut input_ids = raw_nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+    input_ids.sort();
+    input_ids.dedup();
+    if input_ids.len() != raw_nodes.len() {
+        return Err(EngineError::Storage(
+            "distillation batch contains duplicate raw node ids".to_string(),
+        ));
+    }
+    let digest_source = input_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(":");
+    let input_digest =
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, digest_source.as_bytes()).to_string();
+    let lease_for = options
+        .distillation_timeout
+        .checked_mul(2)
+        .and_then(|duration| duration.checked_add(std::time::Duration::from_secs(5)))
+        .ok_or_else(|| {
+            EngineError::Configuration("distillation timeout is too large".to_string())
+        })?;
+    let Some(claim) = deps
+        .repository
+        .try_claim_distillation(session_id, loop_id, input_digest.clone(), lease_for)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let work = async {
+        let distilled = tokio::time::timeout(
+            options.distillation_timeout,
+            deps.distiller.distill(DistillationInput {
+                session_id,
+                loop_id,
+                raw_nodes,
+                activated_abstract_ids,
+            }),
+        )
+        .await
+        .map_err(|_| {
+            EngineError::Tool(format!(
+                "distillation exceeded the configured timeout of {:?}",
+                options.distillation_timeout
+            ))
+        })??;
+
+        let input_set = input_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut updated_ids = std::collections::HashSet::<RawNodeId>::new();
+        for update in &distilled.raw_updates {
+            if !input_set.contains(&update.raw_node_id) || !updated_ids.insert(update.raw_node_id) {
+                return Err(EngineError::Storage(
+                    "distiller returned an out-of-batch or duplicate raw update".to_string(),
+                ));
+            }
+        }
+        if !deps
+            .repository
+            .distillation_claim_is_current(&claim)
+            .await?
+        {
+            return Err(EngineError::RecoveryUnsafe(
+                "distillation claim expired before commit".to_string(),
+            ));
+        }
+
+        let mut result = DistillationBatchResult::default();
+        for (index, mut node) in distilled.new_nodes.into_iter().enumerate() {
+            if !deps
+                .repository
+                .distillation_claim_is_current(&claim)
+                .await?
+            {
+                return Err(EngineError::RecoveryUnsafe(
+                    "distillation claim was replaced during commit".to_string(),
+                ));
+            }
+            node.operation_key = Some(format!(
+                "distill:{session_id}:{loop_id}:{input_digest}:{index}"
+            ));
+            if let Some(node) = persist_abstract_node(deps, node, Some(session_id)).await? {
+                result.new_abstract_ids.push(node.id);
+            }
+        }
+        for update in distilled.raw_updates {
+            if !deps
+                .repository
+                .distillation_claim_is_current(&claim)
+                .await?
+            {
+                return Err(EngineError::RecoveryUnsafe(
+                    "distillation claim was replaced during lifecycle commit".to_string(),
+                ));
+            }
+            deps.repository
+                .update_raw_lifecycle(&[update.raw_node_id], &update.patch)
+                .await?;
+            result.updated_raw_nodes += 1;
+        }
+        Ok(result)
+    }
+    .await;
+
+    let release_result = deps.repository.release_distillation_claim(&claim).await;
+    match (work, release_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(result), Ok(())) => Ok(Some(result)),
+    }
+}
+
 #[async_trait]
 impl GraphNode for DistillCurrentLoopNode {
     fn id(&self) -> &'static str {
@@ -931,35 +1169,40 @@ impl GraphNode for DistillCurrentLoopNode {
     async fn run(
         &self,
         state: &mut ExecutionState,
-        _config: &EngineConfig,
+        config: &EngineConfig,
         deps: &EngineDeps,
-        _options: &ResolvedRunOptions,
+        options: &ResolvedRunOptions,
     ) -> Result<NodeOutcome> {
-        let raw_nodes = deps.repository.raw_for_loop(&state.loop_id).await?;
-        let distilled = deps
-            .distiller
-            .distill(DistillationInput {
-                session_id: state.session_id,
-                loop_id: state.loop_id,
-                raw_nodes,
-                activated_abstract_ids: state
-                    .activated_memory
-                    .abstract_nodes
-                    .iter()
-                    .map(|entry| entry.node.id)
-                    .collect(),
-            })
+        let raw_nodes = deps
+            .repository
+            .raw_for_loop_bounded(
+                &state.loop_id,
+                config.runtime.max_loop_nodes.saturating_add(1),
+            )
             .await?;
-
-        for node in distilled.new_nodes {
-            if let Some(node) = persist_abstract_node(deps, node, Some(state.session_id)).await? {
-                state.new_abstract_ids.push(node.id);
-            }
+        if raw_nodes.len() > config.runtime.max_loop_nodes {
+            return Err(EngineError::Configuration(format!(
+                "loop {} exceeds max_loop_nodes={}; split the turn before distillation",
+                state.loop_id, config.runtime.max_loop_nodes
+            )));
         }
-        for update in distilled.raw_updates {
-            deps.repository
-                .update_raw_lifecycle(&[update.raw_node_id], &update.patch)
-                .await?;
+        if let Some(result) = distill_claimed_raw_nodes(
+            config,
+            deps,
+            options,
+            state.session_id,
+            state.loop_id,
+            raw_nodes,
+            state
+                .activated_memory
+                .abstract_nodes
+                .iter()
+                .map(|entry| entry.node.id)
+                .collect(),
+        )
+        .await?
+        {
+            state.new_abstract_ids.extend(result.new_abstract_ids);
         }
         Ok(NodeOutcome::Finish)
     }
@@ -980,7 +1223,7 @@ pub(crate) fn build_response(state: ExecutionState, result: GraphRunResult) -> S
     }
 }
 
-fn trim_external_conversation_history(
+pub(crate) fn trim_conversation_history(
     history: &[ConversationMessage],
     config: &EngineConfig,
     estimator: &dyn crate::engine::context_assembler::TokenEstimator,
@@ -1017,6 +1260,30 @@ fn trim_external_conversation_history(
     }
     selected.reverse();
     Ok(selected.into_iter().flatten().collect())
+}
+
+fn validate_tool_call_payload(call: &ToolCallRequest, tools: &ToolsConfig) -> Result<()> {
+    const MAX_TOOL_IDENTIFIER_BYTES: usize = 256;
+    if call.name.len() > MAX_TOOL_IDENTIFIER_BYTES
+        || call
+            .id
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_TOOL_IDENTIFIER_BYTES)
+    {
+        return Err(EngineError::Tool(
+            "tool call id/name exceeds the 256-byte boundary".to_string(),
+        ));
+    }
+    let argument_bytes = serde_json::to_vec(&call.arguments)
+        .map_err(|err| EngineError::Tool(format!("failed to encode tool arguments: {err}")))?
+        .len();
+    if argument_bytes > tools.max_tool_argument_bytes {
+        return Err(EngineError::Tool(format!(
+            "tool {} arguments use {argument_bytes} bytes, exceeding max_tool_argument_bytes={}",
+            call.name, tools.max_tool_argument_bytes
+        )));
+    }
+    Ok(())
 }
 
 fn coherent_conversation_groups(history: &[ConversationMessage]) -> Vec<Vec<ConversationMessage>> {
@@ -1215,24 +1482,21 @@ fn to_model_input(
 }
 
 async fn persist_raw_node(deps: &EngineDeps, node: RawNode) -> Result<RawNode> {
-    if let Some(operation_key) = &node.operation_key {
-        if let Some(existing) = deps
-            .repository
-            .get_raw_by_operation_key(operation_key)
-            .await?
-        {
-            return Ok(existing);
-        }
-    }
     let embedding = deps.embedder.embed_text(&node.content_text()).await?;
-    let session_id = node.session_id;
-    deps.repository.insert_raw(node.clone()).await?;
-    // Use the session-aware indexing path so per-session retrieval stays
-    // isolated. The raw node's own `session_id` is the source of truth here.
-    deps.vector_index
-        .index_raw_with_session(node.id, embedding, session_id)
-        .await?;
-    Ok(node)
+    let commit = deps.repository.commit_raw(node, embedding.clone()).await?;
+    if !commit.projections_committed {
+        let embedding = if commit.inserted {
+            embedding
+        } else {
+            deps.embedder
+                .embed_text(&commit.node.content_text())
+                .await?
+        };
+        deps.vector_index
+            .index_raw_with_session(commit.node.id, embedding, commit.node.session_id)
+            .await?;
+    }
+    Ok(commit.node)
 }
 
 /// Persist a distilled abstract node, deduplicating on its `operation_key`.
@@ -1242,35 +1506,70 @@ async fn persist_raw_node(deps: &EngineDeps, node: RawNode) -> Result<RawNode> {
 /// write). Callers use this distinction to count only fresh creations.
 pub(crate) async fn persist_abstract_node(
     deps: &EngineDeps,
-    node: AbstractNode,
+    mut node: AbstractNode,
     session_id: Option<SessionId>,
 ) -> Result<Option<AbstractNode>> {
-    if let Some(operation_key) = &node.operation_key {
-        if deps
-            .repository
-            .get_abstract_by_operation_key(operation_key)
-            .await?
-            .is_some()
+    node.session_id = session_id;
+    if let Some(session_id) = session_id {
+        let mut raw_reference_ids = node.references.raw_node_ids.clone();
+        raw_reference_ids.extend(
+            node.graph
+                .relations
+                .iter()
+                .flat_map(|relation| relation.provenance_raw_node_ids.iter().copied()),
+        );
+        raw_reference_ids.sort();
+        raw_reference_ids.dedup();
+        let raw_references = deps.repository.list_raw(&raw_reference_ids).await?;
+        if raw_references.len() != raw_reference_ids.len()
+            || raw_references
+                .iter()
+                .any(|reference| reference.session_id != Some(session_id))
         {
-            // Already persisted under this operation_key. Return `None` (not
-            // `Some(existing)`) so callers can distinguish a NEW abstract from a
-            // dedup hit — otherwise "created" is always true, miscounting
-            // maintenance stats and the engine's new_abstract_ids. [C6]
-            return Ok(None);
+            return Err(EngineError::Storage(
+                "abstract node contains missing or cross-session raw provenance".to_string(),
+            ));
+        }
+
+        let mut abstract_reference_ids = node.references.abstract_node_ids.clone();
+        abstract_reference_ids.sort();
+        abstract_reference_ids.dedup();
+        let abstract_references = deps
+            .repository
+            .list_abstract(&abstract_reference_ids)
+            .await?;
+        if abstract_references.len() != abstract_reference_ids.len()
+            || abstract_references
+                .iter()
+                .any(|reference| reference.session_id != Some(session_id))
+        {
+            return Err(EngineError::Storage(
+                "abstract node contains missing or cross-session abstract provenance".to_string(),
+            ));
         }
     }
     let embedding = deps
         .embedder
         .embed_text(&format!("{} {}", node.title, node.summary))
         .await?;
-    deps.repository.insert_abstract(node.clone()).await?;
-    // Persist the producing session id alongside the abstract embedding so
-    // distilled / summary nodes also respect the per-session retrieval guard.
-    deps.vector_index
-        .index_abstract_with_session(node.id, embedding, session_id)
+    let commit = deps
+        .repository
+        .commit_abstract(node, embedding.clone())
         .await?;
-    deps.graph_repository.index_abstract(&node).await?;
-    Ok(Some(node))
+    if !commit.projections_committed {
+        let embedding = if commit.inserted {
+            embedding
+        } else {
+            deps.embedder
+                .embed_text(&format!("{} {}", commit.node.title, commit.node.summary))
+                .await?
+        };
+        deps.vector_index
+            .index_abstract_with_session(commit.node.id, embedding, commit.node.session_id)
+            .await?;
+        deps.graph_repository.index_abstract(&commit.node).await?;
+    }
+    Ok(commit.inserted.then_some(commit.node))
 }
 
 fn push_raw_node_into_state(state: &mut ExecutionState, node: RawNode) {
@@ -1369,6 +1668,78 @@ fn clamp_tool_result_for_model(
     result
 }
 
+fn bound_tool_result_for_storage(result: &mut ToolCallResult, max_bytes: usize) -> Result<()> {
+    fn encoded_len(result: &ToolCallResult) -> Result<usize> {
+        serde_json::to_vec(result)
+            .map(|payload| payload.len())
+            .map_err(|err| EngineError::Tool(format!("failed to encode tool result: {err}")))
+    }
+
+    fn truncate_utf8(value: &mut String, max_bytes: usize) {
+        if value.len() <= max_bytes {
+            return;
+        }
+        let mut boundary = max_bytes;
+        while boundary > 0 && !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        value.truncate(boundary);
+    }
+
+    if encoded_len(result)? <= max_bytes {
+        return Ok(());
+    }
+
+    // Bound metadata first so the content preview has a deterministic share of
+    // the envelope. Correlation id/name are engine-validated before dispatch.
+    truncate_utf8(&mut result.summary, (max_bytes / 8).min(4_096));
+    let serialized = serde_json::to_string(&result.content)
+        .map_err(|err| EngineError::Tool(format!("failed to encode tool result: {err}")))?;
+
+    let empty_marker = serde_json::json!({ "truncated": true, "preview": "" });
+    result.content = empty_marker.clone();
+    if encoded_len(result)? > max_bytes {
+        result.summary.clear();
+    }
+    if encoded_len(result)? > max_bytes {
+        return Err(EngineError::Configuration(format!(
+            "max_tool_result_bytes={max_bytes} is too small for the validated tool result envelope"
+        )));
+    }
+
+    // Binary-search a UTF-8-safe preview without allocating a boundary vector
+    // proportional to the (potentially large) result.
+    let mut low = 0usize;
+    let mut high = serialized.len();
+    let mut best = empty_marker;
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        let mut boundary = middle;
+        while boundary > 0 && !serialized.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        let candidate = serde_json::json!({
+            "truncated": true,
+            "preview": &serialized[..boundary],
+        });
+        result.content = candidate.clone();
+        if encoded_len(result)? <= max_bytes {
+            best = candidate;
+            if middle == serialized.len() {
+                break;
+            }
+            low = middle.saturating_add(1);
+        } else if middle == 0 {
+            break;
+        } else {
+            high = middle - 1;
+        }
+    }
+    result.content = best;
+    debug_assert!(encoded_len(result)? <= max_bytes);
+    Ok(())
+}
+
 pub(crate) fn prepare_tool_call_for_config(
     mut call: ToolCallRequest,
     tools: &ToolsConfig,
@@ -1400,10 +1771,8 @@ pub(crate) fn prepare_tool_call_for_config(
                     EngineError::Tool(format!("invalid graph search args: {err}"))
                 })?;
             params.max_depth = bounds.clamp_graph_search_depth(params.max_depth);
-            // NOTE: graph_search / provenance_lookup dereference abstract-node
-            // ids in the (non-session-partitioned) graph + abstract store, so
-            // they cannot be session-gated without partitioning that store.
-            // Left global on purpose; see the S2 deferral note.
+            params.max_hits = bounds.clamp_graph_search_hits(params.max_hits);
+            params.session_id = Some(session_id.to_string());
             call.arguments = serde_json::to_value(params).map_err(|err| {
                 EngineError::Tool(format!("failed to encode graph search args: {err}"))
             })?;
@@ -1411,6 +1780,14 @@ pub(crate) fn prepare_tool_call_for_config(
         }
         "provenance_lookup" => {
             ensure_tool_enabled(tools.provenance_lookup, &call.name)?;
+            let mut params: crate::tools::memory_tools::ProvenanceLookupParams =
+                serde_json::from_value(std::mem::take(&mut call.arguments))
+                    .map_err(|err| EngineError::Tool(format!("invalid provenance args: {err}")))?;
+            params.session_id = Some(session_id.to_string());
+            params.limit = bounds.clamp_provenance_raw_nodes(params.limit);
+            call.arguments = serde_json::to_value(params).map_err(|err| {
+                EngineError::Tool(format!("failed to encode provenance args: {err}"))
+            })?;
             Ok(call)
         }
         "timeline_search" => {

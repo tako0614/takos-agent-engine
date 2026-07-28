@@ -1,0 +1,12 @@
+{
+  "name": "takos-agent-engine-workspace",
+  "private": true,
+  "scripts": {
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun run test:portable && bun run build:portable",
+    "format:check": "cargo fmt --all --check",
+    "lint": "cargo clippy --locked --all-targets --all-features -- -D warnings && RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features",
+    "typecheck": "cargo check --locked --all-targets --all-features && cargo check --locked --lib --no-default-features && cargo +1.85.0 check --locked --all-targets --all-features",
+    "test:portable": "cargo test --locked --all-targets --all-features",
+    "build:portable": "cargo build --locked --all-targets --all-features"
+  }
+}

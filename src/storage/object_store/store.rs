@@ -1,17 +1,23 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::domain::{AbstractNode, DistillationState, RawNode};
 use crate::error::{EngineError, Result};
 use crate::ids::{AbstractNodeId, LoopId, RawNodeId, SessionId};
 use crate::model::embedding::Embedding;
+use crate::storage::RawLifecyclePatch;
+
+use super::graph::{ObjectGraphRepository, StoredGraphEdges};
 
 const STORE_FORMAT_VERSION: u32 = 1;
 /// Bumped whenever the on-disk index layout written by
@@ -30,12 +36,26 @@ const STORE_FORMAT_VERSION: u32 = 1;
 /// activation — every embedding ever written for the installation) to
 /// per-session shards under `indexes/vector/{raw,abstract}/<session|none>.json`,
 /// so a session-scoped search only reads its own session's embeddings.
-const INDEX_VERSION: u32 = 3;
+const INDEX_VERSION: u32 = 5;
+pub(super) const MAX_SESSION_INDEX_ENTRIES: usize = 4_096;
+pub(super) const MAX_LOOP_INDEX_ENTRIES: usize = 4_097;
+pub(super) const MAX_VECTOR_SHARD_ENTRIES: usize = 4_096;
 
 #[derive(Debug, Clone)]
 pub struct FileObjectStore {
     root: PathBuf,
     gate: Arc<Mutex<()>>,
+}
+
+pub(super) struct StoreGuard<'a> {
+    _process_guard: MutexGuard<'a, ()>,
+    lock_file: File,
+}
+
+impl Drop for StoreGuard<'_> {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock_file);
+    }
 }
 
 impl FileObjectStore {
@@ -67,6 +87,7 @@ impl FileObjectStore {
         // runs for a directory mutually exclude. [S1]
         let gate = shared_gate_for_root(&root).await;
         let store = Self { root, gate };
+        store.validate_root_boundary().await?;
         store.ensure_layout().await?;
         store.ensure_indexes().await?;
         Ok(store)
@@ -77,8 +98,42 @@ impl FileObjectStore {
         &self.root
     }
 
-    pub(super) async fn lock(&self) -> MutexGuard<'_, ()> {
-        self.gate.lock().await
+    pub(super) async fn lock(&self) -> Result<StoreGuard<'_>> {
+        let process_guard = self.gate.lock().await;
+        let lock_path = self.root.join(".store.lock");
+        let lock_file = tokio::task::spawn_blocking(move || -> std::io::Result<File> {
+            let file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)?;
+            file.lock_exclusive()?;
+            Ok(file)
+        })
+        .await
+        .map_err(|err| EngineError::Storage(format!("store lock task failed: {err}")))?
+        .map_err(|err| EngineError::Storage(format!("failed to lock object store: {err}")))?;
+        Ok(StoreGuard {
+            _process_guard: process_guard,
+            lock_file,
+        })
+    }
+
+    async fn validate_root_boundary(&self) -> Result<()> {
+        let metadata = fs::symlink_metadata(&self.root).await.map_err(|err| {
+            EngineError::Storage(format!(
+                "failed to inspect object store root {}: {err}",
+                self.root.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(EngineError::Storage(format!(
+                "object store root must be a real directory, not a symlink: {}",
+                self.root.display()
+            )));
+        }
+        Ok(())
     }
 
     async fn ensure_layout(&self) -> Result<()> {
@@ -89,39 +144,87 @@ impl FileObjectStore {
             self.abstract_embedding_dir(),
             self.graph_dir(),
             self.checkpoint_dir(),
+            self.journal_dir(),
+            self.quarantine_dir(),
+            self.distillation_claim_dir(),
+            self.raw_operation_dir(),
+            self.abstract_operation_dir(),
         ] {
-            fs::create_dir_all(&directory).await.map_err(|err| {
-                EngineError::Storage(format!(
-                    "failed to create object store directory {}: {err}",
-                    directory.display()
-                ))
-            })?;
+            self.ensure_real_directory(&directory).await?;
         }
         self.ensure_index_layout().await
     }
 
     async fn ensure_index_layout(&self) -> Result<()> {
         for directory in [
-            self.raw_operation_dir(),
-            self.abstract_operation_dir(),
             self.session_index_dir(),
             self.loop_index_dir(),
             self.timeline_index_dir(),
             self.backlog_index_dir(),
             self.vector_index_dir(),
         ] {
-            fs::create_dir_all(&directory).await.map_err(|err| {
-                EngineError::Storage(format!(
-                    "failed to create object store index directory {}: {err}",
-                    directory.display()
-                ))
-            })?;
+            self.ensure_real_directory(&directory).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_real_directory(&self, directory: &Path) -> Result<()> {
+        self.validate_managed_path(directory).await?;
+        fs::create_dir_all(directory).await.map_err(|err| {
+            EngineError::Storage(format!(
+                "failed to create object store directory {}: {err}",
+                directory.display()
+            ))
+        })?;
+        let metadata = fs::symlink_metadata(directory).await.map_err(|err| {
+            EngineError::Storage(format!(
+                "failed to inspect object store directory {}: {err}",
+                directory.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(EngineError::Storage(format!(
+                "managed object store path is not a real directory: {}",
+                directory.display()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn validate_managed_path(&self, path: &Path) -> Result<()> {
+        let relative = path.strip_prefix(&self.root).map_err(|_| {
+            EngineError::Storage(format!(
+                "object store path escapes root: {}",
+                path.display()
+            ))
+        })?;
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            current.push(component);
+            match fs::symlink_metadata(&current).await {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(EngineError::Storage(format!(
+                        "object store refuses symlink path component: {}",
+                        current.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                Err(err) => {
+                    return Err(EngineError::Storage(format!(
+                        "failed to inspect object store path {}: {err}",
+                        current.display()
+                    )));
+                }
+            }
         }
         Ok(())
     }
 
     async fn ensure_indexes(&self) -> Result<()> {
-        let _guard = self.lock().await;
+        let _guard = self.lock().await?;
+        self.reap_stale_temporary_files_unlocked().await?;
+        self.replay_journal_unlocked().await?;
         let mut metadata = self.ensure_metadata_unlocked().await?;
         if self.read_index_version().await? == Some(INDEX_VERSION)
             && self.indexes_pass_sanity_check().await
@@ -398,7 +501,10 @@ impl FileObjectStore {
             if let Some(operation_key) = &node.operation_key {
                 self.write_json(
                     &self.raw_operation_path(operation_key),
-                    &StoredId { id: node.id },
+                    &StoredId {
+                        id: node.id,
+                        operation_key: operation_key.clone(),
+                    },
                 )
                 .await?;
             }
@@ -418,11 +524,17 @@ impl FileObjectStore {
 
         for (session_id, mut entries) in session_timelines {
             sort_raw_index_entries(&mut entries);
+            if entries.len() > MAX_SESSION_INDEX_ENTRIES {
+                entries.drain(..entries.len() - MAX_SESSION_INDEX_ENTRIES);
+            }
             self.write_json(&self.session_index_path(&session_id), &entries)
                 .await?;
         }
         for (loop_id, mut entries) in loop_timelines {
             sort_raw_index_entries(&mut entries);
+            if entries.len() > MAX_LOOP_INDEX_ENTRIES {
+                entries.drain(..entries.len() - MAX_LOOP_INDEX_ENTRIES);
+            }
             self.write_json(&self.loop_index_path(&loop_id), &entries)
                 .await?;
         }
@@ -431,7 +543,10 @@ impl FileObjectStore {
             if let Some(operation_key) = &node.operation_key {
                 self.write_json(
                     &self.abstract_operation_path(operation_key),
-                    &StoredId { id: node.id },
+                    &StoredId {
+                        id: node.id,
+                        operation_key: operation_key.clone(),
+                    },
                 )
                 .await?;
             }
@@ -488,12 +603,37 @@ impl FileObjectStore {
         self.root.join("checkpoints")
     }
 
+    fn journal_dir(&self) -> PathBuf {
+        self.root.join("journal")
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.journal_dir().join("current.json")
+    }
+
+    fn quarantine_dir(&self) -> PathBuf {
+        self.root.join("quarantine")
+    }
+
+    fn distillation_claim_dir(&self) -> PathBuf {
+        self.root.join("claims").join("distillation")
+    }
+
+    pub(super) fn distillation_claim_path(
+        &self,
+        session_id: &SessionId,
+        loop_id: &LoopId,
+    ) -> PathBuf {
+        self.distillation_claim_dir()
+            .join(format!("{session_id}--{loop_id}.json"))
+    }
+
     fn raw_operation_dir(&self) -> PathBuf {
-        self.index_root().join("raw_operation")
+        self.root.join("receipts").join("raw_operation")
     }
 
     fn abstract_operation_dir(&self) -> PathBuf {
-        self.index_root().join("abstract_operation")
+        self.root.join("receipts").join("abstract_operation")
     }
 
     fn session_index_dir(&self) -> PathBuf {
@@ -716,6 +856,7 @@ impl FileObjectStore {
 
     #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
     pub(super) async fn write_json<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
+        self.validate_managed_path(path).await?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await.map_err(|err| {
                 EngineError::Storage(format!(
@@ -723,6 +864,7 @@ impl FileObjectStore {
                     parent.display()
                 ))
             })?;
+            self.validate_managed_path(parent).await?;
         }
         let payload = serde_json::to_vec_pretty(value).map_err(|err| {
             EngineError::Storage(format!(
@@ -736,12 +878,25 @@ impl FileObjectStore {
         // `.tmp` extension keeps it out of every `*.json` index/body listing.
         // [S1]
         let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-        fs::write(&temporary, payload).await.map_err(|err| {
+        let mut file = fs::File::create(&temporary).await.map_err(|err| {
+            EngineError::Storage(format!(
+                "failed to create temporary object {}: {err}",
+                temporary.display()
+            ))
+        })?;
+        file.write_all(&payload).await.map_err(|err| {
             EngineError::Storage(format!(
                 "failed to write temporary object {}: {err}",
                 temporary.display()
             ))
         })?;
+        file.sync_all().await.map_err(|err| {
+            EngineError::Storage(format!(
+                "failed to sync temporary object {}: {err}",
+                temporary.display()
+            ))
+        })?;
+        drop(file);
         if let Err(err) = fs::rename(&temporary, path).await {
             // Best-effort cleanup so a failed rename does not leak the staged
             // temp file (a hard kill mid-write can still leave one, which is
@@ -752,20 +907,47 @@ impl FileObjectStore {
                 path.display()
             )));
         }
+        if let Some(parent) = path.parent() {
+            self.sync_directory(parent).await?;
+        }
         Ok(())
     }
 
     #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
     async fn read_json<T: DeserializeOwned>(&self, path: &Path) -> Result<T> {
+        self.validate_managed_path(path).await?;
         let payload = fs::read(path).await.map_err(|err| {
             EngineError::Storage(format!("failed to read object {}: {err}", path.display()))
         })?;
-        serde_json::from_slice(&payload).map_err(|err| {
-            EngineError::Storage(format!(
-                "failed to deserialize object {}: {err}",
+        match serde_json::from_slice(&payload) {
+            Ok(value) => Ok(value),
+            Err(err) if path == self.journal_path() => Err(EngineError::Storage(format!(
+                "failed to deserialize recovery journal {}; manual recovery is required: {err}",
                 path.display()
-            ))
-        })
+            ))),
+            Err(err) => {
+                let filename = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("object");
+                let quarantine_path = self
+                    .quarantine_dir()
+                    .join(format!("{filename}.{}.corrupt", uuid::Uuid::new_v4()));
+                self.ensure_real_directory(&self.quarantine_dir()).await?;
+                fs::rename(path, &quarantine_path).await.map_err(|move_err| {
+                    EngineError::Storage(format!(
+                        "failed to deserialize object {} ({err}) and failed to quarantine it: {move_err}",
+                        path.display()
+                    ))
+                })?;
+                self.sync_directory(&self.quarantine_dir()).await?;
+                Err(EngineError::Storage(format!(
+                    "corrupt object {} was quarantined at {}: {err}",
+                    path.display(),
+                    quarantine_path.display()
+                )))
+            }
+        }
     }
 
     pub(super) async fn try_read_json<T: DeserializeOwned>(
@@ -784,6 +966,7 @@ impl FileObjectStore {
 
     #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
     pub(super) async fn remove_file_if_exists(&self, path: &Path) -> Result<()> {
+        self.validate_managed_path(path).await?;
         match fs::try_exists(path).await {
             Ok(true) => fs::remove_file(path).await.map_err(|err| {
                 EngineError::Storage(format!("failed to remove object {}: {err}", path.display()))
@@ -798,6 +981,7 @@ impl FileObjectStore {
 
     #[allow(clippy::unused_self)] // grouped with FileObjectStore for cohesion
     async fn list_paths(&self, directory: &Path) -> Result<Vec<PathBuf>> {
+        self.validate_managed_path(directory).await?;
         match fs::try_exists(directory).await {
             Ok(false) => return Ok(Vec::new()),
             Ok(true) => {}
@@ -849,6 +1033,37 @@ impl FileObjectStore {
         Ok(nodes)
     }
 
+    async fn reap_stale_temporary_files_unlocked(&self) -> Result<()> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut pending = vec![root];
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(directory)? {
+                    let entry = entry?;
+                    let file_type = entry.file_type()?;
+                    if file_type.is_symlink() {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if file_type.is_dir() {
+                        pending.push(path);
+                        continue;
+                    }
+                    if path.extension().and_then(|value| value.to_str()) != Some("tmp") {
+                        continue;
+                    }
+                    // The store-wide advisory lock is held while this sweep
+                    // runs, so no live writer can own a staging file.
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|err| EngineError::Storage(format!("temporary-file reaper failed: {err}")))?
+        .map_err(|err| EngineError::Storage(format!("failed to reap stale temporary files: {err}")))
+    }
+
     async fn list_abstract_nodes_scan_unlocked(&self) -> Result<Vec<AbstractNode>> {
         let mut nodes = Vec::new();
         for path in self.list_paths(&self.abstract_dir()).await? {
@@ -874,12 +1089,15 @@ impl FileObjectStore {
 
     async fn write_manifest_unlocked<Id>(&self, path: &Path, ids: &[Id]) -> Result<()>
     where
-        Id: Serialize + Clone + Ord,
+        Id: Serialize + Clone + PartialEq,
     {
-        let mut ids = ids.to_vec();
-        ids.sort();
-        ids.dedup();
-        self.write_json(path, &IdManifest { ids }).await
+        let mut unique = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !unique.contains(id) {
+                unique.push(id.clone());
+            }
+        }
+        self.write_json(path, &IdManifest { ids: unique }).await
     }
 
     pub(super) async fn read_manifest_unlocked<Id>(&self, path: &Path) -> Result<Vec<Id>>
@@ -893,15 +1111,25 @@ impl FileObjectStore {
             .unwrap_or_default())
     }
 
-    pub(super) async fn upsert_manifest_id_unlocked<Id>(&self, path: &Path, id: Id) -> Result<()>
+    pub(super) async fn upsert_manifest_id_unlocked<Id>(
+        &self,
+        path: &Path,
+        id: Id,
+    ) -> Result<Vec<Id>>
     where
-        Id: Serialize + DeserializeOwned + Copy + Ord,
+        Id: Serialize + DeserializeOwned + Copy + PartialEq,
     {
         let mut ids = self.read_manifest_unlocked::<Id>(path).await?;
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
-        self.write_manifest_unlocked(path, &ids).await
+        ids.retain(|existing| *existing != id);
+        ids.push(id);
+        let overflow = ids.len().saturating_sub(MAX_VECTOR_SHARD_ENTRIES);
+        let evicted = if overflow == 0 {
+            Vec::new()
+        } else {
+            ids.drain(..overflow).collect()
+        };
+        self.write_manifest_unlocked(path, &ids).await?;
+        Ok(evicted)
     }
 
     /// Regenerate the per-session embedding shard manifests for one body
@@ -915,17 +1143,24 @@ impl FileObjectStore {
         shard_dir: &Path,
     ) -> Result<()>
     where
-        Id: DeserializeOwned + Serialize + Ord + Copy,
+        Id: DeserializeOwned + Serialize + Ord + Copy + std::fmt::Display,
     {
-        let mut shards: HashMap<String, Vec<Id>> = HashMap::new();
+        let mut shards: HashMap<String, Vec<(DateTime<Utc>, Id)>> = HashMap::new();
         for path in self.list_paths(body_dir).await? {
             let record: StoredEmbedding<Id> = self.read_json(&path).await?;
             shards
                 .entry(embedding_shard_bucket(record.session_id.as_ref()))
                 .or_default()
-                .push(record.id);
+                .push((record.indexed_at, record.id));
         }
-        for (bucket, ids) in shards {
+        for (bucket, mut entries) in shards {
+            entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+            let overflow = entries.len().saturating_sub(MAX_VECTOR_SHARD_ENTRIES);
+            for (_, evicted) in entries.drain(..overflow) {
+                self.remove_file_if_exists(&body_dir.join(format!("{evicted}.json")))
+                    .await?;
+            }
+            let ids = entries.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
             self.write_manifest_unlocked(&shard_dir.join(format!("{bucket}.json")), &ids)
                 .await?;
         }
@@ -941,6 +1176,22 @@ impl FileObjectStore {
         entries.retain(|existing| existing.id != entry.id);
         entries.push(entry);
         sort_raw_index_entries(&mut entries);
+        self.write_json(path, &entries).await
+    }
+
+    async fn upsert_bounded_raw_index_entry_unlocked(
+        &self,
+        path: &Path,
+        entry: RawIndexEntry,
+        limit: usize,
+    ) -> Result<()> {
+        let mut entries = self.read_raw_index_entries_unlocked(path).await?;
+        entries.retain(|existing| existing.id != entry.id);
+        entries.push(entry);
+        sort_raw_index_entries(&mut entries);
+        if entries.len() > limit {
+            entries.drain(..entries.len() - limit);
+        }
         self.write_json(path, &entries).await
     }
 
@@ -966,15 +1217,20 @@ impl FileObjectStore {
         // (it would instead be missing from the timeline -> probe fails ->
         // rebuild). [C5]
         if let Some(session_id) = node.session_id {
-            self.upsert_raw_index_entry_unlocked(
+            self.upsert_bounded_raw_index_entry_unlocked(
                 &self.session_index_path(&session_id),
                 entry.clone(),
+                MAX_SESSION_INDEX_ENTRIES,
             )
             .await?;
         }
         if let Some(loop_id) = node.loop_id {
-            self.upsert_raw_index_entry_unlocked(&self.loop_index_path(&loop_id), entry.clone())
-                .await?;
+            self.upsert_bounded_raw_index_entry_unlocked(
+                &self.loop_index_path(&loop_id),
+                entry.clone(),
+                MAX_LOOP_INDEX_ENTRIES,
+            )
+            .await?;
         }
 
         let is_undistilled = node.distillation_state != DistillationState::Distilled;
@@ -1008,6 +1264,195 @@ impl FileObjectStore {
         .await?;
 
         Ok(())
+    }
+
+    pub(super) async fn commit_raw_unlocked(
+        &self,
+        node: &RawNode,
+        embedding: &Embedding,
+    ) -> Result<()> {
+        let mutation = MutationJournal::CommitRaw {
+            node: node.clone(),
+            embedding: embedding.clone(),
+        };
+        self.write_journal_unlocked(&mutation).await?;
+        self.apply_raw_commit_unlocked(node, embedding).await?;
+        self.clear_journal_unlocked().await
+    }
+
+    pub(super) async fn commit_abstract_unlocked(
+        &self,
+        node: &AbstractNode,
+        embedding: &Embedding,
+    ) -> Result<()> {
+        let mutation = MutationJournal::CommitAbstract {
+            node: node.clone(),
+            embedding: embedding.clone(),
+        };
+        self.write_journal_unlocked(&mutation).await?;
+        self.apply_abstract_commit_unlocked(node, embedding).await?;
+        self.clear_journal_unlocked().await
+    }
+
+    pub(super) async fn update_raw_lifecycle_unlocked(
+        &self,
+        ids: &[RawNodeId],
+        patch: &RawLifecyclePatch,
+    ) -> Result<()> {
+        let mutation = MutationJournal::UpdateRawLifecycle {
+            ids: ids.to_vec(),
+            patch: patch.clone(),
+        };
+        self.write_journal_unlocked(&mutation).await?;
+        self.apply_raw_lifecycle_unlocked(ids, patch).await?;
+        self.clear_journal_unlocked().await
+    }
+
+    async fn write_journal_unlocked(&self, mutation: &MutationJournal) -> Result<()> {
+        self.write_json(&self.journal_path(), mutation).await
+    }
+
+    async fn clear_journal_unlocked(&self) -> Result<()> {
+        self.remove_file_if_exists(&self.journal_path()).await?;
+        self.sync_directory(&self.journal_dir()).await
+    }
+
+    async fn replay_journal_unlocked(&self) -> Result<()> {
+        let Some(mutation) = self
+            .try_read_json::<MutationJournal>(&self.journal_path())
+            .await?
+        else {
+            return Ok(());
+        };
+        match &mutation {
+            MutationJournal::CommitRaw { node, embedding } => {
+                self.apply_raw_commit_unlocked(node, embedding).await?;
+            }
+            MutationJournal::CommitAbstract { node, embedding } => {
+                self.apply_abstract_commit_unlocked(node, embedding).await?;
+            }
+            MutationJournal::UpdateRawLifecycle { ids, patch } => {
+                self.apply_raw_lifecycle_unlocked(ids, patch).await?;
+            }
+        }
+        self.clear_journal_unlocked().await
+    }
+
+    async fn apply_raw_commit_unlocked(&self, node: &RawNode, embedding: &Embedding) -> Result<()> {
+        self.write_json(&self.raw_path(&node.id), node).await?;
+        if let Some(operation_key) = &node.operation_key {
+            self.write_json(
+                &self.raw_operation_path(operation_key),
+                &StoredId {
+                    id: node.id,
+                    operation_key: operation_key.clone(),
+                },
+            )
+            .await?;
+        }
+        self.sync_raw_indexes_unlocked(node).await?;
+        self.write_json(
+            &self.raw_embedding_path(&node.id),
+            &StoredEmbedding {
+                id: node.id,
+                embedding: embedding.clone(),
+                indexed_at: node.timestamp,
+                session_id: node.session_id,
+            },
+        )
+        .await?;
+        let evicted = self
+            .upsert_manifest_id_unlocked(
+                &self.raw_embedding_shard_path(node.session_id.as_ref()),
+                node.id,
+            )
+            .await?;
+        for id in evicted {
+            self.remove_file_if_exists(&self.raw_embedding_path(&id))
+                .await?;
+        }
+        self.touch_metadata_unlocked().await
+    }
+
+    async fn apply_abstract_commit_unlocked(
+        &self,
+        node: &AbstractNode,
+        embedding: &Embedding,
+    ) -> Result<()> {
+        self.write_json(&self.abstract_path(&node.id), node).await?;
+        if let Some(operation_key) = &node.operation_key {
+            self.write_json(
+                &self.abstract_operation_path(operation_key),
+                &StoredId {
+                    id: node.id,
+                    operation_key: operation_key.clone(),
+                },
+            )
+            .await?;
+        }
+        self.write_json(
+            &self.abstract_embedding_path(&node.id),
+            &StoredEmbedding {
+                id: node.id,
+                embedding: embedding.clone(),
+                indexed_at: node.timestamp,
+                session_id: node.session_id,
+            },
+        )
+        .await?;
+        let evicted = self
+            .upsert_manifest_id_unlocked(
+                &self.abstract_embedding_shard_path(node.session_id.as_ref()),
+                node.id,
+            )
+            .await?;
+        for id in evicted {
+            self.remove_file_if_exists(&self.abstract_embedding_path(&id))
+                .await?;
+        }
+        self.write_json(
+            &self.graph_path(&node.id),
+            &StoredGraphEdges {
+                node_id: node.id,
+                session_id: node.session_id,
+                edges: ObjectGraphRepository::edges_for_abstract(node),
+            },
+        )
+        .await?;
+        self.touch_metadata_unlocked().await
+    }
+
+    async fn apply_raw_lifecycle_unlocked(
+        &self,
+        ids: &[RawNodeId],
+        patch: &RawLifecyclePatch,
+    ) -> Result<()> {
+        let mut changed = false;
+        for id in ids {
+            if let Some(mut node) = self.try_read_json::<RawNode>(&self.raw_path(id)).await? {
+                if let Some(distillation_state) = &patch.distillation_state {
+                    node.distillation_state = distillation_state.clone();
+                }
+                if let Some(overflow) = &patch.overflow {
+                    node.overflow = overflow.clone();
+                }
+                self.write_json(&self.raw_path(id), &node).await?;
+                self.sync_raw_indexes_unlocked(&node).await?;
+                changed = true;
+            }
+        }
+        if changed {
+            self.touch_metadata_unlocked().await?;
+        }
+        Ok(())
+    }
+
+    async fn sync_directory(&self, directory: &Path) -> Result<()> {
+        let directory = directory.to_path_buf();
+        tokio::task::spawn_blocking(move || File::open(&directory)?.sync_all())
+            .await
+            .map_err(|err| EngineError::Storage(format!("directory sync task failed: {err}")))?
+            .map_err(|err| EngineError::Storage(format!("failed to sync directory: {err}")))
     }
 
     pub(super) async fn read_raw_by_ids_unlocked(&self, ids: &[RawNodeId]) -> Result<Vec<RawNode>> {
@@ -1081,6 +1526,25 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct StoredId<Id> {
     pub(super) id: Id,
+    #[serde(default)]
+    pub(super) operation_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MutationJournal {
+    CommitRaw {
+        node: RawNode,
+        embedding: Embedding,
+    },
+    CommitAbstract {
+        node: AbstractNode,
+        embedding: Embedding,
+    },
+    UpdateRawLifecycle {
+        ids: Vec<RawNodeId>,
+        patch: RawLifecyclePatch,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1100,6 +1564,8 @@ struct IdManifest<Id> {
 pub(super) struct StoredEmbedding<Id> {
     pub(super) id: Id,
     pub(super) embedding: Embedding,
+    #[serde(default = "default_indexed_at")]
+    pub(super) indexed_at: DateTime<Utc>,
     /// Session id this embedding was indexed for. `None` represents either
     /// (a) legacy entries written before the session-aware index existed, or
     /// (b) intentionally session-less indexing. The search filter treats
@@ -1109,6 +1575,10 @@ pub(super) struct StoredEmbedding<Id> {
     /// without the field deserializes cleanly into the legacy bucket.
     #[serde(default)]
     pub(super) session_id: Option<SessionId>,
+}
+
+fn default_indexed_at() -> DateTime<Utc> {
+    DateTime::<Utc>::UNIX_EPOCH
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1160,20 +1630,7 @@ fn sort_raw_index_entries(entries: &mut [RawIndexEntry]) {
 }
 
 fn encode_operation_key(source: &str) -> String {
-    let mut encoded = String::with_capacity(source.len() * 2);
-    for byte in source.bytes() {
-        encoded.push(hex_char(byte >> 4));
-        encoded.push(hex_char(byte & 0x0f));
-    }
-    encoded
-}
-
-fn hex_char(value: u8) -> char {
-    match value {
-        0..=9 => (b'0' + value) as char,
-        10..=15 => (b'a' + (value - 10)) as char,
-        _ => unreachable!("hex nibble must be between 0 and 15"),
-    }
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, source.as_bytes()).to_string()
 }
 
 #[cfg(test)]
@@ -1182,7 +1639,11 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::FileObjectStore;
+    use super::{FileObjectStore, MutationJournal};
+    use crate::domain::{DistillationState, RawNode, RawNodeKind};
+    use crate::model::Embedding;
+    use crate::storage::object_store::ObjectNodeRepository;
+    use crate::storage::{NodeRepository, RawLifecyclePatch, VectorIndex};
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1220,10 +1681,6 @@ mod tests {
     // with a rename ENOENT.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_stores_on_one_root_serialize() -> crate::Result<()> {
-        use crate::domain::{RawNode, RawNodeKind};
-        use crate::storage::object_store::ObjectNodeRepository;
-        use crate::storage::traits::NodeRepository;
-
         let root = temp_root("concurrent");
         let session_id = crate::SessionId::new();
         let loop_id = crate::LoopId::new();
@@ -1268,6 +1725,182 @@ mod tests {
         assert_eq!(session.len(), total);
 
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_replays_raw_commit_before_index_validation() -> crate::Result<()> {
+        let root = temp_root("journal-raw");
+        let store = FileObjectStore::open_async(&root).await?;
+        let session_id = crate::SessionId::new();
+        let node = RawNode::text(
+            RawNodeKind::Note,
+            Some(session_id),
+            Some(crate::LoopId::new()),
+            "test",
+            "journaled",
+            0.5,
+            Vec::new(),
+        )
+        .with_operation_key("journal-raw-operation");
+        store
+            .write_json(
+                &store.journal_path(),
+                &MutationJournal::CommitRaw {
+                    node: node.clone(),
+                    embedding: Embedding(vec![1.0, 0.0]),
+                },
+            )
+            .await?;
+        drop(store);
+
+        let reopened = FileObjectStore::open_async(&root).await?;
+        let repository = ObjectNodeRepository::new(reopened.clone());
+        assert_eq!(
+            repository
+                .get_raw_by_operation_key("journal-raw-operation")
+                .await?
+                .map(|value| value.id),
+            Some(node.id)
+        );
+        let vector = super::super::ObjectVectorIndex::new(reopened);
+        assert_eq!(
+            vector
+                .search_raw(&Embedding(vec![1.0, 0.0]), 1, Some(&session_id))
+                .await?
+                .first()
+                .map(|hit| hit.id),
+            Some(node.id)
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_journal_finishes_partial_lifecycle_update() -> crate::Result<()> {
+        let root = temp_root("journal-lifecycle");
+        let store = FileObjectStore::open_async(&root).await?;
+        let repository = ObjectNodeRepository::new(store.clone());
+        let session_id = crate::SessionId::new();
+        let loop_id = crate::LoopId::new();
+        let first = RawNode::text(
+            RawNodeKind::Note,
+            Some(session_id),
+            Some(loop_id),
+            "test",
+            "first",
+            0.5,
+            Vec::new(),
+        );
+        let second = RawNode::text(
+            RawNodeKind::Note,
+            Some(session_id),
+            Some(loop_id),
+            "test",
+            "second",
+            0.5,
+            Vec::new(),
+        );
+        repository.insert_raw(first.clone()).await?;
+        repository.insert_raw(second.clone()).await?;
+        let patch = RawLifecyclePatch {
+            distillation_state: Some(DistillationState::Distilled),
+            overflow: None,
+        };
+        store
+            .write_json(
+                &store.journal_path(),
+                &MutationJournal::UpdateRawLifecycle {
+                    ids: vec![first.id, second.id],
+                    patch: patch.clone(),
+                },
+            )
+            .await?;
+        let mut partially_updated = first.clone();
+        partially_updated.distillation_state = DistillationState::Distilled;
+        store
+            .write_json(&store.raw_path(&first.id), &partially_updated)
+            .await?;
+        drop(repository);
+        drop(store);
+
+        let reopened = FileObjectStore::open_async(&root).await?;
+        let repository = ObjectNodeRepository::new(reopened);
+        for id in [first.id, second.id] {
+            assert_eq!(
+                repository
+                    .get_raw(&id)
+                    .await?
+                    .expect("replayed raw")
+                    .distillation_state,
+                DistillationState::Distilled
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_body_is_quarantined_and_open_fails_closed() -> crate::Result<()> {
+        let root = temp_root("quarantine");
+        let store = FileObjectStore::open_async(&root).await?;
+        let corrupt_path = store.raw_path(&crate::RawNodeId::new());
+        std::fs::write(&corrupt_path, b"{not-json").map_err(|err| {
+            crate::EngineError::Storage(format!("failed to stage corrupt body: {err}"))
+        })?;
+        drop(store);
+
+        assert!(FileObjectStore::open_async(&root).await.is_err());
+        let quarantined = std::fs::read_dir(root.join("quarantine"))
+            .map_err(|err| crate::EngineError::Storage(err.to_string()))?
+            .count();
+        assert_eq!(quarantined, 1);
+        FileObjectStore::open_async(&root).await?;
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_recovery_journal_remains_blocking() -> crate::Result<()> {
+        let root = temp_root("corrupt-journal");
+        let store = FileObjectStore::open_async(&root).await?;
+        std::fs::write(store.journal_path(), b"{not-json").map_err(|err| {
+            crate::EngineError::Storage(format!("failed to stage corrupt journal: {err}"))
+        })?;
+        drop(store);
+        assert!(FileObjectStore::open_async(&root).await.is_err());
+        assert!(root.join("journal/current.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_reaps_abandoned_temporary_files() -> crate::Result<()> {
+        let root = temp_root("temp-reaper");
+        let store = FileObjectStore::open_async(&root).await?;
+        let abandoned = root.join("raw/abandoned.tmp");
+        std::fs::write(&abandoned, b"partial").map_err(|err| {
+            crate::EngineError::Storage(format!("failed to stage temporary file: {err}"))
+        })?;
+        drop(store);
+        FileObjectStore::open_async(&root).await?;
+        assert!(!abandoned.exists());
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_root_is_rejected() -> crate::Result<()> {
+        let target = temp_root("symlink-target");
+        let link = temp_root("symlink-link");
+        std::fs::create_dir_all(&target)
+            .map_err(|err| crate::EngineError::Storage(err.to_string()))?;
+        std::os::unix::fs::symlink(&target, &link)
+            .map_err(|err| crate::EngineError::Storage(err.to_string()))?;
+        assert!(FileObjectStore::open(&link).is_err());
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir_all(target);
         Ok(())
     }
 }

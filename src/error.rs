@@ -14,6 +14,11 @@ pub enum EngineError {
     Model(String),
     #[error("tool error: {0}")]
     Tool(String),
+    #[error("tool outcome is indeterminate for idempotency_key={idempotency_key}: {reason}")]
+    ToolOutcomeIndeterminate {
+        idempotency_key: String,
+        reason: String,
+    },
     #[error("operation cancelled")]
     Cancelled,
     #[error("loop checkpoint not found for session={session_id} loop={loop_id}")]

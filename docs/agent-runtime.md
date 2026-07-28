@@ -30,6 +30,10 @@ Takos wrapperは`ExecutionProfile::ExternalContext`を明示します。このpr
 一度だけ渡し、engineのsession/memory string contextへ複製しません。graph/tool budget、timeout、cancellation、checkpoint、native
 tool-call ID、`SessionResponse.turn_messages`はmemory-aware profileと共通です。
 
+durable recoveryを使うlibrary consumerは`RunOptions.loop_id`にcaller-stable IDを渡します。checkpointはschema version、
+profile固有`graph_id`、session / loop identityを照合するため、別graphや別runの状態を誤って再開しません。Takos wrapperは
+引き続きWorker canonical historyからrunを再構築し、container checkpointをproduct authorityにはしません。
+
 ## Runtime flow
 
 ```text
@@ -64,6 +68,9 @@ engineの`semantic_search_memory` / `graph_search_memory` / `provenance_lookup` 
 consumer向けprimitiveです。Takos production wrapperはexternal-context profileを使うため、これらをlocal product memory authorityや
 turn-local duplicate memoryとして実行しません。
 
+memory-aware consumer向けの4 memory toolはstandard graphがcurrent sessionを強制します。modelが別sessionをargumentsへ
+入れても上書きし、vector / graph / provenance / timelineの各層でscopeを再検証します。
+
 ## History and model protocol
 
 Workerのconversation-history responseは`system` / `user` / `assistant` / `tool` role、`tool_calls`、`tool_call_id`を保持した
@@ -79,11 +86,22 @@ nameや配列順だけで相関しません。
 
 `ToolExecutor::execution_kind` は各callを read-only / side-effecting に分類します。engineは隣接するread-only callだけを
 parallel実行し、side-effecting callをprovider順のbarrierとして直列実行します。未分類はside-effecting扱いでfail-closedに
-します。
+します。call数・ID / name・argumentsはdispatch前に検証し、上限超過を黙ってdropしません。
 
-tool-result contentはmemory-aware / external-contextの両profileでcurrent turn合計`reserve_tools`以内にclampします。correlation
-messageは落とさず、超過内容をstructured previewへ変換します。完全なlarge outputはtool実装がartifact/objectへ保存し、modelには
-bounded preview/referenceを返す責務です。
+wrapperは`ToolExecutor::execute_with_context`で渡される`session_id`、`loop_id`、`idempotency_key`、timeout、
+cancellation tokenをWorker control RPCまで伝播します。Workerのdurable tool operationはengine keyをconditional
+create / lookupのfenceとして使い、同じkeyの再送で副作用を二重実行しません。`recovery_is_idempotent`は、このend-to-end
+fenceが実在するcallにだけtrueを返します。
+
+read-only callのtimeoutは通常のtool errorとしてmodelへ返せます。side-effecting callはdispatch後にtimeout /
+cancellationになってもremote commitの有無をengineから判定できないため、`ToolOutcomeIndeterminate`でrunを停止します。
+wrapperはこの状態を一般的な失敗へ潰さず、idempotency keyとともにWorkerへ返します。子process / HTTP requestの中止・reapは
+executor実装の責務です。
+
+tool-result envelopeはmemory-aware / external-contextの両profileで`max_tool_result_bytes`以内へ縮約し、current turn全体も
+`reserve_tools`以内にclampします。correlation messageは落とさず、超過内容をstructured previewへ変換します。engine local
+storeにfull resultを残す前提にはしません。完全なlarge outputはWorker/tool実装がdurable artifact/objectへ先に保存し、
+modelにはbounded preview/referenceを返します。
 
 ## Source owners
 
@@ -96,9 +114,12 @@ bounded preview/referenceを返す責務です。
 
 ```bash
 cd takos-agent-engine
-cargo test --features test-support
-cargo fmt --check
-cargo clippy --all-targets --features test-support -- -D warnings
+cargo fmt --all --check
+cargo check --locked --lib --no-default-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+cargo +1.85.0 check --locked --all-targets --all-features
 
 cd ../takos/containers/agent
 cargo test --features mock-llm

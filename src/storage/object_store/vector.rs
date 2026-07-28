@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::Utc;
 
 use crate::error::Result;
 use crate::ids::{AbstractNodeId, RawNodeId, SessionId};
@@ -36,13 +37,14 @@ impl VectorIndex for ObjectVectorIndex {
         embedding: Embedding,
         session_id: Option<SessionId>,
     ) -> Result<()> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         self.store
             .write_json(
                 &self.store.raw_embedding_path(&id),
                 &StoredEmbedding {
                     id,
                     embedding,
+                    indexed_at: Utc::now(),
                     session_id,
                 },
             )
@@ -50,12 +52,18 @@ impl VectorIndex for ObjectVectorIndex {
         // Index into the per-session shard so a session-scoped search only scans
         // its own session's embeddings (the `none` shard for legacy/session-less
         // entries). [C3]
-        self.store
+        let evicted = self
+            .store
             .upsert_manifest_id_unlocked(
                 &self.store.raw_embedding_shard_path(session_id.as_ref()),
                 id,
             )
             .await?;
+        for evicted_id in evicted {
+            self.store
+                .remove_file_if_exists(&self.store.raw_embedding_path(&evicted_id))
+                .await?;
+        }
         self.store.touch_metadata_unlocked().await
     }
 
@@ -65,18 +73,20 @@ impl VectorIndex for ObjectVectorIndex {
         embedding: Embedding,
         session_id: Option<SessionId>,
     ) -> Result<()> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         self.store
             .write_json(
                 &self.store.abstract_embedding_path(&id),
                 &StoredEmbedding {
                     id,
                     embedding,
+                    indexed_at: Utc::now(),
                     session_id,
                 },
             )
             .await?;
-        self.store
+        let evicted = self
+            .store
             .upsert_manifest_id_unlocked(
                 &self
                     .store
@@ -84,6 +94,11 @@ impl VectorIndex for ObjectVectorIndex {
                 id,
             )
             .await?;
+        for evicted_id in evicted {
+            self.store
+                .remove_file_if_exists(&self.store.abstract_embedding_path(&evicted_id))
+                .await?;
+        }
         self.store.touch_metadata_unlocked().await
     }
 
@@ -93,7 +108,7 @@ impl VectorIndex for ObjectVectorIndex {
         top_k: usize,
         session_id: Option<&SessionId>,
     ) -> Result<Vec<ScoredRawRef>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         let mut scored = Vec::new();
         // Read only the requested session's shard (the `none` shard for a
         // session-less search). Every id in that shard belongs to the session,
@@ -127,7 +142,7 @@ impl VectorIndex for ObjectVectorIndex {
         top_k: usize,
         session_id: Option<&SessionId>,
     ) -> Result<Vec<ScoredAbstractRef>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         let mut scored = Vec::new();
         for id in self
             .store

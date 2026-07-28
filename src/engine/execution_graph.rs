@@ -42,6 +42,14 @@ impl ExecutionProfile {
     pub const fn uses_local_memory(self) -> bool {
         matches!(self, Self::MemoryAware)
     }
+
+    #[must_use]
+    pub const fn graph_id(self) -> &'static str {
+        match self {
+            Self::MemoryAware => "memory-aware-v1",
+            Self::ExternalContext => "external-context-v1",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +162,8 @@ impl ExecutionState {
     /// serialized into JSON for inclusion in the checkpoint.
     pub fn checkpoint(&self, current_node: String, status: LoopStatus) -> Result<LoopState> {
         Ok(LoopState {
+            checkpoint_version: 1,
+            graph_id: self.execution_profile.graph_id().to_string(),
             session_id: self.session_id,
             loop_id: self.loop_id,
             current_node,
@@ -169,11 +179,30 @@ impl ExecutionState {
     /// Returns an [`EngineError::Storage`] when the checkpoint's `state_json`
     /// cannot be deserialized back into an `ExecutionState`.
     pub fn from_checkpoint(checkpoint: LoopState) -> Result<(Self, String, LoopStatus)> {
+        if checkpoint.checkpoint_version != 1 {
+            return Err(EngineError::RecoveryUnsafe(format!(
+                "unsupported checkpoint schema version {}",
+                checkpoint.checkpoint_version
+            )));
+        }
         let state: Self = serde_json::from_value(checkpoint.state_json).map_err(|err| {
             EngineError::Storage(format!(
                 "failed to deserialize loop checkpoint state: {err}"
             ))
         })?;
+        if state.session_id != checkpoint.session_id || state.loop_id != checkpoint.loop_id {
+            return Err(EngineError::RecoveryUnsafe(
+                "checkpoint envelope identity does not match serialized execution state"
+                    .to_string(),
+            ));
+        }
+        if checkpoint.graph_id != state.execution_profile.graph_id() {
+            return Err(EngineError::RecoveryUnsafe(format!(
+                "checkpoint graph {} does not match execution profile graph {}",
+                checkpoint.graph_id,
+                state.execution_profile.graph_id()
+            )));
+        }
         Ok((state, checkpoint.current_node, checkpoint.status))
     }
 }
@@ -208,6 +237,9 @@ pub struct GraphRunResult {
 
 #[derive(Clone, Default)]
 pub struct RunOptions {
+    /// Caller-stable loop identity for durable recovery. Ephemeral callers may
+    /// leave it unset and receive a generated id in `SessionResponse`.
+    pub loop_id: Option<LoopId>,
     pub max_graph_steps: Option<u32>,
     pub max_tool_rounds: Option<u32>,
     pub node_timeout: Option<Duration>,
@@ -244,25 +276,32 @@ impl ResolvedRunOptions {
         Self {
             max_graph_steps: options
                 .max_graph_steps
-                .unwrap_or(config.runtime.max_graph_steps),
+                .unwrap_or(config.runtime.max_graph_steps)
+                .min(config.runtime.max_graph_steps),
             max_tool_rounds: options
                 .max_tool_rounds
-                .unwrap_or(config.runtime.max_tool_rounds),
+                .unwrap_or(config.runtime.max_tool_rounds)
+                .min(config.runtime.max_tool_rounds),
             node_timeout: options
                 .node_timeout
-                .unwrap_or_else(|| config.runtime.node_timeout()),
+                .unwrap_or_else(|| config.runtime.node_timeout())
+                .min(config.runtime.node_timeout()),
             model_timeout: options
                 .model_timeout
-                .unwrap_or_else(|| config.runtime.model_timeout()),
+                .unwrap_or_else(|| config.runtime.model_timeout())
+                .min(config.runtime.model_timeout()),
             tool_timeout: options
                 .tool_timeout
-                .unwrap_or_else(|| config.runtime.tool_timeout()),
+                .unwrap_or_else(|| config.runtime.tool_timeout())
+                .min(config.runtime.tool_timeout()),
             distillation_timeout: options
                 .distillation_timeout
-                .unwrap_or_else(|| config.runtime.distillation_timeout()),
+                .unwrap_or_else(|| config.runtime.distillation_timeout())
+                .min(config.runtime.distillation_timeout()),
             maintenance_batch_size: options
                 .maintenance_batch_size
-                .unwrap_or(config.runtime.maintenance_batch_size),
+                .unwrap_or(config.runtime.maintenance_batch_size)
+                .min(config.runtime.maintenance_batch_size),
             cancellation_token: options.cancellation_token,
             execution_profile: options.execution_profile,
         }
@@ -282,6 +321,31 @@ impl ResolvedRunOptions {
         self.cancellation_token
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.max_graph_steps == 0
+            || self.max_tool_rounds == 0
+            || self.maintenance_batch_size == 0
+        {
+            return Err(EngineError::Configuration(
+                "run option budgets must be greater than zero".to_string(),
+            ));
+        }
+        if [
+            self.node_timeout,
+            self.model_timeout,
+            self.tool_timeout,
+            self.distillation_timeout,
+        ]
+        .into_iter()
+        .any(|timeout| timeout.is_zero())
+        {
+            return Err(EngineError::Configuration(
+                "run option timeouts must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -403,6 +467,7 @@ impl GraphRunner {
         deps: &EngineDeps,
         options: &ResolvedRunOptions,
     ) -> Result<GraphRunResult> {
+        options.validate()?;
         // `GraphRunner` is public and callers are not required to construct
         // state through `run_turn_with_options`. Persist the selected profile
         // before the first checkpoint so a direct external-context run can be
@@ -430,6 +495,7 @@ impl GraphRunner {
         deps: &EngineDeps,
         options: &ResolvedRunOptions,
     ) -> Result<(ExecutionState, GraphRunResult)> {
+        options.validate()?;
         if checkpoint.status != LoopStatus::Paused {
             return Err(EngineError::LoopTerminated(checkpoint.status));
         }
@@ -463,6 +529,7 @@ impl GraphRunner {
         deps: &EngineDeps,
         options: &ResolvedRunOptions,
     ) -> Result<(ExecutionState, GraphRunResult)> {
+        options.validate()?;
         if checkpoint.status != LoopStatus::Running {
             return Err(EngineError::LoopTerminated(checkpoint.status));
         }
@@ -542,6 +609,7 @@ impl GraphRunner {
                 });
             }
 
+            let node = self.graph.node(&current_node)?.clone();
             state.iteration = state.iteration.saturating_add(1);
             let running = state.checkpoint(current_node.clone(), LoopStatus::Running)?;
             deps.loop_state_repository.save_checkpoint(running).await?;
@@ -551,7 +619,6 @@ impl GraphRunner {
                     .await;
             }
 
-            let node = self.graph.node(&current_node)?.clone();
             debug!(
                 session_id = %state.session_id,
                 loop_id = %state.loop_id,
@@ -568,14 +635,10 @@ impl GraphRunner {
                 // serial side-effect phase off part-way through and loses the
                 // completed results. The per-call timeouts, fan-out cap, graph
                 // step budget, and cancellation token keep this node bounded.
-                if let Some(token) = &options.cancellation_token {
-                    tokio::select! {
-                        () = token.cancelled() => NodeExecutionResult::Cancelled,
-                        result = node_future => NodeExecutionResult::Completed(result),
-                    }
-                } else {
-                    NodeExecutionResult::Completed(node_future.await)
-                }
+                // ExecuteToolsNode owns cancellation after dispatch so it can
+                // distinguish a clean pre-dispatch cancel from an ambiguous
+                // side-effecting outcome.
+                NodeExecutionResult::Completed(node_future.await)
             } else {
                 let run_node = timeout(options.timeout_for_class(runtime_class), node_future);
                 if let Some(token) = &options.cancellation_token {
@@ -627,7 +690,7 @@ impl GraphRunner {
                 }
             };
 
-            if options.is_cancelled() {
+            if options.is_cancelled() && runtime_class != NodeRuntimeClass::ToolExecution {
                 return self
                     .save_cancelled_checkpoint(&current_node, state, deps)
                     .await;
@@ -676,5 +739,84 @@ impl GraphRunner {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_identity_tests {
+    use super::*;
+    use crate::engine::session_engine::SessionRequest;
+
+    fn checkpoint() -> LoopState {
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let state = ExecutionState::from_request(
+            SessionRequest {
+                session_id: Some(session_id),
+                user_message: "checkpoint".to_string(),
+                plan: None,
+            },
+            session_id,
+            loop_id,
+        );
+        state
+            .checkpoint("load_session_view".to_string(), LoopStatus::Running)
+            .expect("checkpoint should serialize")
+    }
+
+    #[test]
+    fn checkpoint_rejects_outer_inner_identity_mismatch() {
+        let mut checkpoint = checkpoint();
+        checkpoint.session_id = SessionId::new();
+        assert!(matches!(
+            ExecutionState::from_checkpoint(checkpoint),
+            Err(EngineError::RecoveryUnsafe(_))
+        ));
+    }
+
+    #[test]
+    fn checkpoint_rejects_graph_and_schema_mismatch() {
+        let mut graph_mismatch = checkpoint();
+        graph_mismatch.graph_id = "different-graph".to_string();
+        assert!(matches!(
+            ExecutionState::from_checkpoint(graph_mismatch),
+            Err(EngineError::RecoveryUnsafe(_))
+        ));
+
+        let mut version_mismatch = checkpoint();
+        version_mismatch.checkpoint_version = 99;
+        assert!(matches!(
+            ExecutionState::from_checkpoint(version_mismatch),
+            Err(EngineError::RecoveryUnsafe(_))
+        ));
+    }
+
+    #[test]
+    fn run_options_cannot_disable_or_expand_configured_guards() {
+        let config = EngineConfig::default();
+        let zero = ResolvedRunOptions::from_config(
+            &config,
+            RunOptions {
+                max_graph_steps: Some(0),
+                ..RunOptions::default()
+            },
+        );
+        assert!(zero.validate().is_err());
+
+        let expanded = ResolvedRunOptions::from_config(
+            &config,
+            RunOptions {
+                max_graph_steps: Some(u32::MAX),
+                tool_timeout: Some(Duration::MAX),
+                maintenance_batch_size: Some(usize::MAX),
+                ..RunOptions::default()
+            },
+        );
+        assert_eq!(expanded.max_graph_steps, config.runtime.max_graph_steps);
+        assert_eq!(expanded.tool_timeout, config.runtime.tool_timeout());
+        assert_eq!(
+            expanded.maintenance_batch_size,
+            config.runtime.maintenance_batch_size
+        );
     }
 }

@@ -9,13 +9,26 @@ use crate::model::openai_http::send_with_retry;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiEmbeddingConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
     pub dimensions: Option<u32>,
     pub timeout: Duration,
+}
+
+impl std::fmt::Debug for OpenAiEmbeddingConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiEmbeddingConfig")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &"[REDACTED]")
+            .field("dimensions", &self.dimensions)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl OpenAiEmbeddingConfig {
@@ -40,10 +53,19 @@ impl OpenAiEmbeddingConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiCompatibleEmbedder {
     client: reqwest::Client,
     config: OpenAiEmbeddingConfig,
+}
+
+impl std::fmt::Debug for OpenAiCompatibleEmbedder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiCompatibleEmbedder")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OpenAiCompatibleEmbedder {
@@ -304,6 +326,21 @@ mod tests {
         let err = OpenAiCompatibleEmbedder::new("embedding-model", "").unwrap_err();
         assert!(matches!(err, EngineError::Configuration(_)));
         assert!(err.to_string().contains("api_key"));
+    }
+
+    #[test]
+    fn debug_output_never_exposes_the_api_key() {
+        let secret = "sk-super-secret-debug-value";
+        let config = OpenAiEmbeddingConfig::new("embedding-model", secret);
+        let config_debug = format!("{config:?}");
+        assert!(!config_debug.contains(secret));
+        assert!(config_debug.contains("[REDACTED]"));
+
+        let embedder =
+            OpenAiCompatibleEmbedder::with_config(config).expect("a non-empty config should build");
+        let embedder_debug = format!("{embedder:?}");
+        assert!(!embedder_debug.contains(secret));
+        assert!(embedder_debug.contains("[REDACTED]"));
     }
 
     struct FakeEmbeddingServer {

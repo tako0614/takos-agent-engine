@@ -27,6 +27,10 @@ pub enum LoopStatus {
 /// now-unknown fields). \[Q3]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoopState {
+    #[serde(default)]
+    pub checkpoint_version: u32,
+    #[serde(default)]
+    pub graph_id: String,
     pub session_id: SessionId,
     pub loop_id: LoopId,
     pub current_node: String,
@@ -38,6 +42,8 @@ impl LoopState {
     #[cfg(test)]
     pub(crate) fn new_for_test(session_id: SessionId, loop_id: LoopId, _goal: &str) -> Self {
         Self {
+            checkpoint_version: 1,
+            graph_id: "memory-aware-v1".to_string(),
             session_id,
             loop_id,
             current_node: "start".to_string(),

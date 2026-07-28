@@ -23,7 +23,7 @@ impl ObjectLoopStateRepository {
 #[async_trait]
 impl LoopStateRepository for ObjectLoopStateRepository {
     async fn save_checkpoint(&self, state: LoopState) -> Result<()> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         self.store
             .write_json(
                 &self
@@ -40,14 +40,14 @@ impl LoopStateRepository for ObjectLoopStateRepository {
         session_id: &SessionId,
         loop_id: &LoopId,
     ) -> Result<Option<LoopState>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         self.store
             .try_read_json(&self.store.checkpoint_path(session_id, loop_id))
             .await
     }
 
     async fn clear_checkpoint(&self, session_id: &SessionId, loop_id: &LoopId) -> Result<()> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         self.store
             .remove_file_if_exists(&self.store.checkpoint_path(session_id, loop_id))
             .await?;

@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{EngineError, Result};
+use crate::ids::{LoopId, SessionId};
 use crate::model::runner::ToolCallRequest;
 
 use super::memory_tools::{
@@ -26,6 +29,47 @@ pub enum ToolExecutionKind {
     SideEffecting,
 }
 
+/// Stable execution identity supplied to every tool invocation.
+///
+/// Side-effecting executors must forward `idempotency_key` to their durable
+/// boundary and should observe `cancellation_token` when they own a child
+/// process or request. The key is identical when an explicitly-safe recovery
+/// retries the same checkpoint.
+#[derive(Clone)]
+pub struct ToolExecutionContext {
+    pub session_id: SessionId,
+    pub loop_id: LoopId,
+    pub idempotency_key: String,
+    pub timeout: Duration,
+    /// Maximum serialized result envelope accepted by the engine.
+    ///
+    /// Remote/process executors should enforce this before materializing a
+    /// `serde_json::Value` in this process, returning an artifact reference and
+    /// bounded preview when the complete result is larger.
+    pub max_result_bytes: usize,
+    pub cancellation_token: Option<CancellationToken>,
+}
+
+impl std::fmt::Debug for ToolExecutionContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolExecutionContext")
+            .field("session_id", &self.session_id)
+            .field("loop_id", &self.loop_id)
+            .field("idempotency_key", &self.idempotency_key)
+            .field("timeout", &self.timeout)
+            .field("max_result_bytes", &self.max_result_bytes)
+            .field(
+                "cancellation_requested",
+                &self
+                    .cancellation_token
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled),
+            )
+            .finish()
+    }
+}
+
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     /// Fail closed: executors must explicitly classify calls as read-only
@@ -34,7 +78,26 @@ pub trait ToolExecutor: Send + Sync {
         ToolExecutionKind::SideEffecting
     }
 
+    /// Whether a `Running` checkpoint may safely invoke this call again with
+    /// the same [`ToolExecutionContext::idempotency_key`]. Read-only calls are
+    /// safe by definition; side-effecting executors must opt in only after
+    /// their remote boundary durably fences that key.
+    fn recovery_is_idempotent(&self, call: &ToolCallRequest) -> bool {
+        self.execution_kind(call) == ToolExecutionKind::ReadOnly
+    }
+
     async fn execute(&self, call: ToolCallRequest) -> Result<ToolCallResult>;
+
+    /// Context-aware execution path. Existing executors remain source
+    /// compatible through the default delegation, while production executors
+    /// can override this to propagate idempotency and cancellation.
+    async fn execute_with_context(
+        &self,
+        _context: ToolExecutionContext,
+        call: ToolCallRequest,
+    ) -> Result<ToolCallResult> {
+        self.execute(call).await
+    }
 }
 
 pub struct DefaultToolExecutor {

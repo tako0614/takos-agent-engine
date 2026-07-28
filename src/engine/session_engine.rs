@@ -7,21 +7,23 @@
 //! lives in [`nodes`](crate::engine::nodes); both are re-exported here so the
 //! crate-facing API paths stay stable.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use tracing::{info_span, instrument};
 
 use crate::config::EngineConfig;
-use crate::domain::{DistillationState, LoopState, LoopStatus, RawNode};
+use crate::domain::{LoopState, LoopStatus};
 use crate::engine::context_assembler::{ContextAssembler, TokenEstimator};
 use crate::engine::execution_graph::{
     ExecutionProfile, ExecutionState, GraphRunner, ResolvedRunOptions, RunOptions,
 };
-use crate::engine::nodes::{build_response, persist_abstract_node};
+use crate::engine::nodes::{
+    build_response, distill_claimed_raw_nodes, trim_conversation_history, EXECUTE_TOOLS_NODE,
+};
 use crate::error::{EngineError, Result};
 use crate::ids::{LoopId, SessionId};
-use crate::memory::{ActivationService, DistillationInput, Distiller, ScoringPolicy};
+use crate::memory::{ActivationService, Distiller, ScoringPolicy};
 use crate::model::{Embedder, ModelRunner};
 use crate::storage::{GraphRepository, LoopStateRepository, NodeRepository, VectorIndex};
 use crate::tools::executor::ToolExecutor;
@@ -121,16 +123,22 @@ pub async fn run_turn_with_options(
     config: &EngineConfig,
     deps: &EngineDeps,
     request: SessionRequest,
-    options: RunOptions,
+    mut options: RunOptions,
 ) -> Result<SessionResponse> {
     config.validate()?;
 
     let session_id = request.session_id.unwrap_or_default();
-    let loop_id = LoopId::new();
+    let loop_id = options.loop_id.unwrap_or_default();
     tracing::Span::current().record("session_id", tracing::field::display(session_id));
     tracing::Span::current().record("loop_id", tracing::field::display(loop_id));
 
-    let conversation_history = options.conversation_history.clone();
+    let conversation_history = trim_conversation_history(
+        &std::mem::take(&mut options.conversation_history),
+        config,
+        deps.token_estimator.as_ref(),
+        &request.user_message,
+        request.plan.as_deref(),
+    )?;
     let resolved_options = ResolvedRunOptions::from_config(config, options);
     let graph = Arc::new(graph_for_profile(resolved_options.execution_profile));
     let runner = GraphRunner::new(graph);
@@ -207,6 +215,19 @@ pub async fn recover_interrupted_loop_with_options(
             checkpoint.current_node
         )));
     }
+    if checkpoint.current_node == EXECUTE_TOOLS_NODE {
+        let (state, _, _) = ExecutionState::from_checkpoint(checkpoint.clone())?;
+        if let Some(call) = state
+            .pending_tool_calls
+            .iter()
+            .find(|call| !deps.tool_executor.recovery_is_idempotent(call))
+        {
+            return Err(EngineError::RecoveryUnsafe(format!(
+                "side-effecting tool {} does not guarantee recovery with the engine idempotency key",
+                call.name
+            )));
+        }
+    }
     let resolved_options = ResolvedRunOptions::from_config(config, options);
     let graph = Arc::new(graph_for_profile(resolved_options.execution_profile));
     let runner = GraphRunner::new(graph);
@@ -230,34 +251,22 @@ pub async fn run_maintenance_pass(
     let resolved_options = ResolvedRunOptions::from_config(config, RunOptions::default());
     let backlog_limit = limit.max(1).min(resolved_options.maintenance_batch_size);
     let backlog = deps.repository.undistilled_raw(backlog_limit, true).await?;
-    // Identify the distinct loops with pushed-out backlog. We use the truncated
-    // backlog only to discover WHICH loops need work; each loop is then distilled
-    // over its FULL pushed-out-undistilled raw set (re-fetched below). This
-    // prevents a loop whose raws straddle the `backlog_limit` boundary from being
-    // distilled in two batches that collide on the same `operation_key`, which
-    // would silently drop the second batch from the distilled layer while still
-    // marking those raws Distilled. [C6]
-    let mut loop_keys: BTreeSet<(SessionId, LoopId)> = BTreeSet::new();
+    // The backlog query is the bounded work queue. Group only the materialized
+    // batch rather than reloading an unbounded loop; stable input-digest keys
+    // let later passes safely distill the next chunk.
+    let mut loop_batches: BTreeMap<(SessionId, LoopId), Vec<_>> = BTreeMap::new();
     for node in backlog {
         if let (Some(session_id), Some(loop_id)) = (node.session_id, node.loop_id) {
-            loop_keys.insert((session_id, loop_id));
+            loop_batches
+                .entry((session_id, loop_id))
+                .or_default()
+                .push(node);
         }
     }
 
     let mut report = MaintenanceReport::default();
-    for (session_id, loop_id) in loop_keys {
-        // Full pushed-out, undistilled set for this loop (not the truncated
-        // batch), so the whole loop is distilled atomically in one pass.
-        let raw_nodes: Vec<RawNode> = deps
-            .repository
-            .raw_for_loop(&loop_id)
-            .await?
-            .into_iter()
-            .filter(|node| {
-                node.distillation_state != DistillationState::Distilled
-                    && node.overflow.was_pushed_out_of_session
-            })
-            .collect();
+    for ((session_id, loop_id), mut raw_nodes) in loop_batches {
+        raw_nodes.truncate(config.runtime.max_loop_nodes);
         if raw_nodes.is_empty() {
             continue;
         }
@@ -268,36 +277,27 @@ pub async fn run_maintenance_pass(
             raw_nodes = raw_nodes.len()
         );
         let _guard = span.enter();
-        let distilled = deps
-            .distiller
-            .distill(DistillationInput {
-                session_id,
-                loop_id,
-                raw_nodes: raw_nodes.clone(),
-                activated_abstract_ids: Vec::new(),
-            })
-            .await?;
-
-        let mut created_for_loop = 0usize;
-        for node in distilled.new_nodes {
-            if persist_abstract_node(deps, node, Some(session_id))
-                .await?
-                .is_some()
-            {
-                report.new_abstract_nodes += 1;
-                created_for_loop += 1;
+        match distill_claimed_raw_nodes(
+            config,
+            deps,
+            &resolved_options,
+            session_id,
+            loop_id,
+            raw_nodes,
+            Vec::new(),
+        )
+        .await?
+        {
+            Some(result) => {
+                report.new_abstract_nodes += result.new_abstract_ids.len();
+                report.updated_raw_nodes += result.updated_raw_nodes;
+                if result.new_abstract_ids.is_empty() {
+                    report.skipped_loops += 1;
+                } else {
+                    report.processed_loops += 1;
+                }
             }
-        }
-        for update in distilled.raw_updates {
-            deps.repository
-                .update_raw_lifecycle(&[update.raw_node_id], &update.patch)
-                .await?;
-            report.updated_raw_nodes += 1;
-        }
-        if created_for_loop == 0 {
-            report.skipped_loops += 1;
-        } else {
-            report.processed_loops += 1;
+            None => report.skipped_loops += 1,
         }
     }
 
@@ -352,7 +352,7 @@ mod tests {
         TestWhitespaceTokenEstimator,
     };
     use crate::tools::executor::{
-        DefaultToolExecutor, ToolCallResult, ToolExecutionKind, ToolExecutor,
+        DefaultToolExecutor, ToolCallResult, ToolExecutionContext, ToolExecutionKind, ToolExecutor,
     };
     use crate::tools::memory_tools::{
         GraphSearchParams, MemorySearchParams, MemoryTools, TimelineSearchParams,
@@ -407,6 +407,28 @@ mod tests {
         assert_eq!(response.status, LoopStatus::Finished);
         assert_eq!(response.tool_results_count, 1);
         assert!(response.assistant_message.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_loop_id_is_preserved() -> Result<()> {
+        let deps = build_demo_deps();
+        let loop_id = LoopId::new();
+        let response = run_turn_with_options(
+            &EngineConfig::default(),
+            &deps,
+            SessionRequest {
+                session_id: None,
+                user_message: "stable recovery identity".to_string(),
+                plan: None,
+            },
+            RunOptions {
+                loop_id: Some(loop_id),
+                ..RunOptions::default()
+            },
+        )
+        .await?;
+        assert_eq!(response.loop_id, loop_id);
         Ok(())
     }
 
@@ -510,6 +532,10 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for PendingToolExecutor {
+        fn execution_kind(&self, _call: &ToolCallRequest) -> ToolExecutionKind {
+            ToolExecutionKind::ReadOnly
+        }
+
         async fn execute(&self, _call: ToolCallRequest) -> Result<ToolCallResult> {
             self.started.notify_waiters();
             std::future::pending::<()>().await;
@@ -1001,12 +1027,100 @@ mod tests {
         Ok(())
     }
 
-    // C6 regression: a single loop whose pushed-out backlog is larger than the
-    // maintenance batch limit must still be distilled in full (no raw left
-    // undistilled / dropped from the distilled layer), and the counters must
-    // distinguish a created loop from a deduped/skipped one.
+    #[derive(Debug)]
+    struct SlowCountingDistiller {
+        calls: AtomicUsize,
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Distiller for SlowCountingDistiller {
+        async fn distill(&self, input: DistillationInput) -> Result<DistillationOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_waiters();
+            sleep(Duration::from_millis(50)).await;
+            TestSimpleDistiller.distill(input).await
+        }
+    }
+
     #[tokio::test]
-    async fn maintenance_distills_full_loop_when_backlog_straddles_batch() -> Result<()> {
+    async fn concurrent_maintenance_claims_each_batch_once() -> Result<()> {
+        let mut deps = build_demo_deps();
+        let distiller = Arc::new(SlowCountingDistiller {
+            calls: AtomicUsize::new(0),
+            started: Arc::new(Notify::new()),
+        });
+        deps.distiller = distiller.clone();
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let mut node = RawNode::text(
+            RawNodeKind::Note,
+            Some(session_id),
+            Some(loop_id),
+            "system",
+            "claim once",
+            0.5,
+            Vec::new(),
+        );
+        node.overflow.was_pushed_out_of_session = true;
+        deps.repository.insert_raw(node).await?;
+
+        let left_deps = deps.clone();
+        let right_deps = deps.clone();
+        let config = EngineConfig::default();
+        let (left, right) = tokio::join!(
+            run_maintenance_pass(&config, &left_deps, 8),
+            run_maintenance_pass(&config, &right_deps, 8)
+        );
+        let left = left?;
+        let right = right?;
+        assert_eq!(distiller.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(left.processed_loops + right.processed_loops, 1);
+        assert_eq!(left.skipped_loops + right.skipped_loops, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_distillation_claim_cannot_release_successor() -> Result<()> {
+        let deps = build_demo_deps();
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let old = deps
+            .repository
+            .try_claim_distillation(
+                session_id,
+                loop_id,
+                "old".to_string(),
+                Duration::from_millis(1),
+            )
+            .await?
+            .expect("first claim");
+        sleep(Duration::from_millis(5)).await;
+        let successor = deps
+            .repository
+            .try_claim_distillation(
+                session_id,
+                loop_id,
+                "new".to_string(),
+                Duration::from_secs(1),
+            )
+            .await?
+            .expect("expired claim should be replaceable");
+        assert!(!deps.repository.distillation_claim_is_current(&old).await?);
+        deps.repository.release_distillation_claim(&old).await?;
+        assert!(
+            deps.repository
+                .distillation_claim_is_current(&successor)
+                .await?
+        );
+        Ok(())
+    }
+
+    // A loop larger than the maintenance batch is processed in stable,
+    // independently fenced chunks. Repeated passes eventually drain it without
+    // loading the full loop or dropping any raw node.
+    #[tokio::test]
+    async fn maintenance_distills_large_loop_in_bounded_batches() -> Result<()> {
         let deps = build_demo_deps();
         let session_id = SessionId::new();
         let loop_id = LoopId::new();
@@ -1033,19 +1147,21 @@ mod tests {
                 .await?;
         }
 
-        // limit = 2 < total: the discovery query is truncated, but the whole
-        // loop must still be distilled atomically.
         let first = run_maintenance_pass(&EngineConfig::default(), &deps, 2).await?;
         assert_eq!(first.processed_loops, 1);
         assert_eq!(first.new_abstract_nodes, 1);
-        // Every raw of the loop is now distilled -> no pushed-out backlog left.
+        assert_eq!(deps.repository.undistilled_raw(100, true).await?.len(), 3);
+
+        let second = run_maintenance_pass(&EngineConfig::default(), &deps, 2).await?;
+        assert_eq!(second.processed_loops, 1);
+        assert_eq!(deps.repository.undistilled_raw(100, true).await?.len(), 1);
+        let third = run_maintenance_pass(&EngineConfig::default(), &deps, 2).await?;
+        assert_eq!(third.processed_loops, 1);
         assert!(deps.repository.undistilled_raw(100, true).await?.is_empty());
 
-        // A second pass finds nothing to do and is counted as neither created
-        // nor skipped (no loops in the backlog at all).
-        let second = run_maintenance_pass(&EngineConfig::default(), &deps, 2).await?;
-        assert_eq!(second.processed_loops, 0);
-        assert_eq!(second.new_abstract_nodes, 0);
+        let fourth = run_maintenance_pass(&EngineConfig::default(), &deps, 2).await?;
+        assert_eq!(fourth.processed_loops, 0);
+        assert_eq!(fourth.new_abstract_nodes, 0);
         Ok(())
     }
 
@@ -1295,15 +1411,15 @@ mod tests {
         }
     }
 
-    // S3 regression: a single model round emitting more tool calls than the
-    // configured cap must only execute `max_tool_calls_per_round` of them.
+    // A model round over the configured call cap fails as a whole. Silently
+    // dropping the tail would change provider intent.
     #[tokio::test]
-    async fn execute_tools_caps_calls_per_round() -> Result<()> {
+    async fn execute_tools_rejects_calls_over_per_round_cap() -> Result<()> {
         let mut deps = build_demo_deps();
         deps.model_runner = Arc::new(BurstToolModelRunner { calls: 10 });
         let mut config = EngineConfig::default();
         config.runtime.max_tool_calls_per_round = 3;
-        let response = run_turn(
+        let error = run_turn(
             &config,
             &deps,
             SessionRequest {
@@ -1312,11 +1428,10 @@ mod tests {
                 plan: None,
             },
         )
-        .await?;
-        assert_eq!(response.status, LoopStatus::Finished);
-        assert_eq!(
-            response.tool_results_count, 3,
-            "only the capped number of tool calls should execute in a round"
+        .await
+        .expect_err("over-cap model output must fail closed");
+        assert!(
+            matches!(error, EngineError::Tool(message) if message.contains("exceeding max_tool_calls_per_round"))
         );
         Ok(())
     }
@@ -1651,6 +1766,120 @@ mod tests {
         assert_eq!(response.status, LoopStatus::Finished);
         assert_eq!(response.tool_results_count, 2);
         assert_eq!(executor.completed.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct CommitThenPendingToolExecutor {
+        started: Arc<Notify>,
+        calls: Mutex<Vec<String>>,
+        contexts: Mutex<Vec<ToolExecutionContext>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CommitThenPendingToolExecutor {
+        async fn execute(&self, _call: ToolCallRequest) -> Result<ToolCallResult> {
+            unreachable!("the context-aware path must be used")
+        }
+
+        async fn execute_with_context(
+            &self,
+            context: ToolExecutionContext,
+            call: ToolCallRequest,
+        ) -> Result<ToolCallResult> {
+            self.calls.lock().expect("call log").push(call.name.clone());
+            self.contexts.lock().expect("context log").push(context);
+            // Simulate a remote durable commit before the local response is
+            // available. Cancellation from this point is ambiguous.
+            self.started.notify_waiters();
+            std::future::pending::<()>().await;
+            unreachable!("pending side effect should be cancelled")
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_side_effect_dispatch_is_indeterminate_and_replayable() -> Result<()>
+    {
+        let mut deps = build_demo_deps();
+        let model = Arc::new(SequentialSideEffectModelRunner::default());
+        deps.model_runner = model.clone();
+        let started = Arc::new(Notify::new());
+        let executor = Arc::new(CommitThenPendingToolExecutor {
+            started: started.clone(),
+            calls: Mutex::new(Vec::new()),
+            contexts: Mutex::new(Vec::new()),
+        });
+        deps.tool_executor = executor.clone();
+
+        let session_id = SessionId::new();
+        let loop_id = LoopId::new();
+        let token = CancellationToken::new();
+        let run_token = token.clone();
+        let run_deps = deps.clone();
+        let handle = tokio::spawn(async move {
+            run_turn_with_options(
+                &EngineConfig::default(),
+                &run_deps,
+                SessionRequest {
+                    session_id: Some(session_id),
+                    user_message: "perform both writes".to_string(),
+                    plan: None,
+                },
+                RunOptions {
+                    loop_id: Some(loop_id),
+                    execution_profile: ExecutionProfile::ExternalContext,
+                    tool_timeout: Some(Duration::from_secs(5)),
+                    cancellation_token: Some(run_token),
+                    ..RunOptions::default()
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("side effect did not start");
+        token.cancel();
+        let error = handle
+            .await
+            .expect("run task panicked")
+            .expect_err("post-dispatch cancellation must be indeterminate");
+        let expected_key = tool_result_operation_key(loop_id, 1, 0, "write-a");
+        assert!(matches!(
+            error,
+            EngineError::ToolOutcomeIndeterminate {
+                ref idempotency_key,
+                ..
+            } if idempotency_key == &expected_key
+        ));
+        assert_eq!(
+            executor.calls.lock().expect("call log").as_slice(),
+            ["write-a"],
+            "a later side effect must not dispatch after an ambiguous outcome"
+        );
+        {
+            let contexts = executor.contexts.lock().expect("context log");
+            assert_eq!(contexts.len(), 1);
+            assert_eq!(contexts[0].idempotency_key, expected_key);
+            assert_eq!(
+                contexts[0].max_result_bytes,
+                EngineConfig::default().tools.max_tool_result_bytes
+            );
+        }
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+
+        let checkpoint = deps
+            .loop_state_repository
+            .load_checkpoint(&session_id, &loop_id)
+            .await?
+            .expect("failed checkpoint should remain");
+        assert_eq!(checkpoint.status, LoopStatus::Failed);
+        let (state, _, _) = ExecutionState::from_checkpoint(checkpoint)?;
+        assert_eq!(state.pending_tool_calls.len(), 2);
+        assert_eq!(
+            tool_result_operation_key(loop_id, 1, 0, &state.pending_tool_calls[0].name),
+            expected_key
+        );
         Ok(())
     }
 

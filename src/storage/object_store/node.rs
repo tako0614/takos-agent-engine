@@ -1,11 +1,14 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{AbstractNode, RawNode};
 use crate::error::Result;
 use crate::ids::{AbstractNodeId, LoopId, RawNodeId, SessionId};
+use crate::model::Embedding;
 
-use crate::storage::traits::{NodeRepository, RawLifecyclePatch};
+use crate::storage::traits::{DistillationClaim, NodeCommit, NodeRepository, RawLifecyclePatch};
 
 use super::store::{FileObjectStore, StoredId};
 
@@ -24,15 +27,39 @@ impl ObjectNodeRepository {
 #[async_trait]
 impl NodeRepository for ObjectNodeRepository {
     async fn insert_raw(&self, node: RawNode) -> Result<()> {
-        let _guard = self.store.lock().await;
-        // Cross-file write ordering invariant: the durable raw node body MUST be
-        // written (tmp + atomic rename) BEFORE the retrieval indexes are synced.
-        // The body is the source of truth; `FileObjectStore::indexes_are_complete`
-        // reconciles index coverage against the bodies on open and forces a
-        // rebuild if any body is missing from the timeline. If this order were
-        // reversed (index first) a mid-insert crash would instead leave an index
-        // entry pointing at a non-existent body — a worse, self-healing-free
-        // state. Do not reorder these writes.
+        self.insert_raw_once(node).await.map(|_| ())
+    }
+
+    async fn insert_abstract(&self, node: AbstractNode) -> Result<()> {
+        self.insert_abstract_once(node).await.map(|_| ())
+    }
+
+    async fn insert_raw_once(&self, node: RawNode) -> Result<NodeCommit<RawNode>> {
+        let _guard = self.store.lock().await?;
+        if let Some(operation_key) = &node.operation_key {
+            if let Some(record) = self
+                .store
+                .try_read_json::<StoredId<RawNodeId>>(&self.store.raw_operation_path(operation_key))
+                .await?
+            {
+                if record.operation_key != *operation_key {
+                    return Err(crate::EngineError::Storage(
+                        "operation receipt digest collision".to_string(),
+                    ));
+                }
+                if let Some(existing) = self
+                    .store
+                    .try_read_json::<RawNode>(&self.store.raw_path(&record.id))
+                    .await?
+                {
+                    return Ok(NodeCommit {
+                        node: existing,
+                        inserted: false,
+                        projections_committed: false,
+                    });
+                }
+            }
+        }
         self.store
             .write_json(&self.store.raw_path(&node.id), &node)
             .await?;
@@ -40,16 +67,50 @@ impl NodeRepository for ObjectNodeRepository {
             self.store
                 .write_json(
                     &self.store.raw_operation_path(operation_key),
-                    &StoredId { id: node.id },
+                    &StoredId {
+                        id: node.id,
+                        operation_key: operation_key.clone(),
+                    },
                 )
                 .await?;
         }
         self.store.sync_raw_indexes_unlocked(&node).await?;
-        self.store.touch_metadata_unlocked().await
+        self.store.touch_metadata_unlocked().await?;
+        Ok(NodeCommit {
+            node,
+            inserted: true,
+            projections_committed: false,
+        })
     }
 
-    async fn insert_abstract(&self, node: AbstractNode) -> Result<()> {
-        let _guard = self.store.lock().await;
+    async fn insert_abstract_once(&self, node: AbstractNode) -> Result<NodeCommit<AbstractNode>> {
+        let _guard = self.store.lock().await?;
+        if let Some(operation_key) = &node.operation_key {
+            if let Some(record) = self
+                .store
+                .try_read_json::<StoredId<AbstractNodeId>>(
+                    &self.store.abstract_operation_path(operation_key),
+                )
+                .await?
+            {
+                if record.operation_key != *operation_key {
+                    return Err(crate::EngineError::Storage(
+                        "operation receipt digest collision".to_string(),
+                    ));
+                }
+                if let Some(existing) = self
+                    .store
+                    .try_read_json::<AbstractNode>(&self.store.abstract_path(&record.id))
+                    .await?
+                {
+                    return Ok(NodeCommit {
+                        node: existing,
+                        inserted: false,
+                        projections_committed: false,
+                    });
+                }
+            }
+        }
         self.store
             .write_json(&self.store.abstract_path(&node.id), &node)
             .await?;
@@ -57,33 +118,126 @@ impl NodeRepository for ObjectNodeRepository {
             self.store
                 .write_json(
                     &self.store.abstract_operation_path(operation_key),
-                    &StoredId { id: node.id },
+                    &StoredId {
+                        id: node.id,
+                        operation_key: operation_key.clone(),
+                    },
                 )
                 .await?;
         }
-        self.store.touch_metadata_unlocked().await
+        self.store.touch_metadata_unlocked().await?;
+        Ok(NodeCommit {
+            node,
+            inserted: true,
+            projections_committed: false,
+        })
+    }
+
+    async fn commit_raw(&self, node: RawNode, embedding: Embedding) -> Result<NodeCommit<RawNode>> {
+        let _guard = self.store.lock().await?;
+        if let Some(operation_key) = &node.operation_key {
+            if let Some(record) = self
+                .store
+                .try_read_json::<StoredId<RawNodeId>>(&self.store.raw_operation_path(operation_key))
+                .await?
+            {
+                if record.operation_key != *operation_key {
+                    return Err(crate::EngineError::Storage(
+                        "operation receipt digest collision".to_string(),
+                    ));
+                }
+                if let Some(existing) = self
+                    .store
+                    .try_read_json::<RawNode>(&self.store.raw_path(&record.id))
+                    .await?
+                {
+                    return Ok(NodeCommit {
+                        node: existing,
+                        inserted: false,
+                        // Re-apply derived projections at the engine boundary.
+                        // This repairs stores created by pre-WAL versions that
+                        // may have persisted the receipt/body but not the
+                        // embedding (or graph).
+                        projections_committed: false,
+                    });
+                }
+            }
+        }
+        self.store.commit_raw_unlocked(&node, &embedding).await?;
+        Ok(NodeCommit {
+            node,
+            inserted: true,
+            projections_committed: true,
+        })
+    }
+
+    async fn commit_abstract(
+        &self,
+        node: AbstractNode,
+        embedding: Embedding,
+    ) -> Result<NodeCommit<AbstractNode>> {
+        let _guard = self.store.lock().await?;
+        if let Some(operation_key) = &node.operation_key {
+            if let Some(record) = self
+                .store
+                .try_read_json::<StoredId<AbstractNodeId>>(
+                    &self.store.abstract_operation_path(operation_key),
+                )
+                .await?
+            {
+                if record.operation_key != *operation_key {
+                    return Err(crate::EngineError::Storage(
+                        "operation receipt digest collision".to_string(),
+                    ));
+                }
+                if let Some(existing) = self
+                    .store
+                    .try_read_json::<AbstractNode>(&self.store.abstract_path(&record.id))
+                    .await?
+                {
+                    return Ok(NodeCommit {
+                        node: existing,
+                        inserted: false,
+                        projections_committed: false,
+                    });
+                }
+            }
+        }
+        self.store
+            .commit_abstract_unlocked(&node, &embedding)
+            .await?;
+        Ok(NodeCommit {
+            node,
+            inserted: true,
+            projections_committed: true,
+        })
     }
 
     async fn get_raw(&self, id: &RawNodeId) -> Result<Option<RawNode>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         self.store.try_read_json(&self.store.raw_path(id)).await
     }
 
     async fn get_abstract(&self, id: &AbstractNodeId) -> Result<Option<AbstractNode>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         self.store
             .try_read_json(&self.store.abstract_path(id))
             .await
     }
 
     async fn get_raw_by_operation_key(&self, operation_key: &str) -> Result<Option<RawNode>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         match self
             .store
             .try_read_json::<StoredId<RawNodeId>>(&self.store.raw_operation_path(operation_key))
             .await?
         {
             Some(record) => {
+                if record.operation_key != operation_key {
+                    return Err(crate::EngineError::Storage(
+                        "operation receipt digest collision".to_string(),
+                    ));
+                }
                 self.store
                     .try_read_json(&self.store.raw_path(&record.id))
                     .await
@@ -96,7 +250,7 @@ impl NodeRepository for ObjectNodeRepository {
         &self,
         operation_key: &str,
     ) -> Result<Option<AbstractNode>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         match self
             .store
             .try_read_json::<StoredId<AbstractNodeId>>(
@@ -105,6 +259,11 @@ impl NodeRepository for ObjectNodeRepository {
             .await?
         {
             Some(record) => {
+                if record.operation_key != operation_key {
+                    return Err(crate::EngineError::Storage(
+                        "operation receipt digest collision".to_string(),
+                    ));
+                }
                 self.store
                     .try_read_json(&self.store.abstract_path(&record.id))
                     .await
@@ -114,12 +273,12 @@ impl NodeRepository for ObjectNodeRepository {
     }
 
     async fn list_raw(&self, ids: &[RawNodeId]) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         self.store.read_raw_by_ids_unlocked(ids).await
     }
 
     async fn list_abstract(&self, ids: &[AbstractNodeId]) -> Result<Vec<AbstractNode>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         let mut nodes = Vec::new();
         for id in ids {
             if let Some(node) = self
@@ -138,7 +297,7 @@ impl NodeRepository for ObjectNodeRepository {
         session_id: &SessionId,
         limit: usize,
     ) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         let mut entries = self
             .store
             .read_raw_index_entries_unlocked(&self.store.session_index_path(session_id))
@@ -151,7 +310,7 @@ impl NodeRepository for ObjectNodeRepository {
     }
 
     async fn session_raw(&self, session_id: &SessionId) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         let entries = self
             .store
             .read_raw_index_entries_unlocked(&self.store.session_index_path(session_id))
@@ -161,11 +320,22 @@ impl NodeRepository for ObjectNodeRepository {
     }
 
     async fn raw_for_loop(&self, loop_id: &LoopId) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         let entries = self
             .store
             .read_raw_index_entries_unlocked(&self.store.loop_index_path(loop_id))
             .await?;
+        let ids: Vec<_> = entries.into_iter().map(|entry| entry.id).collect();
+        self.store.read_raw_by_ids_unlocked(&ids).await
+    }
+
+    async fn raw_for_loop_bounded(&self, loop_id: &LoopId, limit: usize) -> Result<Vec<RawNode>> {
+        let _guard = self.store.lock().await?;
+        let mut entries = self
+            .store
+            .read_raw_index_entries_unlocked(&self.store.loop_index_path(loop_id))
+            .await?;
+        entries.truncate(limit);
         let ids: Vec<_> = entries.into_iter().map(|entry| entry.id).collect();
         self.store.read_raw_by_ids_unlocked(&ids).await
     }
@@ -177,7 +347,7 @@ impl NodeRepository for ObjectNodeRepository {
         to: Option<DateTime<Utc>>,
         limit: usize,
     ) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         let entries = match session_id {
             // Session-scoped: read the (naturally bounded) per-session index.
             Some(value) => {
@@ -213,38 +383,12 @@ impl NodeRepository for ObjectNodeRepository {
         ids: &[RawNodeId],
         patch: &RawLifecyclePatch,
     ) -> Result<()> {
-        let _guard = self.store.lock().await;
-        let mut changed = false;
-        for id in ids {
-            if let Some(mut node) = self
-                .store
-                .try_read_json::<RawNode>(&self.store.raw_path(id))
-                .await?
-            {
-                if let Some(distillation_state) = &patch.distillation_state {
-                    node.distillation_state = distillation_state.clone();
-                }
-                if let Some(overflow) = &patch.overflow {
-                    node.overflow = overflow.clone();
-                }
-                // Same body-before-indexes ordering invariant as `insert_raw`:
-                // persist the updated body first so a crash before the index
-                // sync is reconciled (rebuilt from the body) on the next open.
-                self.store
-                    .write_json(&self.store.raw_path(id), &node)
-                    .await?;
-                self.store.sync_raw_indexes_unlocked(&node).await?;
-                changed = true;
-            }
-        }
-        if changed {
-            self.store.touch_metadata_unlocked().await?;
-        }
-        Ok(())
+        let _guard = self.store.lock().await?;
+        self.store.update_raw_lifecycle_unlocked(ids, patch).await
     }
 
     async fn undistilled_raw(&self, limit: usize, only_pushed_out: bool) -> Result<Vec<RawNode>> {
-        let _guard = self.store.lock().await;
+        let _guard = self.store.lock().await?;
         let index_path = if only_pushed_out {
             self.store.pushed_undistilled_index_path()
         } else {
@@ -257,6 +401,73 @@ impl NodeRepository for ObjectNodeRepository {
         entries.truncate(limit);
         let ids: Vec<_> = entries.into_iter().map(|entry| entry.id).collect();
         self.store.read_raw_by_ids_unlocked(&ids).await
+    }
+
+    async fn try_claim_distillation(
+        &self,
+        session_id: SessionId,
+        loop_id: LoopId,
+        input_digest: String,
+        lease_for: Duration,
+    ) -> Result<Option<DistillationClaim>> {
+        let lease_duration = chrono::Duration::from_std(lease_for).map_err(|_| {
+            crate::EngineError::Configuration(
+                "distillation lease duration is too large".to_string(),
+            )
+        })?;
+        let _guard = self.store.lock().await?;
+        let path = self.store.distillation_claim_path(&session_id, &loop_id);
+        let now = Utc::now();
+        if self
+            .store
+            .try_read_json::<DistillationClaim>(&path)
+            .await?
+            .is_some_and(|claim| claim.expires_at > now)
+        {
+            return Ok(None);
+        }
+        let claim = DistillationClaim {
+            session_id,
+            loop_id,
+            input_digest,
+            lease_id: uuid::Uuid::new_v4().to_string(),
+            expires_at: now + lease_duration,
+        };
+        self.store.write_json(&path, &claim).await?;
+        Ok(Some(claim))
+    }
+
+    async fn distillation_claim_is_current(&self, claim: &DistillationClaim) -> Result<bool> {
+        let _guard = self.store.lock().await?;
+        Ok(self
+            .store
+            .try_read_json::<DistillationClaim>(
+                &self
+                    .store
+                    .distillation_claim_path(&claim.session_id, &claim.loop_id),
+            )
+            .await?
+            .is_some_and(|current| {
+                current.lease_id == claim.lease_id
+                    && current.input_digest == claim.input_digest
+                    && current.expires_at > Utc::now()
+            }))
+    }
+
+    async fn release_distillation_claim(&self, claim: &DistillationClaim) -> Result<()> {
+        let _guard = self.store.lock().await?;
+        let path = self
+            .store
+            .distillation_claim_path(&claim.session_id, &claim.loop_id);
+        if self
+            .store
+            .try_read_json::<DistillationClaim>(&path)
+            .await?
+            .is_some_and(|current| current.lease_id == claim.lease_id)
+        {
+            self.store.remove_file_if_exists(&path).await?;
+        }
+        Ok(())
     }
 }
 
@@ -279,6 +490,44 @@ mod tests {
             "takos-agent-engine-object-store-{name}-{}",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_same_operation_key_has_one_canonical_node() -> crate::Result<()> {
+        let root = temp_root("operation-key-race");
+        let left = ObjectNodeRepository::new(FileObjectStore::open_async(&root).await?);
+        let right = ObjectNodeRepository::new(FileObjectStore::open_async(&root).await?);
+        let mut first = RawNode::text(
+            RawNodeKind::Note,
+            Some(crate::SessionId::new()),
+            Some(crate::LoopId::new()),
+            "test",
+            "first",
+            0.5,
+            Vec::new(),
+        );
+        first.operation_key = Some("same-operation".to_string());
+        let mut second = first.clone();
+        second.id = crate::RawNodeId::new();
+        second.content = crate::domain::RawContent::Text("second".to_string());
+
+        let (left_result, right_result) = tokio::join!(
+            left.commit_raw(first, Embedding(vec![1.0])),
+            right.commit_raw(second, Embedding(vec![2.0]))
+        );
+        let left_result = left_result?;
+        let right_result = right_result?;
+        assert_eq!(left_result.node.id, right_result.node.id);
+        assert_ne!(left_result.inserted, right_result.inserted);
+
+        let reopened = ObjectNodeRepository::new(FileObjectStore::open_async(&root).await?);
+        let canonical = reopened
+            .get_raw_by_operation_key("same-operation")
+            .await?
+            .expect("canonical node");
+        assert_eq!(canonical.id, left_result.node.id);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ pub use object_store::{
     ObjectVectorIndex,
 };
 pub use traits::{
-    GraphRepository, GraphTraversalHit, LoopStateRepository, NodeRepository, RawLifecyclePatch,
-    ScoredAbstractRef, ScoredRawRef, VectorIndex,
+    DistillationClaim, GraphRepository, GraphTraversalHit, LoopStateRepository, NodeCommit,
+    NodeRepository, RawLifecyclePatch, ScoredAbstractRef, ScoredRawRef, VectorIndex,
 };
 pub use vector::InMemoryVectorIndex;

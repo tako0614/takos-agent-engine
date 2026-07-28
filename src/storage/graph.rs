@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::domain::AbstractNode;
 use crate::error::Result;
-use crate::ids::AbstractNodeId;
+use crate::ids::{AbstractNodeId, SessionId};
 
 use super::traits::{GraphRepository, GraphTraversalHit};
 
@@ -16,9 +16,15 @@ struct GraphEdge {
     predicate: String,
 }
 
+#[derive(Debug, Clone)]
+struct GraphRecord {
+    session_id: Option<SessionId>,
+    edges: Vec<GraphEdge>,
+}
+
 #[derive(Debug, Default)]
 pub struct InMemoryGraphRepository {
-    adjacency: RwLock<HashMap<AbstractNodeId, Vec<GraphEdge>>>,
+    adjacency: RwLock<HashMap<AbstractNodeId, GraphRecord>>,
 }
 
 impl InMemoryGraphRepository {
@@ -53,10 +59,13 @@ impl InMemoryGraphRepository {
 #[async_trait]
 impl GraphRepository for InMemoryGraphRepository {
     async fn index_abstract(&self, node: &AbstractNode) -> Result<()> {
-        self.adjacency
-            .write()
-            .await
-            .insert(node.id, Self::edges_for_abstract(node));
+        self.adjacency.write().await.insert(
+            node.id,
+            GraphRecord {
+                session_id: node.session_id,
+                edges: Self::edges_for_abstract(node),
+            },
+        );
         Ok(())
     }
 
@@ -65,6 +74,8 @@ impl GraphRepository for InMemoryGraphRepository {
         start: &AbstractNodeId,
         max_depth: usize,
         relation_types: Option<&[String]>,
+        session_id: Option<&SessionId>,
+        max_hits: usize,
     ) -> Result<Vec<GraphTraversalHit>> {
         let adjacency = self.adjacency.read().await;
         let filters = relation_types.map(|values| values.iter().cloned().collect::<HashSet<_>>());
@@ -76,18 +87,27 @@ impl GraphRepository for InMemoryGraphRepository {
             if depth > max_depth || !visited.insert(current) {
                 continue;
             }
+            let Some(record) = adjacency.get(&current) else {
+                continue;
+            };
+            if session_id.is_some_and(|scope| record.session_id.as_ref() != Some(scope)) {
+                continue;
+            }
             output.push(GraphTraversalHit {
                 node_id: current,
                 depth,
                 via_predicate: via_predicate.clone(),
             });
-            if let Some(neighbors) = adjacency.get(&current) {
-                for neighbor in neighbors {
-                    if let Some(filters) = &filters {
-                        if !filters.contains(&neighbor.predicate) {
-                            continue;
-                        }
+            if output.len() >= max_hits.max(1) {
+                break;
+            }
+            for neighbor in &record.edges {
+                if let Some(filters) = &filters {
+                    if !filters.contains(&neighbor.predicate) {
+                        continue;
                     }
+                }
+                if output.len().saturating_add(queue.len()) < max_hits.max(1) {
                     queue.push_back((neighbor.to, depth + 1, Some(neighbor.predicate.clone())));
                 }
             }

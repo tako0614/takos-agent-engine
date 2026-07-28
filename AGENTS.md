@@ -1,56 +1,47 @@
-# AGENTS.md — takos-agent-engine
+# AGENTS.md
 
-`takos-agent-engine` は Takos の **stateless agent runtime library** (Rust) で、 session 履歴と長期 memory を同一基盤で
-扱い、 RawNode / AbstractNode の二層記憶を activation しながら checkpoint 可能な graph runtime で長期継続実行する。
-agent runtime の正本 library であり、 service wrapper は `takos/containers/agent/` が持つ。
+> このファイルは `takos-control/engineering.policy.json` と `ecosystem.repos.json` から generator v1 で生成されています。手編集しないでください。
 
-Takos product wrapperではTakos WorkerのThread / memoryをdurable authorityとし、engine repository/checkpointは1 run内の
-in-memory scratchとしてinjectするが、`ExecutionProfile::ExternalContext`によりnode/vector/graph memory pathは実行しない。
-checkpoint repositoryだけがbounded loopに使われる。file backend / `resume_loop`はdurable backendを選ぶ別consumer向けlibrary primitiveであり、
-Cloudflare Container diskをproduct recoveryの正本にしない。
+## Repository
 
-## 責務
+- Scope: Product-independent Rust agent runtime library consumed by the Takos agent service wrapper.
+- Repository kind: `library`
+- Direct sibling dependencies: なし
+- Repository gate: `bun run check`
+- Canonical docs: [README.md](README.md), [architecture.md](architecture.md), [docs/agent-runtime.md](docs/agent-runtime.md)
 
-### 持つ
+## Ownership
 
-- GraphRunner (checkpointable graph execution)
-- RawNode / AbstractNode 二層 memory
-- token-budget context assembly
-- embedding vector search
-- activation scoring
-- distillation (raw → AbstractNode 昇格)
-- checkpoint / resume
-- LLM provider trait / memory backend trait の inject 点
-- maintenance pass (overflow / structure 変換)
+- Owns: Stateless checkpointable Rust graph runtime / RawNode and AbstractNode memory and context assembly / Injectable model, vector, storage, and checkpoint traits
+- Does not own: HTTP or RPC service wrapper / Takos-specific prompts, skills, or orchestration / Production vendor integrations
+- Hazards: Takos ExternalContext mode keeps durable product memory outside the engine. / Container disk is not Takos product recovery authority.
 
-### 持たない
+## Required workflow
 
-- service wrapping (HTTP server、 RPC binding 等は `takos/containers/agent/` の責務)
-- production vendor implementation (OpenAI / Claude 等は feature gate のみ提供)
-- Takos-specific orchestration (skill catalog、 system prompt 等は `takos/containers/agent/` 側)
+- repo固有の挙動・契約・architectureは、このrepo自身のsourceとdocsを正本にします。共通工学ルールをこのrepoで再定義しません。
+- 通常変更はこのrepo内に閉じます。横断変更はtask ledgerに対象repoと順序を宣言し、unrelatedなdirty workを変更・stage・commitしません。
+- handoff前に `bun run check` を実行します。これはread-onlyで、`format-check`, `lint-or-static-analysis`, `type-or-compile`, `portable-tests`, `portable-build` を完全に検証し、未実装項目をskipしてはいけません。
+- このrepoにformat writerはありません。`bun run fmt` は存在せず、実行するとcoreutilsのfmt(1)が動いて何もせず成功します。formatを直すときはformatterを直接呼びます。
+- task ledgerが必要な条件: The change modifies more than one repository. / The work changes production or release behavior. / The work changes a persisted schema or migrates data. / The work changes security, identity, credentials, authorization, billing, or authority. / The work destructively changes data or repository history.
+- secret、credential、production記録、private keyをrepoへcommitしません。
 
-## 隣接 product との contract
+## Deploy
 
-- **Upstream**: なし (library)
-- **Downstream consumer**: `takos/containers/agent/` (Takos の agent execution service)
+- このrepoがproduction targetを持つなら、入口は `bun run deploy` 一つです。無ければ作ります。承認待ちの列も、登録する先もありません。entrypointは副作用なしの `--contract` で、自分に立つtriggerと各obligationの果たし方を宣言します。
+- 実行するかどうかはoperatorの判断です。task ledger、branch名、green checkのいずれもdeployを承認しません。逆に、どれも欠けているからといってdeployが禁止されるわけでもありません。
+- どのsurfaceも次のobligationを負います。
 
-## Substitutability
+  - **provenance**: The published bytes belong to one reviewed commit, are built from that worktree, and the commit and artifact digest are recorded. Whatever validates them must cover those bytes.
+  - **post-conditions**: After publishing, state how you know the thing works for a real user, and confirm it.
+  - **reversal**: State how to get back. If you cannot get back, say so and name the forward-repair plan instead.
+  - **failure-handling**: State what the entrypoint prints on failure and what it refuses to do. Raw diagnostics, no blind retry, and a clear split between failing before and after the target was touched.
 
-library 内部は **代替可能**: LLM provider / memory backend / vector store を trait 経由で inject する設計。 production
-vendor は feature gate で生かし、 unit test は `test-support` feature の deterministic stub で回す。
+- 次のtriggerが立つと義務が増えます。判別できないものはirreversible扱いです。
 
-## Workflow
+  - **irreversible** (The step leaves the previous artifact unable to serve again: a schema or data migration, a topology change, or anything that rewrites durable state.) → pre-mutation-proof, independent-review
+  - **authority** (The step moves money, identity, authentication, authorization, or the deploy mechanism itself.) → independent-review
+  - **published-identity** (Publication mints a version, digest, or tag that consumers pin.) → no-overwrite
+  - **asynchronous** (Publication completes through an external review or staged delivery the deploy does not control, such as an app store.) → halt
 
-```bash
-cd takos-agent-engine
-cargo build
-cargo test
-cargo test --features test-support
-cargo fmt --check
-cargo clippy
-```
-
-## 関連 docs
-
-- [`README.md`](README.md) — engine の設計理念と memory model
-- [`docs/agent-runtime.md`](docs/agent-runtime.md) — agent runtime の境界
+- 果たし方は各surfaceが自分の言葉で決めます。中央は義務を決め、機構は決めません。宣言を弱められませんが、強める分には自由です。
+- 利用者/operatorが自分の環境へself-host deployすることは別authorityで、このruleの対象外です。

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -32,10 +34,76 @@ pub struct RawLifecyclePatch {
     pub overflow: Option<OverflowPolicy>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeCommit<T> {
+    pub node: T,
+    pub inserted: bool,
+    /// `true` when node, embedding and (for abstract nodes) graph projection
+    /// were committed by one durable mutation boundary.
+    pub projections_committed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DistillationClaim {
+    pub session_id: SessionId,
+    pub loop_id: LoopId,
+    pub input_digest: String,
+    pub lease_id: String,
+    pub expires_at: DateTime<Utc>,
+}
+
 #[async_trait]
 pub trait NodeRepository: Send + Sync {
     async fn insert_raw(&self, node: RawNode) -> Result<()>;
     async fn insert_abstract(&self, node: AbstractNode) -> Result<()>;
+    async fn insert_raw_once(&self, node: RawNode) -> Result<NodeCommit<RawNode>> {
+        if let Some(operation_key) = &node.operation_key {
+            if let Some(existing) = self.get_raw_by_operation_key(operation_key).await? {
+                return Ok(NodeCommit {
+                    node: existing,
+                    inserted: false,
+                    projections_committed: false,
+                });
+            }
+        }
+        self.insert_raw(node.clone()).await?;
+        Ok(NodeCommit {
+            node,
+            inserted: true,
+            projections_committed: false,
+        })
+    }
+    async fn insert_abstract_once(&self, node: AbstractNode) -> Result<NodeCommit<AbstractNode>> {
+        if let Some(operation_key) = &node.operation_key {
+            if let Some(existing) = self.get_abstract_by_operation_key(operation_key).await? {
+                return Ok(NodeCommit {
+                    node: existing,
+                    inserted: false,
+                    projections_committed: false,
+                });
+            }
+        }
+        self.insert_abstract(node.clone()).await?;
+        Ok(NodeCommit {
+            node,
+            inserted: true,
+            projections_committed: false,
+        })
+    }
+    async fn commit_raw(
+        &self,
+        node: RawNode,
+        _embedding: Embedding,
+    ) -> Result<NodeCommit<RawNode>> {
+        self.insert_raw_once(node).await
+    }
+    async fn commit_abstract(
+        &self,
+        node: AbstractNode,
+        _embedding: Embedding,
+    ) -> Result<NodeCommit<AbstractNode>> {
+        self.insert_abstract_once(node).await
+    }
     async fn get_raw(&self, id: &RawNodeId) -> Result<Option<RawNode>>;
     async fn get_abstract(&self, id: &AbstractNodeId) -> Result<Option<AbstractNode>>;
     async fn get_raw_by_operation_key(&self, operation_key: &str) -> Result<Option<RawNode>>;
@@ -52,6 +120,11 @@ pub trait NodeRepository: Send + Sync {
     ) -> Result<Vec<RawNode>>;
     async fn session_raw(&self, session_id: &SessionId) -> Result<Vec<RawNode>>;
     async fn raw_for_loop(&self, loop_id: &LoopId) -> Result<Vec<RawNode>>;
+    async fn raw_for_loop_bounded(&self, loop_id: &LoopId, limit: usize) -> Result<Vec<RawNode>> {
+        let mut nodes = self.raw_for_loop(loop_id).await?;
+        nodes.truncate(limit);
+        Ok(nodes)
+    }
     async fn timeline_raw(
         &self,
         session_id: Option<&SessionId>,
@@ -65,6 +138,15 @@ pub trait NodeRepository: Send + Sync {
         patch: &RawLifecyclePatch,
     ) -> Result<()>;
     async fn undistilled_raw(&self, limit: usize, only_pushed_out: bool) -> Result<Vec<RawNode>>;
+    async fn try_claim_distillation(
+        &self,
+        session_id: SessionId,
+        loop_id: LoopId,
+        input_digest: String,
+        lease_for: Duration,
+    ) -> Result<Option<DistillationClaim>>;
+    async fn distillation_claim_is_current(&self, claim: &DistillationClaim) -> Result<bool>;
+    async fn release_distillation_claim(&self, claim: &DistillationClaim) -> Result<()>;
 }
 
 #[async_trait]
@@ -128,6 +210,8 @@ pub trait GraphRepository: Send + Sync {
         start: &AbstractNodeId,
         max_depth: usize,
         relation_types: Option<&[String]>,
+        session_id: Option<&SessionId>,
+        max_hits: usize,
     ) -> Result<Vec<GraphTraversalHit>>;
 }
 

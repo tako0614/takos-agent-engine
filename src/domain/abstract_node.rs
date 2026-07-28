@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::Relation;
-use crate::ids::{AbstractNodeId, RawNodeId};
+use crate::ids::{AbstractNodeId, RawNodeId, SessionId};
 use crate::model::embedding::EmbeddingRef;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +46,10 @@ impl Default for AbstractNodeMetadata {
 pub struct AbstractNode {
     pub id: AbstractNodeId,
     pub operation_key: Option<String>,
+    /// Durable tenant boundary for graph/provenance lookup. Legacy nodes omit
+    /// this field and remain reachable only through explicitly unscoped APIs.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
     pub timestamp: DateTime<Utc>,
     pub title: String,
     pub summary: String,
@@ -68,6 +72,7 @@ impl AbstractNode {
         Self {
             id,
             operation_key: None,
+            session_id: None,
             timestamp: Utc::now(),
             title: title.into(),
             summary: summary.into(),

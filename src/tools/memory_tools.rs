@@ -52,15 +52,31 @@ pub struct GraphSearchParams {
     #[serde(default = "default_graph_depth")]
     pub max_depth: usize,
     pub relation_types: Option<Vec<String>>,
+    #[serde(default = "default_graph_hits")]
+    pub max_hits: usize,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 const fn default_graph_depth() -> usize {
     2
 }
 
+const fn default_graph_hits() -> usize {
+    32
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenanceLookupParams {
     pub abstract_node_id: String,
+    #[serde(default = "default_provenance_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+const fn default_provenance_limit() -> usize {
+    32
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +137,8 @@ pub struct TimelineSearchResult {
 pub struct MemoryToolBounds {
     pub max_memory_search_top_k: usize,
     pub max_graph_search_depth: usize,
+    pub max_graph_search_hits: usize,
+    pub max_provenance_raw_nodes: usize,
     pub max_timeline_search_limit: usize,
 }
 
@@ -135,6 +153,8 @@ impl From<&ToolsConfig> for MemoryToolBounds {
         Self {
             max_memory_search_top_k: config.max_memory_search_top_k,
             max_graph_search_depth: config.max_graph_search_depth,
+            max_graph_search_hits: config.max_graph_search_hits,
+            max_provenance_raw_nodes: config.max_provenance_raw_nodes,
             max_timeline_search_limit: config.max_timeline_search_limit,
         }
     }
@@ -149,6 +169,16 @@ impl MemoryToolBounds {
     #[must_use]
     pub fn clamp_graph_search_depth(&self, requested: usize) -> usize {
         requested.min(self.max_graph_search_depth)
+    }
+
+    #[must_use]
+    pub fn clamp_graph_search_hits(&self, requested: usize) -> usize {
+        requested.max(1).min(self.max_graph_search_hits.max(1))
+    }
+
+    #[must_use]
+    pub fn clamp_provenance_raw_nodes(&self, requested: usize) -> usize {
+        requested.max(1).min(self.max_provenance_raw_nodes.max(1))
     }
 
     #[must_use]
@@ -231,10 +261,27 @@ impl MemoryTools {
     pub async fn graph_search(&self, params: GraphSearchParams) -> Result<GraphSearchResult> {
         let start = AbstractNodeId::from_str(&params.start_node_id)
             .map_err(|err| EngineError::Tool(format!("invalid abstract node id: {err}")))?;
+        let session_id = parse_optional_session_id(params.session_id.as_deref())?;
+        let start_node = self
+            .repository
+            .get_abstract(&start)
+            .await?
+            .filter(|node| {
+                session_id
+                    .as_ref()
+                    .is_none_or(|session_id| node.session_id.as_ref() == Some(session_id))
+            })
+            .ok_or_else(|| EngineError::Tool("abstract node not found".to_string()))?;
         let max_depth = params.max_depth;
         let hits = self
             .graph_repository
-            .traverse(&start, max_depth, params.relation_types.as_deref())
+            .traverse(
+                &start,
+                max_depth,
+                params.relation_types.as_deref(),
+                session_id.as_ref(),
+                params.max_hits.max(1),
+            )
             .await?;
 
         let ids: Vec<_> = hits.iter().map(|hit| hit.node_id).collect();
@@ -243,14 +290,20 @@ impl MemoryTools {
             .list_abstract(&ids)
             .await?
             .into_iter()
+            .filter(|node| {
+                session_id
+                    .as_ref()
+                    .is_none_or(|session_id| node.session_id.as_ref() == Some(session_id))
+            })
             .map(|node| (node.id, node))
             .collect::<std::collections::HashMap<_, _>>();
+        nodes_by_id.insert(start_node.id, start_node);
 
         let mut ordered_hits = Vec::new();
         for hit in hits {
             if let Some(node) = nodes_by_id.remove(&hit.node_id) {
                 ordered_hits.push(GraphSearchHit {
-                    node,
+                    node: without_provenance_links(node),
                     depth: hit.depth,
                     via_predicate: hit.via_predicate,
                 });
@@ -268,17 +321,56 @@ impl MemoryTools {
         &self,
         params: ProvenanceLookupParams,
     ) -> Result<ProvenanceLookupResult> {
+        let session_id = parse_optional_session_id(params.session_id.as_deref())?;
         let node_id = AbstractNodeId::from_str(&params.abstract_node_id)
             .map_err(|err| EngineError::Tool(format!("invalid abstract node id: {err}")))?;
-        let abstract_node = self
+        let mut abstract_node = self
             .repository
             .get_abstract(&node_id)
             .await?
+            .filter(|node| {
+                session_id
+                    .as_ref()
+                    .is_none_or(|session_id| node.session_id.as_ref() == Some(session_id))
+            })
             .ok_or_else(|| EngineError::Tool("abstract node not found".to_string()))?;
+        let requested_raw_ids = abstract_node
+            .references
+            .raw_node_ids
+            .iter()
+            .take(params.limit.max(1))
+            .copied()
+            .collect::<Vec<_>>();
         let raw_nodes = self
             .repository
-            .list_raw(&abstract_node.references.raw_node_ids)
-            .await?;
+            .list_raw(&requested_raw_ids)
+            .await?
+            .into_iter()
+            .filter(|node| {
+                session_id
+                    .as_ref()
+                    .is_none_or(|session_id| node.session_id.as_ref() == Some(session_id))
+            })
+            .collect::<Vec<_>>();
+        if session_id.is_some() && raw_nodes.len() != requested_raw_ids.len() {
+            return Err(EngineError::Tool("abstract node not found".to_string()));
+        }
+        let visible_ids = raw_nodes
+            .iter()
+            .map(|node| node.id)
+            .collect::<std::collections::HashSet<_>>();
+        abstract_node.references.raw_node_ids = requested_raw_ids
+            .into_iter()
+            .filter(|id| visible_ids.contains(id))
+            .collect();
+        // Abstract-to-abstract links are graph-search capabilities and are not
+        // part of the provenance projection.
+        abstract_node.references.abstract_node_ids.clear();
+        for relation in &mut abstract_node.graph.relations {
+            relation
+                .provenance_raw_node_ids
+                .retain(|id| visible_ids.contains(id));
+        }
         Ok(ProvenanceLookupResult {
             abstract_node,
             raw_nodes,
@@ -332,6 +424,9 @@ impl MemoryTools {
                 continue;
             }
             if let Some(node) = self.repository.get_raw(&candidate.id).await? {
+                if session_id.is_some_and(|scope| node.session_id.as_ref() != Some(scope)) {
+                    continue;
+                }
                 hits.push(ScoredRawHit {
                     node,
                     score: candidate.score,
@@ -358,14 +453,36 @@ impl MemoryTools {
                 continue;
             }
             if let Some(node) = self.repository.get_abstract(&candidate.id).await? {
+                if session_id.is_some_and(|scope| node.session_id.as_ref() != Some(scope)) {
+                    continue;
+                }
                 hits.push(ScoredAbstractHit {
-                    node,
+                    node: without_provenance_links(node),
                     score: candidate.score,
                 });
             }
         }
         Ok(hits)
     }
+}
+
+fn parse_optional_session_id(value: Option<&str>) -> Result<Option<SessionId>> {
+    value
+        .map(SessionId::from_str)
+        .transpose()
+        .map_err(|err| EngineError::Tool(format!("invalid session id: {err}")))
+}
+
+fn without_provenance_links(mut node: AbstractNode) -> AbstractNode {
+    // Search results expose the matched memory's content, not a capability to
+    // dereference arbitrary identifiers embedded in a legacy/corrupt node.
+    // Provenance has its own scoped, bounded endpoint below.
+    node.references.raw_node_ids.clear();
+    node.references.abstract_node_ids.clear();
+    for relation in &mut node.graph.relations {
+        relation.provenance_raw_node_ids.clear();
+    }
+    node
 }
 
 #[cfg(test)]
@@ -382,6 +499,7 @@ mod tests {
         tools: MemoryTools,
         repo: Arc<InMemoryNodeRepository>,
         vector: Arc<InMemoryVectorIndex>,
+        graph: Arc<InMemoryGraphRepository>,
         embedder: TestHashEmbedder,
     }
 
@@ -401,6 +519,7 @@ mod tests {
             tools,
             repo,
             vector,
+            graph,
             embedder,
         }
     }
@@ -614,6 +733,91 @@ mod tests {
         };
         let result = h.tools.semantic_search(params).await.unwrap();
         assert!(result.raw_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn graph_and_provenance_search_do_not_cross_session_boundaries() {
+        let h = setup();
+        let session = SessionId::new();
+        let foreign_session = SessionId::new();
+
+        let local_raw = RawNode::text(
+            RawNodeKind::UserUtterance,
+            Some(session),
+            None,
+            "user",
+            "local evidence",
+            0.5,
+            Vec::new(),
+        );
+        let foreign_raw = RawNode::text(
+            RawNodeKind::UserUtterance,
+            Some(foreign_session),
+            None,
+            "user",
+            "foreign evidence",
+            0.5,
+            Vec::new(),
+        );
+        h.repo.insert_raw(local_raw.clone()).await.unwrap();
+        h.repo.insert_raw(foreign_raw.clone()).await.unwrap();
+
+        let mut foreign = AbstractNode::new(
+            "foreign",
+            "must stay private",
+            References {
+                raw_node_ids: vec![foreign_raw.id],
+                ..References::default()
+            },
+            GraphFragment::default(),
+            AbstractNodeMetadata::default(),
+        );
+        foreign.session_id = Some(foreign_session);
+        h.repo.insert_abstract(foreign.clone()).await.unwrap();
+        h.graph.index_abstract(&foreign).await.unwrap();
+
+        let mut local = AbstractNode::new(
+            "local",
+            "references a foreign graph node",
+            References {
+                raw_node_ids: vec![local_raw.id],
+                abstract_node_ids: vec![foreign.id],
+            },
+            GraphFragment::default(),
+            AbstractNodeMetadata::default(),
+        );
+        local.session_id = Some(session);
+        h.repo.insert_abstract(local.clone()).await.unwrap();
+        h.graph.index_abstract(&local).await.unwrap();
+
+        let graph = h
+            .tools
+            .graph_search(GraphSearchParams {
+                start_node_id: local.id.to_string(),
+                max_depth: 2,
+                relation_types: None,
+                max_hits: 8,
+                session_id: Some(session.to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            graph.hits.iter().map(|hit| hit.node.id).collect::<Vec<_>>(),
+            vec![local.id]
+        );
+
+        let provenance = h
+            .tools
+            .provenance_lookup(ProvenanceLookupParams {
+                abstract_node_id: foreign.id.to_string(),
+                limit: 8,
+                session_id: Some(session.to_string()),
+            })
+            .await;
+        assert!(
+            provenance.is_err(),
+            "a caller must not dereference another session's abstract node"
+        );
     }
 
     // Argument-bound clamping is enforced once at the engine chokepoint

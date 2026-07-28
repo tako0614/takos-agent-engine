@@ -1,35 +1,44 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::domain::{AbstractNode, DistillationState, LoopState, RawNode};
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use crate::ids::{AbstractNodeId, LoopId, RawNodeId, SessionId};
 
-use super::traits::{LoopStateRepository, NodeRepository, RawLifecyclePatch};
+use super::traits::{DistillationClaim, LoopStateRepository, NodeRepository, RawLifecyclePatch};
 
 #[derive(Debug, Default)]
 pub struct InMemoryNodeRepository {
+    mutation_gate: Mutex<()>,
     raw_nodes: RwLock<HashMap<RawNodeId, RawNode>>,
     abstract_nodes: RwLock<HashMap<AbstractNodeId, AbstractNode>>,
     session_index: RwLock<HashMap<SessionId, Vec<RawNodeId>>>,
     loop_index: RwLock<HashMap<LoopId, Vec<RawNodeId>>>,
     raw_operation_index: RwLock<HashMap<String, RawNodeId>>,
     abstract_operation_index: RwLock<HashMap<String, AbstractNodeId>>,
+    distillation_claims: RwLock<HashMap<(SessionId, LoopId), DistillationClaim>>,
 }
 
-#[async_trait]
-impl NodeRepository for InMemoryNodeRepository {
-    async fn insert_raw(&self, node: RawNode) -> Result<()> {
+impl InMemoryNodeRepository {
+    async fn insert_raw_unlocked(&self, node: RawNode) {
+        self.raw_nodes.write().await.insert(node.id, node.clone());
         if let Some(session_id) = node.session_id {
             let mut session_index = self.session_index.write().await;
-            session_index.entry(session_id).or_default().push(node.id);
+            let ids = session_index.entry(session_id).or_default();
+            if !ids.contains(&node.id) {
+                ids.push(node.id);
+            }
         }
         if let Some(loop_id) = node.loop_id {
             let mut loop_index = self.loop_index.write().await;
-            loop_index.entry(loop_id).or_default().push(node.id);
+            let ids = loop_index.entry(loop_id).or_default();
+            if !ids.contains(&node.id) {
+                ids.push(node.id);
+            }
         }
         if let Some(operation_key) = &node.operation_key {
             self.raw_operation_index
@@ -37,19 +46,91 @@ impl NodeRepository for InMemoryNodeRepository {
                 .await
                 .insert(operation_key.clone(), node.id);
         }
-        self.raw_nodes.write().await.insert(node.id, node);
-        Ok(())
     }
 
-    async fn insert_abstract(&self, node: AbstractNode) -> Result<()> {
+    async fn insert_abstract_unlocked(&self, node: AbstractNode) {
+        self.abstract_nodes
+            .write()
+            .await
+            .insert(node.id, node.clone());
         if let Some(operation_key) = &node.operation_key {
             self.abstract_operation_index
                 .write()
                 .await
                 .insert(operation_key.clone(), node.id);
         }
-        self.abstract_nodes.write().await.insert(node.id, node);
+    }
+}
+
+#[async_trait]
+impl NodeRepository for InMemoryNodeRepository {
+    async fn insert_raw(&self, node: RawNode) -> Result<()> {
+        let _guard = self.mutation_gate.lock().await;
+        self.insert_raw_unlocked(node).await;
         Ok(())
+    }
+
+    async fn insert_abstract(&self, node: AbstractNode) -> Result<()> {
+        let _guard = self.mutation_gate.lock().await;
+        self.insert_abstract_unlocked(node).await;
+        Ok(())
+    }
+
+    async fn insert_raw_once(&self, node: RawNode) -> Result<super::traits::NodeCommit<RawNode>> {
+        let _guard = self.mutation_gate.lock().await;
+        if let Some(operation_key) = &node.operation_key {
+            if let Some(id) = self
+                .raw_operation_index
+                .read()
+                .await
+                .get(operation_key)
+                .copied()
+            {
+                if let Some(existing) = self.raw_nodes.read().await.get(&id).cloned() {
+                    return Ok(super::traits::NodeCommit {
+                        node: existing,
+                        inserted: false,
+                        projections_committed: false,
+                    });
+                }
+            }
+        }
+        self.insert_raw_unlocked(node.clone()).await;
+        Ok(super::traits::NodeCommit {
+            node,
+            inserted: true,
+            projections_committed: false,
+        })
+    }
+
+    async fn insert_abstract_once(
+        &self,
+        node: AbstractNode,
+    ) -> Result<super::traits::NodeCommit<AbstractNode>> {
+        let _guard = self.mutation_gate.lock().await;
+        if let Some(operation_key) = &node.operation_key {
+            if let Some(id) = self
+                .abstract_operation_index
+                .read()
+                .await
+                .get(operation_key)
+                .copied()
+            {
+                if let Some(existing) = self.abstract_nodes.read().await.get(&id).cloned() {
+                    return Ok(super::traits::NodeCommit {
+                        node: existing,
+                        inserted: false,
+                        projections_committed: false,
+                    });
+                }
+            }
+        }
+        self.insert_abstract_unlocked(node.clone()).await;
+        Ok(super::traits::NodeCommit {
+            node,
+            inserted: true,
+            projections_committed: false,
+        })
     }
 
     async fn get_raw(&self, id: &RawNodeId) -> Result<Option<RawNode>> {
@@ -133,6 +214,20 @@ impl NodeRepository for InMemoryNodeRepository {
         Ok(nodes)
     }
 
+    async fn raw_for_loop_bounded(&self, loop_id: &LoopId, limit: usize) -> Result<Vec<RawNode>> {
+        let ids = {
+            let index = self.loop_index.read().await;
+            index
+                .get(loop_id)
+                .map(|ids| ids.iter().take(limit).copied().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let guard = self.raw_nodes.read().await;
+        let mut nodes: Vec<_> = ids.iter().filter_map(|id| guard.get(id).cloned()).collect();
+        nodes.sort_by_key(|node| node.timestamp);
+        Ok(nodes)
+    }
+
     async fn timeline_raw(
         &self,
         session_id: Option<&SessionId>,
@@ -168,6 +263,7 @@ impl NodeRepository for InMemoryNodeRepository {
         ids: &[RawNodeId],
         patch: &RawLifecyclePatch,
     ) -> Result<()> {
+        let _mutation_guard = self.mutation_gate.lock().await;
         let mut guard = self.raw_nodes.write().await;
         for id in ids {
             if let Some(node) = guard.get_mut(id) {
@@ -195,6 +291,60 @@ impl NodeRepository for InMemoryNodeRepository {
         nodes.sort_by_key(|node| node.timestamp);
         nodes.truncate(limit);
         Ok(nodes)
+    }
+
+    async fn try_claim_distillation(
+        &self,
+        session_id: SessionId,
+        loop_id: LoopId,
+        input_digest: String,
+        lease_for: Duration,
+    ) -> Result<Option<DistillationClaim>> {
+        let lease_duration = chrono::Duration::from_std(lease_for).map_err(|_| {
+            EngineError::Configuration("distillation lease duration is too large".to_string())
+        })?;
+        let _mutation_guard = self.mutation_gate.lock().await;
+        let mut claims = self.distillation_claims.write().await;
+        let key = (session_id, loop_id);
+        let now = Utc::now();
+        if claims.get(&key).is_some_and(|claim| claim.expires_at > now) {
+            return Ok(None);
+        }
+        let claim = DistillationClaim {
+            session_id,
+            loop_id,
+            input_digest,
+            lease_id: uuid::Uuid::new_v4().to_string(),
+            expires_at: now + lease_duration,
+        };
+        claims.insert(key, claim.clone());
+        Ok(Some(claim))
+    }
+
+    async fn distillation_claim_is_current(&self, claim: &DistillationClaim) -> Result<bool> {
+        Ok(self
+            .distillation_claims
+            .read()
+            .await
+            .get(&(claim.session_id, claim.loop_id))
+            .is_some_and(|current| {
+                current.lease_id == claim.lease_id
+                    && current.input_digest == claim.input_digest
+                    && current.expires_at > Utc::now()
+            }))
+    }
+
+    async fn release_distillation_claim(&self, claim: &DistillationClaim) -> Result<()> {
+        let _mutation_guard = self.mutation_gate.lock().await;
+        let mut claims = self.distillation_claims.write().await;
+        let key = (claim.session_id, claim.loop_id);
+        if claims
+            .get(&key)
+            .is_some_and(|current| current.lease_id == claim.lease_id)
+        {
+            claims.remove(&key);
+        }
+        Ok(())
     }
 }
 
