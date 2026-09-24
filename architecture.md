@@ -13,7 +13,7 @@
 - node graph と checkpoint により paused loop を再開可能に実行する
 - raw な出来事を構造化して provenance 付き graph memory に育てる
 
-この文書は概念仕様ではなく、現在の Rust 実装の正本アーキテクチャを説明する。
+この文書は概念仕様ではなく、現在の Rust 実装を正とする情報として説明する。
 
 ## 2. 基本方針
 
@@ -179,7 +179,7 @@ loop status は次を持つ。
 
 ### 6.1 NodeRepository
 
-`NodeRepository` は raw / abstract の正本であり、timeline・loop・session view と raw lifecycle patch を担当する。
+`NodeRepository` は raw / abstract の正とする情報であり、timeline・loop・session view と raw lifecycle patch を担当する。
 
 重要 API:
 
@@ -228,7 +228,7 @@ checkpoint の保存・読込・削除を担当する。実在する graph node 
 durable baseline は object backend である。公開されている in-memory 実装は deterministic test / prototype
 用であり、process を越える recovery・locking・fencing authority にはしない。
 
-object backend は JSON object を正本にし、session・memory・embedding・graph・checkpoint を同じ root 配下に保存する。query path では directory scan に頼らず、session / loop / timeline / backlog / embedding manifest を materialized index として持つ。
+object backend は JSON object を正とする情報とし、session・memory・embedding・graph・checkpoint を同じ root 配下に保存する。query path では directory scan に頼らず、session / loop / timeline / backlog / embedding manifest を materialized index として持つ。
 
 - `store.json`
 - `.store.lock`
