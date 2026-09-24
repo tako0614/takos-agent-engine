@@ -4,7 +4,7 @@
 
 ## Authority
 
-Takos Worker が product state の唯一の durable authority です。
+Takos Worker が product state の唯一の永続 authority です。
 
 - Thread message、summary、explicit memory、retrieval indexes
 - Run lifecycle、cancel、lease、usage、event
@@ -19,9 +19,9 @@ Takos Worker が product state の唯一の durable authority です。
 - remote tool bridge
 - run-scoped checkpoint (product recovery authorityではない)
 
-container の disk、pool slot、process lifetime は product state の正本ではありません。sleep / restart / 別 slotでも、次の
+container の disk、pool slot、process lifetime は product state の正本 (正とする情報)ではありません。sleep / restart / 別 slotでも、次の
 run は Takos Worker の canonical history から再構築します。`takos-agent-engine` の file-backed repository と
-`resume_loop` は library consumer が durable backendをinjectする場合のprimitiveであり、Takos wrapperのcrash recoveryを
+`resume_loop` は library consumer が永続 backendをinjectする場合のprimitiveであり、Takos wrapperのcrash recoveryを
 意味しません。
 
 Takos wrapperは`ExecutionProfile::ExternalContext`を明示します。このprofileはengineのmemory-aware defaultを他consumer向けに
@@ -30,7 +30,7 @@ Takos wrapperは`ExecutionProfile::ExternalContext`を明示します。このpr
 一度だけ渡し、engineのsession/memory string contextへ複製しません。graph/tool budget、timeout、cancellation、checkpoint、native
 tool-call ID、`SessionResponse.turn_messages`はmemory-aware profileと共通です。
 
-durable recoveryを使うlibrary consumerは`RunOptions.loop_id`にcaller-stable IDを渡します。checkpointはschema version、
+永続 recoveryを使うlibrary consumerは`RunOptions.loop_id`にcaller-stable IDを渡します。checkpointはschema version、
 profile固有`graph_id`、session / loop identityを照合するため、別graphや別runの状態を誤って再開しません。Takos wrapperは
 引き続きWorker canonical historyからrunを再構築し、container checkpointをproduct authorityにはしません。
 
@@ -85,11 +85,11 @@ model adapterはassistant tool call IDを保存し、同じIDをtool execution�
 nameや配列順だけで相関しません。
 
 `ToolExecutor::execution_kind` は各callを read-only / side-effecting に分類します。engineは隣接するread-only callだけを
-parallel実行し、side-effecting callをprovider順のbarrierとして直列実行します。未分類はside-effecting扱いでfail-closedに
+parallel実行し、side-effecting callをprovider順のbarrierとして直列実行します。未分類はside-effecting扱いで安全側に倒して
 します。call数・ID / name・argumentsはdispatch前に検証し、上限超過を黙ってdropしません。
 
 wrapperは`ToolExecutor::execute_with_context`で渡される`session_id`、`loop_id`、`idempotency_key`、timeout、
-cancellation tokenをWorker control RPCまで伝播します。Workerのdurable tool operationはengine keyをconditional
+cancellation tokenをWorker control RPCまで伝播します。Workerの永続 tool operationはengine keyをconditional
 create / lookupのfenceとして使い、同じkeyの再送で副作用を二重実行しません。`recovery_is_idempotent`は、このend-to-end
 fenceが実在するcallにだけtrueを返します。
 
@@ -100,14 +100,14 @@ executor実装の責務です。
 
 tool-result envelopeはmemory-aware / external-contextの両profileで`max_tool_result_bytes`以内へ縮約し、current turn全体も
 `reserve_tools`以内にclampします。correlation messageは落とさず、超過内容をstructured previewへ変換します。engine local
-storeにfull resultを残す前提にはしません。完全なlarge outputはWorker/tool実装がdurable artifact/objectへ先に保存し、
+storeにfull resultを残す前提にはしません。完全なlarge outputはWorker/tool実装が永続 artifact/objectへ先に保存し、
 modelにはbounded preview/referenceを返します。
 
 ## Source owners
 
 - engine library: `takos-agent-engine/`
 - Takos executor wrapper: `takos/containers/agent/`
-- product agent-control RPC / durable state / tools: `takos/src/worker/`
+- product agent-control RPC / 永続 state / tools: `takos/src/worker/`
 - Capsule / ContainerService deployment and OpenTofu Run ledger: `takosumi/`
 
 ## Checks

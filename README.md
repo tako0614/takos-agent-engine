@@ -364,12 +364,12 @@ LoopState は ExecutionState 全体を JSON として直列化したもので、
 の判断、実行待ちの tool call を含みます。`resume_loop` が再開の対象にするのは `LoopStatus::Paused` の checkpoint
 だけです。cancellation / timeout は `LoopStatus::Cancelled` / `LoopStatus::TimedOut` として checkpoint
 に残り、状態は失われませんが、そのまま自動では再開しません。checkpoint には schema version、実行 profile 固有の
-`graph_id`、外側と内側の `session_id` / `loop_id` を持たせ、どれかが一致しない状態は fail-closed で拒否します。
-durable recovery を使う caller は `RunOptions.loop_id` に安定した ID を渡します。省略時の自動生成 ID は一時的な
+`graph_id`、外側と内側の `session_id` / `loop_id` を持たせ、どれかが一致しない状態は安全側に停止して拒否します。
+永続 recovery を使う caller は `RunOptions.loop_id` に安定した ID を渡します。省略時の自動生成 ID は一時的な
 run 向けです。
 
 process が `Running` checkpoint を残した場合は `recover_interrupted_loop_with_options` を明示的に使います。model
-request は provider-neutral な冪等性契約がないため再送しません。tool node も `ToolExecutor::recovery_is_idempotent`
+request は「何度実行しても結果が同じ」を provider-neutral に保証する契約がないため再送しません。tool node も `ToolExecutor::recovery_is_idempotent`
 が true の call だけを、元と同じ idempotency key で再実行します。
 
 checkpoint / resume は、永続的な `LoopStateRepository` を注入する利用側に向けたライブラリの部品です。Takos の service
@@ -396,7 +396,7 @@ LLM / embedding / 蒸留など、特定のベンダーに依存する実装は c
 | `LoopStateRepository` | checkpoint の save / load / clear                                                        |
 
 `ToolExecutor::execute_with_context` には `session_id`、`loop_id`、安定した `idempotency_key`、timeout、
-`CancellationToken` を渡します。side-effecting executor はこの key を実際の durable boundary まで伝播し、子 process /
+`CancellationToken` を渡します。side-effecting executor はこの key を実際の永続 boundary まで伝播し、子 process /
 request の停止も担当します。read-only call の timeout は通常の tool error として model に返せますが、dispatch
 後の side-effecting call が timeout / cancellation になった場合は、remote side effect の有無を判断できないため
 `EngineError::ToolOutcomeIndeterminate` で run を停止します。engine はそれを成功・失敗へ推測せず、自動 retry
@@ -407,7 +407,7 @@ demo 用の実装は `examples/common/support.rs` と test 用の support に閉
 
 ### storage backend
 
-durable baseline はファイルベースの object backend です。JSON object を正とする情報として保存し、query
+永続 baseline はファイルベースの object backend です。JSON object を正とする情報として保存し、query
 を速くするための index を別に生成します。公開 in-memory backend は deterministic test / prototype
 用で、process を越える recovery authority にはしません。
 
@@ -438,16 +438,17 @@ indexes/
 raw commit は node・operation receipt・timeline/session/loop/backlog index・embedding body / manifest を、
 abstract commit は node・receipt・embedding・graph projection を 1 つの write-ahead journal mutation
 として扱います。raw lifecycle の複数 node 更新も journal に記録します。process が途中で落ちた場合、次の open
-が journal を冪等に replay してから index の完全性を検査し、必要なら canonical object から再構築します。
-receipt は index rebuild と別の durable identity であり、digest と元の `operation_key` の両方を照合します。
+が journal を、何度 replay しても結果が同じ形で適用してから index の完全性を検査し、必要なら canonical
+object から再構築します。
+receipt は index rebuild と別の永続 identity であり、digest と元の `operation_key` の両方を照合します。
 
 同じ root の更新は process 内 mutex と `.store.lock` の OS advisory lock の両方で直列化します。root と管理対象 path
 の symlink は拒否し、root 外へ抜ける path を書きません。通常 object の壊れた JSON は `quarantine/` に隔離して
 Storage error を返しますが、未完了 mutation の唯一の記録である壊れた journal は自動削除・隔離せず、operator
-介入まで fail-closed にします。hard kill で残った古い staging `*.tmp` は open 時に回収します。
+介入まで安全側に停止します。hard kill で残った古い staging `*.tmp` は open 時に回収します。
 
 この file backend の journal と lock は単一 filesystem root の整合性境界です。network filesystem や分散 writer
-へそのまま拡張できる分散 transaction / lease ではありません。その場合は各 trait の durable 実装側で同等以上の
+へそのまま拡張できる分散 transaction / lease ではありません。その場合は各 trait の永続実装側で同等以上の
 atomicity と fencing を提供します。
 
 ### 実行の上限
@@ -470,12 +471,12 @@ atomicity と fencing を提供します。
 `RunOptions` では、run ごとの上書き、`CancellationToken`、製品側が管理する `conversation_history`、`ExecutionProfile`
 を渡せます。0 や config より大きい override で上限を無効化することはできません。model が返した tool call
 数・ID / name / arguments は side effect の dispatch 前に検証し、上限超過は call を黙って捨てず run
-を fail-closed にします。
+を安全側に停止します。
 
 tool result は `max_tool_result_bytes` 以内の envelope に縮約してから engine storage へ保存します。さらに model
 に見せる current-turn transcript 全体を `context_budget.reserve_tools` 内へ収めます。大きい内容は
 `{"truncated":true,"preview":"..."}` の形になりますが、tool-call ID と tool-result message 自体は保持します。
-完全な出力が必要な tool は、実行側の durable artifact / object に先に保存し、engine には bounded な参照を返してください。
+完全な出力が必要な tool は、実行側の永続 artifact / object に先に保存し、engine には bounded な参照を返してください。
 
 ## 開発
 
