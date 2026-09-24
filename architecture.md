@@ -255,7 +255,7 @@ object backend は JSON object を正とする情報とし、session・memory・
 
 - `operation_key` receipt は materialized index の rebuild と独立した durable identity である
 - raw / abstract commit と raw lifecycle update は write-ahead journal を先に書き、open 時に未完了 mutation
-  を冪等 replay する
+  を replay する (何度 replay しても同じ結果に収束する)
 - object backend は journal replay 後に index の version・parse・完全性を検査し、必要なら canonical object
   から再構築する
 - `store.json` に `format_version` / `created_at` / `updated_at` / `last_index_rebuild_at` を持つ
@@ -636,7 +636,7 @@ crate 外の統合課題:
 
 ## 19. 一文で要約
 
-`takos-agent-engine` は、session と長期 memory を同一 substrate
+`takos-agent-engine` は、session と長期 memory を同じ実行基盤の
 上で扱い、RawNode / AbstractNode の二層記憶を activation しながら、paused
 checkpoint から再開できる graph runtime で長期継続実行する Rust agent engine
 である。
