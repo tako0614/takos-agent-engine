@@ -85,13 +85,18 @@ src/
   config.rs
   error.rs
   ids.rs
+  test_support.rs
   domain/
   engine/
+    mod.rs
     execution_graph.rs
+    graph_spec.rs
+    nodes.rs
     session_engine.rs
     context_assembler.rs
   memory/
   storage/
+    object_store/
   model/
   tools/
 examples/
