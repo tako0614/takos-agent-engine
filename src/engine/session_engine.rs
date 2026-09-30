@@ -324,7 +324,7 @@ mod tests {
     };
     use crate::engine::nodes::{
         assistant_output_operation_key, prepare_tool_call_for_config, tool_result_operation_key,
-        user_input_operation_key,
+        trim_conversation_history, user_input_operation_key,
     };
     use crate::engine::session_engine::{
         build_default_execution_graph, build_external_context_execution_graph,
@@ -1687,6 +1687,67 @@ mod tests {
             *executor.write_order.lock().expect("write order lock"),
             vec!["write-1".to_string(), "write-2".to_string()],
         );
+        Ok(())
+    }
+
+    #[test]
+    fn external_history_drops_orphan_tool_results_and_incomplete_tool_calls() -> Result<()> {
+        let orphan = ConversationMessage {
+            role: ConversationRole::Tool,
+            content: "orphan result".to_string(),
+            tool_call_id: Some("missing-call".to_string()),
+            tool_calls: Vec::new(),
+        };
+        let user = ConversationMessage {
+            role: ConversationRole::User,
+            content: "keep this context".to_string(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        };
+        let incomplete = ConversationMessage {
+            role: ConversationRole::Assistant,
+            content: "partial response".to_string(),
+            tool_call_id: None,
+            tool_calls: vec![ToolCallRequest {
+                id: Some("expected-call".to_string()),
+                name: "lookup".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+        };
+        let mismatched_result = ConversationMessage {
+            role: ConversationRole::Tool,
+            content: "wrong result".to_string(),
+            tool_call_id: Some("different-call".to_string()),
+            tool_calls: Vec::new(),
+        };
+        let assistant = ConversationMessage {
+            role: ConversationRole::Assistant,
+            content: "later answer".to_string(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        };
+
+        let trimmed = trim_conversation_history(
+            &[
+                orphan,
+                user.clone(),
+                incomplete,
+                mismatched_result,
+                assistant.clone(),
+            ],
+            &EngineConfig::default(),
+            &TestWhitespaceTokenEstimator,
+            "current request",
+            None,
+        )?;
+
+        let partial_text = ConversationMessage {
+            role: ConversationRole::Assistant,
+            content: "partial response".to_string(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        };
+        assert_eq!(trimmed, vec![user, partial_text, assistant]);
         Ok(())
     }
 
